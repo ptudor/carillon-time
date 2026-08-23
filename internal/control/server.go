@@ -1,0 +1,151 @@
+package control
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"carillon/internal/discipline"
+	"carillon/internal/engine"
+)
+
+// maxRequest bounds a request line; anything larger is not a request.
+const maxRequest = 4096
+
+// ErrInUse is returned by Listen when another daemon holds the socket.
+var ErrInUse = errors.New("control: socket is in use by another carillon")
+
+// Server answers control requests for one engine.
+type Server struct {
+	path    string
+	ln      net.Listener
+	eng     *engine.Engine
+	version string
+	log     *slog.Logger
+	wg      sync.WaitGroup
+}
+
+// Listen creates the unix socket at path (mode 0660). A stale socket file
+// left by a crashed daemon is removed; one that still answers is an error.
+func Listen(path string, eng *engine.Engine, version string, log *slog.Logger) (*Server, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if _, err := os.Stat(path); err == nil {
+		c, derr := net.DialTimeout("unix", path, 500*time.Millisecond)
+		if derr == nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("%w: %s", ErrInUse, path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("control: removing stale socket %s: %w", path, err)
+		}
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("control: listen %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("control: chmod %s: %w", path, err)
+	}
+	return &Server{path: path, ln: ln, eng: eng, version: version, log: log}, nil
+}
+
+// Path returns the socket path.
+func (s *Server) Path() string { return s.path }
+
+// Serve accepts connections until ctx is done, then closes the listener,
+// waits for in-flight requests, and removes the socket file.
+func (s *Server) Serve(ctx context.Context) error {
+	go func() {
+		<-ctx.Done()
+		_ = s.ln.Close()
+	}()
+	for {
+		conn, err := s.ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				s.wg.Wait()
+				_ = os.Remove(s.path)
+				return nil
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				continue
+			}
+			s.wg.Wait()
+			_ = os.Remove(s.path)
+			return fmt.Errorf("control: accept: %w", err)
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handle(ctx, conn)
+		}()
+	}
+}
+
+func (s *Server) handle(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	r := bufio.NewReaderSize(conn, maxRequest)
+	line, err := r.ReadSlice('\n')
+	if err != nil && !(errors.Is(err, io.EOF) && len(line) > 0) {
+		s.reply(conn, Response{Error: "control: malformed request: " + err.Error()})
+		return
+	}
+	var req Request
+	if err := json.Unmarshal(line, &req); err != nil {
+		s.reply(conn, Response{Error: "control: malformed request: " + err.Error()})
+		return
+	}
+	s.reply(conn, s.dispatch(ctx, conn, req))
+}
+
+func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Response {
+	switch req.Command {
+	case CmdVersion:
+		return Response{Version: s.version}
+	case CmdTracking:
+		return Response{Tracking: TrackingOf(s.eng.Status())}
+	case CmdSources:
+		return Response{Sources: SourcesOf(s.eng.Status())}
+	case CmdWaitSync:
+		wctx := ctx
+		var cancel context.CancelFunc
+		if req.Timeout > 0 {
+			wctx, cancel = context.WithTimeout(ctx, time.Duration(req.Timeout*float64(time.Second)))
+			defer cancel()
+			_ = conn.SetDeadline(time.Now().Add(time.Duration(req.Timeout*float64(time.Second)) + 5*time.Second))
+		} else {
+			_ = conn.SetDeadline(time.Time{})
+		}
+		err := s.eng.Wait(wctx, func(st *engine.Status) bool { return st.State == discipline.StateSynced })
+		synced := err == nil
+		return Response{Synced: &synced}
+	default:
+		return Response{Error: fmt.Sprintf("control: unknown command %q", req.Command)}
+	}
+}
+
+func (s *Server) reply(conn net.Conn, resp Response) {
+	b, err := json.Marshal(resp)
+	if err != nil {
+		s.log.Error("control: encoding response", "error", err)
+		return
+	}
+	b = append(b, '\n')
+	if _, err := conn.Write(b); err != nil {
+		s.log.Debug("control: writing response", "error", err)
+	}
+}

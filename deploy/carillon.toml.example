@@ -1,0 +1,95 @@
+# carillon configuration — NTP client (milestone M1: no server, no refclock).
+#
+# Install as:
+#   /usr/local/etc/carillon/carillon.toml   (FreeBSD)
+#   /etc/carillon/carillon.toml             (Linux)
+#   /etc/carillon.toml                      (OpenWrt)
+# or pass -config /path/to/carillon.toml.
+#
+# Unknown keys are errors: a typo will stop the daemon from starting rather
+# than silently doing nothing. Validate with: carillon -check -config <path>
+
+[daemon]
+# Last known frequency correction, read at start and written hourly.
+#   FreeBSD default: /var/db/carillon/drift
+#   Linux default:   /var/lib/carillon/drift
+#drift_file = "/var/db/carillon/drift"
+
+# Unix socket used by carillonctl.
+#control = "/var/run/carillon.sock"
+
+# IERS/NIST leap-seconds.list. Optional for a client; required to announce
+# leap seconds on a host that has no upstream servers.
+#leapfile = "/var/db/carillon/leap-seconds.list"
+
+# AES-128-CMAC keys in ntp.keys syntax, mode 0600. Required if any server
+# below has a key id. Generate a key with:  openssl rand -hex 16
+#   1  AES128CMAC  <32 hex digits>
+#keys = "/usr/local/etc/carillon/keys"
+
+# debug | info | warn | error
+log_level = "info"
+
+# --- Upstream servers -------------------------------------------------------
+# Each [[server]] is polled independently. Three or more independent servers
+# let the selection algorithm reject one that is wrong.
+
+[[server]]
+name    = "pool-a"
+address = "0.pool.ntp.org"
+iburst  = true
+
+[[server]]
+name    = "pool-b"
+address = "1.pool.ntp.org"
+iburst  = true
+
+[[server]]
+name    = "pool-c"
+address = "2.pool.ntp.org"
+iburst  = true
+
+# An authenticated, preferred upstream — the home stratum-1 seen from the
+# colo. Its offset is used unaltered whenever it survives selection; the
+# public servers above then serve only to detect it being wrong. Requires
+# `keys` above and the matching key id on both hosts.
+#[[server]]
+#name     = "home"
+#address  = "10.9.0.1"       # WireGuard address of the home host
+#key      = 1
+#prefer   = true
+#iburst   = true
+#poll_min = 4                # log2 seconds: 16 s
+#poll_max = 6                # 64 s
+
+# Per-server keys and their defaults:
+#   key      = 0      key id from the keys file; 0 = unauthenticated
+#   prefer   = false  at most one server may be preferred
+#   iburst   = false  burst of requests when the server becomes reachable
+#   noselect = false  monitor only, never synchronize to it
+#   poll_min = 6      log2 seconds (64 s); allowed 2..17
+#   poll_max = 10     log2 seconds (1024 s); allowed 2..17
+
+# --- Discipline -------------------------------------------------------------
+[discipline]
+# Smallest number of sources the cluster algorithm keeps.
+min_survivors = 1
+# Seconds to coast on the held frequency with no source before reporting
+# unsynchronized.
+holdover_max = 3600
+# Maximum phase correction rate, ppm. The kernel caps total correction at
+# 500 ppm, so slew capacity is 500 minus the frequency correction in use.
+max_slew_ppm = 500
+
+# --- Stepping policy --------------------------------------------------------
+[step]
+# Offsets larger than this (seconds) are stepped instead of slewed ...
+threshold = 0.5
+# ... but only within the first `limit` clock updates after start.
+# -1 = steps always allowed (not for a time server), 0 = never step.
+limit = 3
+# Refuse to correct an offset larger than this (seconds) ...
+panic = 1000
+# ... except for the very first correction when this is true. Set it on
+# hosts without a battery-backed clock (OpenWrt routers, some SBCs).
+panic_at_startup = false

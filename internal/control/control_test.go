@@ -1,0 +1,117 @@
+package control
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"carillon/internal/clock"
+	"carillon/internal/discipline"
+	"carillon/internal/engine"
+)
+
+func socketPath(t *testing.T) string {
+	p := filepath.Join(t.TempDir(), "s")
+	if len(p) > 100 {
+		t.Skipf("temp dir path too long for a unix socket: %s", p)
+	}
+	return p
+}
+
+func newEngine(t *testing.T) *engine.Engine {
+	clk := clock.NewFake(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	cfg := engine.Config{
+		Discipline: discipline.Config{
+			Loop:         discipline.LoopConfig{StepThreshold: 0.5, StepLimit: 3, Panic: 1000, MaxSlewPPM: 500, Precision: 1e-6},
+			MinSurvivors: 1, HoldoverMax: 3600, SettleUpdates: 3,
+		},
+		Version: "v-test",
+	}
+	e, err := engine.New(cfg, clk, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+func TestServerRoundTrip(t *testing.T) {
+	path := socketPath(t)
+	eng := newEngine(t)
+	srv, err := Listen(path, eng, "v-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm() != 0o660 {
+		t.Fatalf("socket mode: %v %v", fi, err)
+	}
+
+	resp, err := Call(ctx, path, Request{Command: CmdVersion})
+	if err != nil || resp.Version != "v-test" {
+		t.Fatalf("version: %+v %v", resp, err)
+	}
+	resp, err = Call(ctx, path, Request{Command: CmdTracking})
+	if err != nil || resp.Tracking == nil {
+		t.Fatalf("tracking: %+v %v", resp, err)
+	}
+	if resp.Tracking.State != "unsynced" || resp.Tracking.Stratum != 16 || resp.Tracking.RefID != "INIT" {
+		t.Fatalf("tracking: %+v", resp.Tracking)
+	}
+	resp, err = Call(ctx, path, Request{Command: CmdSources})
+	if err != nil || len(resp.Sources) != 0 {
+		t.Fatalf("sources: %+v %v", resp, err)
+	}
+	resp, err = Call(ctx, path, Request{Command: CmdWaitSync, Timeout: 0.3})
+	if err != nil || resp.Synced == nil || *resp.Synced {
+		t.Fatalf("waitsync on an unsynced engine must report false: %+v %v", resp, err)
+	}
+	if _, err = Call(ctx, path, Request{Command: "bogus"}); err == nil {
+		t.Fatal("unknown command must error")
+	}
+
+	// A second daemon must not be able to take the socket while it is live.
+	if _, err := Listen(path, eng, "v-test", nil); err == nil {
+		t.Fatal("live socket must be refused")
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("socket file must be removed on shutdown")
+	}
+}
+
+func TestListenRemovesStaleSocket(t *testing.T) {
+	path := socketPath(t)
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := Listen(path, newEngine(t), "v", nil)
+	if err != nil {
+		t.Fatalf("stale socket must be replaced: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = srv.Serve(ctx)
+}
+
+func TestConversions(t *testing.T) {
+	eng := newEngine(t)
+	st := eng.Status()
+	tr := TrackingOf(st)
+	if tr.Version != "v-test" || tr.Leap != "unsynchronized" || tr.Uptime < 0 {
+		t.Fatalf("%+v", tr)
+	}
+	if ReachOctal(0xff) != "377" || ReachOctal(1) != "001" {
+		t.Fatal("reach octal")
+	}
+}

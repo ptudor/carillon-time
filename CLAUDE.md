@@ -7,10 +7,18 @@ second job is the two-host topology: the **home** box (GPS + PPS, stratum 1)
 is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
-**Status:** greenfield. `DESIGN.md` is the specification; nothing is built yet.
-Read `DESIGN.md` before writing any code, and update it whenever protocol or
-discipline behaviour changes — the design doc is the source of truth, the code
-follows it.
+**Status (2026-08-23):** milestones M0 and M1 of `DESIGN.md` §15 are
+implemented — wire format, CMAC auth, config, Linux/FreeBSD clock actuators,
+the discipline pipeline with simulation tests, the NTP client source, the
+engine, the control socket, `carillon` (with `-check` and `query`) and
+`carillonctl`. Not yet built: the NTP server (M2), the PPS and GPS refclocks
+(M3), leapfile/stats/metrics (M4), OpenWrt packaging (M5). Nothing has run on
+real hardware yet; the `hwtest`-tagged tests and `deploy/` scripts are the
+next thing to exercise on the FreeBSD box.
+
+`DESIGN.md` is the specification. Read it before writing code, and update it
+whenever protocol or discipline behaviour changes — the design doc is the
+source of truth, the code follows it.
 
 The name is `carillon` — a set of tuned bells struck on the hour. (It replaced
 a working name built on "tick", which reads too much like "bug".) The daemon
@@ -25,8 +33,10 @@ future rename stays a mechanical search-and-replace.
   kernel (ioctls, `ntp_adjtime`, socket timestamps) is done with
   `golang.org/x/sys/unix` and hand-declared structs — no C toolchain, so
   cross-compiling for FreeBSD/Linux/OpenWrt from this Mac is one command.
-- Local toolchain: `/opt/local/bin/go` (MacPorts). `go.mod` sets `go 1.24` as
-  the floor; bump it deliberately, not as a side effect of a `go mod tidy`.
+- Local toolchain: `/opt/local/bin/go` (MacPorts). `go.mod` sets `go 1.25.0`
+  as the floor — `golang.org/x/sys` v0.47 requires it; bump deliberately, not
+  as a side effect of a `go mod tidy`. Run `go` with `GOMODCACHE`/`GOCACHE`
+  pointed at the session scratchpad so nothing is written outside `~/Git`.
 - Allowed third-party modules — do not add others without saying why:
   - `golang.org/x/sys` — syscalls, ioctls, socket options
   - `github.com/pelletier/go-toml/v2` — config (house standard; strict decode
@@ -43,17 +53,19 @@ cmd/carillon/            daemon entry point (flags: -config, -check, -version; s
 cmd/carillonctl/          status client for the control socket
 internal/config/      TOML schema, validation, per-OS defaults
 internal/ntp/         wire format, timestamps/eras, MAC (auth/), KoD codes — pure, fuzzable
-internal/source/      Source interface + NTP client source (poller, clock filter)
-internal/refclock/    PPS and GPS(NMEA+PPS) refclocks; nmea/ parser
-internal/pps/         RFC 2783 bindings: pps_linux.go, pps_freebsd.go, pps_other.go
-internal/serial/      termios open/configure; Linux N_PPS line-discipline attach
+internal/source/      Source interface + NTP client source (poller, clock filter, Query)
+internal/sockts/      kernel receive timestamps on UDP sockets, per OS
+internal/buildinfo/   version and build time stamped by the Makefile
+internal/refclock/    (M3) PPS and GPS(NMEA+PPS) refclocks; nmea/ parser
+internal/pps/         (M3) RFC 2783 bindings: pps_linux.go, pps_freebsd.go, pps_other.go
+internal/serial/      (M3) termios open/configure; Linux N_PPS line-discipline attach
 internal/clock/       actuator: Clock interface, sysclock_linux.go, sysclock_freebsd.go,
                       sysclock_other.go (stub), fake.go (deterministic, for tests)
 internal/discipline/  filter → select → combine → loop; pure functions, no wall clock
 internal/engine/      the single owning goroutine: wires sources, discipline, actuator, status
-internal/server/      UDP listener(s), responder, ACL, rate limiter, KoD
+internal/server/      (M2) UDP listener(s), responder, ACL, rate limiter, KoD
 internal/control/     unix-socket JSON protocol used by carillonctl
-internal/metrics/     Prometheus collectors
+internal/metrics/     (M4) Prometheus collectors
 deploy/               freebsd/ (rc.d), systemd/, openwrt/ (procd), carillon.toml.example
 DESIGN.md             the spec
 ```
@@ -92,8 +104,9 @@ dependency.
 3. **NTP modes 6 and 7 (control / private) are never implemented.** Status
    comes from the unix control socket. A reply is never larger than the request
    that produced it; the server is not an amplifier.
-4. **The server is off unless `[server] allow` lists a prefix.** No implicit
-   "serve everyone" default.
+4. **The server is off unless `[serve] allow` lists a prefix.** No implicit
+   "serve everyone" default. (`[[server]]` entries are the upstreams we poll;
+   `[serve]` is the listener — TOML cannot name both `server`.)
 5. **Timestamps come from the kernel where the kernel offers them**: PPS edges
    via the PPS ioctls, packet receive times via `SO_TIMESTAMPNS` (Linux) /
    `SO_TIMESTAMP`+`SO_TS_CLOCK=SO_TS_REALTIME` (FreeBSD). Wall-clock reads in
