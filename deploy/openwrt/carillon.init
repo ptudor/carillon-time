@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# carillon — NTP-compatible time daemon with serial-port PPS.
+#
+# Install to /etc/init.d/carillon and run: /etc/init.d/carillon enable
+# Config lives at /etc/carillon.toml. Disable the busybox/sysntpd client
+# first so two daemons do not fight over the clock:
+#   /etc/init.d/sysntpd disable; /etc/init.d/sysntpd stop
+#
+# Serial-port PPS needs kmod-pps and kmod-pps-ldisc; GPIO PPS needs
+# kmod-pps-gpio. Routers without a battery-backed clock start in 1970, so
+# set  [step] panic_at_startup = true  in the config.
+
+START=98
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/sbin/carillon
+CONFIG=/etc/carillon.toml
+
+start_service() {
+	[ -x "$PROG" ] || { echo "$PROG not found" >&2; return 1; }
+	[ -f "$CONFIG" ] || { echo "config not found: $CONFIG" >&2; return 1; }
+	"$PROG" -check -config "$CONFIG" || return 1
+
+	procd_open_instance
+	procd_set_param command "$PROG" -config "$CONFIG"
+	# Restart on failure: up to 5 times within 3600 s, 5 s apart.
+	procd_set_param respawn 3600 5 5
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/carillon.pid
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "carillon"
+}
+
+reload_service() {
+	# The daemon has no reload; restart is cheap and the drift file keeps
+	# the frequency estimate.
+	restart
+}

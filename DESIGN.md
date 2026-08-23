@@ -175,21 +175,29 @@ Packages (see `CLAUDE.md` for the tree):
 Data types shared across packages:
 
 ```go
-// Measurement is what every source produces. Offsets are "true minus local".
+// Measurement is what a source delivers after its own clock filter has run.
+// Offsets are "true minus local": positive means the local clock is behind.
 type Measurement struct {
-    Source     string        // config name, e.g. "home", "pps0"
-    At         Mono          // local monotonic time the measurement refers to
-    Offset     float64       // seconds; θ
-    Delay      float64       // seconds; δ (0 for refclocks)
-    Dispersion float64       // seconds; ε at time At
-    Leap       Leap          // 0 none, 1 insert, 2 delete, 3 unsynchronized
-    Stratum    uint8         // 0 for refclocks (they become stratum 1 for us)
-    RefID      [4]byte
-    RootDelay  float64
-    RootDisp   float64
-    Precision  int8
-    RefTime    time.Time
-    Numbering  bool          // this source is allowed to number PPS seconds
+    Source string
+    Now    float64   // monotonic seconds when produced
+    Reach  uint8     // the source's reach register after this poll
+    Poll   int8      // the source's current poll exponent
+    Valid  bool      // false = a poll without a new estimate (only Reach/Poll count)
+
+    At         float64  // monotonic time of the sample the filter chose
+    Offset     float64  // θ, seconds
+    Delay      float64  // δ, seconds (0 for a refclock)
+    Dispersion float64  // ε, seconds
+    Jitter     float64  // ψ, seconds
+
+    Leap        ntp.Leap
+    Stratum     uint8    // 0 for a refclock
+    RefID       ntp.RefID // the source's own reference id
+    SourceRefID ntp.RefID // what we advertise when this source drives us
+    RootDelay   float64
+    RootDisp    float64
+    Precision   int8
+    RefTime     time.Time
 }
 ```
 
@@ -202,15 +210,20 @@ type Measurement struct {
 ```go
 type Source interface {
     Name() string
-    Run(ctx context.Context, out chan<- Measurement) error // returns only on ctx done or fatal error
-    Info() SourceInfo                                      // for carillonctl; cheap, lock-free snapshot
+    Run(ctx context.Context, out chan<- discipline.Measurement) error // returns when ctx is done or on a fatal error
+    Reset()                                                            // discard samples taken before a clock step
+    Info() Info                                                        // lock-free snapshot for carillonctl
 }
 ```
 
-Every source has an 8-bit **reach register** maintained by the engine: shifted
-left on each expected sample slot, low bit set when a sample arrived. A source
-with reach 0 is unreachable and excluded from selection. NTP sources shift
-once per poll; refclocks once per second.
+Every source keeps an 8-bit **reach register**, shifted left on each expected
+sample slot with the low bit set when a sample arrived, and reports it in
+every `Measurement`. A source with reach 0 is unreachable and excluded from
+selection. NTP sources shift once per poll; refclocks once per second. The
+RFC 5905 clock filter (`discipline.Filter`) also runs inside the source, so
+a `Measurement` carries a filtered estimate; `Valid = false` reports a poll
+that produced no new estimate. After a clock step the engine calls `Reset()`
+on every source, because samples taken before the step are wrong by the step.
 
 Per-source config common to all types: `prefer` and `noselect`. There is no
 per-source weight; combining is by root distance (§6.3).
@@ -476,48 +489,68 @@ bits, and reference time for the server variables (§7.3).
 
 ### 6.4 Loop
 
-A discrete type-II PLL with the RFC 5905 / ntpd constants. Variables:
+A critically damped type-II phase-locked loop. The *structure* is ntpd's
+(RFC 5905 §11.3): phase is slewed exponentially, frequency is integrated
+from the offset, one time constant tied to the poll interval, a popcorn
+spike gate and a clock-jitter estimate. The *gains* are not ntpd's — see D8.
 
-- `freq` — the base frequency correction (ppm) currently believed correct
+- `freq` — base frequency correction (ppm), applied to the kernel
 - `pending` — residual phase still to be slewed (seconds)
-- `P = 2^poll` — the system source's current poll/averaging interval (s)
-- `τ = 16·P` — loop time constant (ntpd `CLOCK_PLL = 16`)
+- `P = 2^poll` — the system source's poll/averaging interval
+- `τ = 4·P` — loop time constant (`TimeConstant`, default 4)
 - `μ` — seconds since the previous loop update
 
 Per update with `θ = θ_sys`:
 
 ```
-if step policy fires (§6.6):  Step(θ); pending = 0; reset all source filters; return
-pending = θ                                  # replace, don't accumulate
-freq   += θ · μ / (4·τ)²  · 1e6              # PLL frequency gain (ppm); no FLL branch in v1
-freq    = clamp(freq, -500, +500)
-SetFrequency(freq)
+if the step policy fires (§6.6): Step(θ); pending = 0; Reset() every source; return
+if synced and |θ − θ_prev| > 3·ψ_clk and μ < 2P: ignore it (popcorn spike); return
+ψ_clk   = exp. average (weight 1/8) of |θ − θ_prev|, floored at the clock precision
+pending = θ                                       # replace, don't accumulate
+if |θ| ≤ max_slew·τ:                              # linear region only — see anti-windup
+    freq += θ · min(μ, 2048) / (4τ²) · 1e6        # 2048 s = Allan intercept
+freq    = clamp(freq, ±500)
 ```
 
-Every second (engine ticker) the phase is chased exponentially:
+Every second (engine ticker):
 
 ```
-adj      = pending / τ                       # seconds to slew this second
-adj      = clamp(adj, -max_slew, +max_slew)  # max_slew = max_slew_ppm · 1e-6
-pending -= adj
-SetFrequency(freq + adj·1e6)                 # holds for one second
+adj      = clamp(pending / τ, ±max_slew)          # max_slew = max_slew_ppm · 1e-6
+total    = clamp(freq + adj·1e6, ±500)            # the kernel's own limit
+pending -= (total − freq)·1e-6                    # only what the clamp let through
+SetFrequency(total)                               # holds for one second
 ```
 
-so the kernel frequency word carries `freq` plus a one-second transient. The
-kernel clamps the total to ±500 ppm, so effective slew capacity is
-`500 − |freq|` ppm; the configured `max_slew_ppm` default is 500.
+**Why these gains.** With phase gain 1/τ and integral gain K, the closed
+loop is `s² + s/τ + K = 0`. `K = 1/(4τ²)` puts a double pole at `−1/(2τ)`:
+critically damped, no overshoot, settled in a few × 2τ — 512 s at poll 6,
+128 s at poll 4. ntpd uses τ = 16·P and K = 1/(16τ²), which leaves a slow
+real pole near `−1/(15τ)`: hours at poll 6, days at poll 10 (where ntpd
+relies on its FLL instead). That buys noise immunity a PPS-disciplined host
+does not need and a client already gets from the clock filter.
 
-The FLL branch of ntpd (used at long poll intervals where `μ` exceeds the
-Allan intercept) is **omitted in v1**: PPS-disciplined hosts run at `P ≤ 128`
-where the PLL dominates, and clients use `poll_max ≤ 10` where ntpd's PLL is
-still adequate. The estimator interface (`Estimator.Update(θ, μ, P) →
-(freq, pending)`) is the seam where a regression-based estimator (chrony's
-approach, faster convergence) can replace this later without touching the
-engine.
+**Anti-windup.** A slew saturated at 500 ppm cannot follow the offset, and
+integrating the offset meanwhile would wind the frequency straight to the
+clamp. So the frequency is not integrated while `|θ|` exceeds what one τ can
+slew (`max_slew·τ`, 0.128 s at poll 6); the phase runs at the limit and the
+integral resumes in the linear region.
 
-**Initial frequency:** in order — the drift file (§10.4), then the kernel's
-current frequency word (a previous daemon may have left a good value), then 0.
-On the first update the PLL is seeded with the full offset regardless of `μ`.
+**Initial frequency:** the drift file (§10.4), else the kernel's current
+frequency word if non-zero (a previous daemon left it), else unknown. When
+unknown, the first `FreqMeasure` = 900 s are a direct measurement — ntpd's
+FREQ state, but without withholding phase corrections: at the end,
+`freq += (θ_now − θ_first + slewed)/elapsed`, where `slewed` is the phase the
+ticks removed meanwhile. The PLL takes over afterwards.
+
+**Measured in simulation** (`internal/discipline/sim_test.go`, 200 µs delay
+noise, poll 6): 50 ppm error and 100 ms offset from nothing → 49.99 ppm
+recovered, 27 µs RMS in hour 6, no step; with a drift file, under 1 ms in
+about ten minutes; a 1 s jump after startup is slewed at exactly the 500 ppm
+bound with no frequency disturbance.
+
+**Estimator seam:** `Loop.Update/Tick` is the whole interface; a
+regression-based estimator (chrony's approach) can replace it without
+touching the engine.
 
 ### 6.5 States
 
@@ -531,8 +564,11 @@ On the first update the PLL is seeded with the full offset regardless of `μ`.
 
 - **UNSYNCED:** server replies LI=3, stratum 16 (§7.4); kernel `STA_UNSYNC`
   set; no frequency changes have been applied yet.
-- **SETTLING:** corrections are applied; server still unsynced until the
-  offset is inside 4× the system jitter for three consecutive updates.
+- **SETTLING:** corrections are applied; the server still answers as
+  unsynchronized until three loop updates have gone by without a step. (The
+  root dispersion, which includes the pending slew, tells clients the truth
+  from then on; waiting for the offset to shrink first would keep a slowly
+  converging client unsynced for an hour for no gain.)
 - **SYNCED:** `STA_UNSYNC` cleared, maxerror/esterror maintained; server
   serves. Clearing `STA_UNSYNC` is also what allows the kernel to write the
   clock back to the RTC periodically (Linux's 11-minute mode).
@@ -625,7 +661,7 @@ afterwards because the PPS seconds numbering shifts by one. A `"slew"` mode
 ### 7.1 Listening
 
 ```toml
-[server]
+[serve]                                             # not [server]: that is the upstream array
 listen         = ["0.0.0.0:123", "[::]:123"]
 allow          = ["10.0.0.0/8", "2001:db8::/32"]   # required; empty = server disabled
 deny           = []
@@ -749,7 +785,10 @@ one file can be shared with chrony/ntpd hosts):
 
 TOML, strict (unknown keys are errors), loaded once at start; `SIGHUP` is not a
 reload (restart is cheap and the drift file preserves the frequency). Defaults
-are per OS.
+are per OS. Naming: `[[server]]` entries are upstreams *we poll*; the listener
+*we serve from* is `[serve]` (TOML cannot have both a table and an array of
+tables called `server`). The keys file path is `[daemon] keys` because both
+the client and the server side use it.
 
 Full example, **home** (stratum 1):
 
@@ -759,6 +798,7 @@ Full example, **home** (stratum 1):
 drift_file = "/var/db/carillon/drift"
 control    = "/var/run/carillon.sock"
 leapfile   = "/var/db/carillon/leap-seconds.list"
+keys       = "/usr/local/etc/carillon/keys"
 log_level  = "info"
 
 [[refclock]]
@@ -777,11 +817,10 @@ name     = "pool-a"
 address  = "0.freebsd.pool.ntp.org"
 noselect = true
 
-[server]
+[serve]
 listen      = ["0.0.0.0:123", "[::]:123"]
 allow       = ["192.168.1.0/24", "203.0.113.7/32"]   # LAN + colo
 require_key = { "203.0.113.7/32" = 1 }
-keys        = "/usr/local/etc/carillon/keys"
 
 [step]
 threshold = 0.5
@@ -797,6 +836,7 @@ listen = "127.0.0.1:9123"
 [daemon]
 drift_file = "/var/db/carillon/drift"
 control    = "/var/run/carillon.sock"
+keys       = "/usr/local/etc/carillon/keys"
 
 [[server]]
 name     = "home"
@@ -817,10 +857,9 @@ address = "1.pool.ntp.org"
 name    = "pool-c"
 address = "2.pool.ntp.org"
 
-[server]
+[serve]
 listen         = ["0.0.0.0:123", "[::]:123"]
 allow          = ["0.0.0.0/0", "::/0"]
-keys           = "/usr/local/etc/carillon/keys"
 rate_limit_pps = 4
 rate_burst     = 8
 
@@ -950,8 +989,8 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   socket, constructs the clock backend (fails fast on privilege errors),
   reads the drift file, then starts the engine.
 - **Engine goroutine:** `select` over the measurement channel, a 1 s ticker
-  (slew step, reach shifting, dispersion aging, holdover accounting), control
-  requests, and `ctx.Done()`. It is the only caller of the clock actuator and
+  (slew step, holdover accounting, drift-file writes), source-exit
+  notifications, and `ctx.Done()`. It is the only caller of the clock actuator and
   the only writer of discipline state. It publishes `Status` by storing a new
   immutable struct into an `atomic.Pointer`.
 - **Source goroutines:** one per configured server and per refclock. PPS and
@@ -1051,8 +1090,8 @@ by attackers (rate-limit table is bounded and LRU).
 
 | | Deliverable | Done when |
 |---|---|---|
-| M0 | Repo skeleton, config, `internal/ntp` wire format + CMAC, `clock.Fake`, discipline package with simulation tests | `go test -race ./...` green on the Mac |
-| M1 | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | a plain client host tracks upstream as well as chrony does |
+| M0 ✅ 2026-08-23 | Repo skeleton, config, `internal/ntp` wire format + CMAC, `clock.Fake`, discipline package with simulation tests | `go test -race ./...` green on the Mac |
+| M1 ✅ 2026-08-23 (code) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | a plain client host tracks upstream as well as chrony does — **not yet verified on real hardware** |
 | M2 | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | home → colo topology runs end to end without a refclock |
 | M3 | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | home host is stratum 1 from a bare PPS numbered by NTP |
 | M4 | `gps` refclock (NMEA), leapfile, stats files, metrics, `-check` | home host is stratum 1 with GPS alone |
@@ -1102,10 +1141,16 @@ line of config.
 on one port). Everything else — SHM, PTP, other receivers' binary protocols —
 is out of scope. A future refclock would be a third type, not a framework.
 
-**D8 — ntpd's PLL constants as the v1 estimator.** Proven stable for thirty
-years and exactly specified; convergence is slower than chrony's regression,
-which is acceptable for a daemon that runs for months. The estimator is
-behind an interface for that reason.
+**D8 — ntpd's loop structure, critically damped gains.** The filter →
+select → PLL structure and the τ-per-poll scheme are RFC 5905's and ntpd's.
+The gains are not: the first implementation used ntpd's (τ = 16·P, integral
+gain 1/(16τ²)) and the simulation showed the expected ~15τ slow mode — hours
+at poll 6 with no FLL to rescue longer polls — plus integrator windup during
+a saturated slew. The loop is now critically damped (τ = 4·P, 1/(4τ²)) with
+an anti-windup guard (§6.4): minutes to converge with a drift file, one to
+two hours from nothing, 27 µs RMS on a 200 µs-noise simulated path. The
+estimator stays behind `Loop.Update/Tick` so a regression estimator
+(chrony-style) can still replace it.
 
 **D9 — Second numbering from any qualified source, ntpd-style.** Using the
 nearest whole second of the local clock (once within ±0.4 s) is simpler and
