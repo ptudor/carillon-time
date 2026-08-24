@@ -190,6 +190,16 @@ carillon query -keys /etc/carillon/keys -key 1 server.example.net
 Use the platform-appropriate keys path on FreeBSD. An upgrade is an atomic
 binary replacement followed by `service carillon restart` or
 `systemctl restart carillon`; the drift file preserves the measured frequency.
-Check `tracking`, `sources`, `serverstats`, and the service log after every
-restart. The first in-house deployment baseline and its repeatable checks are
+`carillonctl waitsync 300` may follow the restart directly: it waits for the
+control socket to appear. Check `tracking`, `sources`, `serverstats`, and the
+service log after every restart.
+
+When several hosts are upgraded, restart the upstream first and let it reach
+`synced` before restarting a host that prefers it. A downstream restarted
+while its upstream is still settling discards the upstream's stratum-16
+replies, synchronizes to its other survivors, and then has to slew back once
+the upstream returns; on the in-house pair that cost twocom a 7 ms offset
+transient and a frequency excursion of tens of ppm.
+
+The first in-house deployment baseline and its repeatable checks are
 recorded in [`ACCEPTANCE.md`](ACCEPTANCE.md).
