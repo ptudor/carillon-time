@@ -400,6 +400,92 @@ func TestResetEmptiesFilter(t *testing.T) {
 	}
 }
 
+// TestReResolveAfterTimeouts checks that a hostname is looked up once, kept
+// while the server answers, looked up again only after resolveAfterTimeouts
+// consecutive timeouts, and that landing on a different server discards the
+// clock filter.
+func TestReResolveAfterTimeouts(t *testing.T) {
+	refB := ntp.RefID{192, 0, 2, 2}
+	var drop atomic.Bool
+	srvA := newFakeServer(t, func(req ntp.Packet, raw []byte) []byte {
+		if drop.Load() {
+			return nil
+		}
+		return plain(req, raw)
+	})
+	srvB := newFakeServer(t, func(req ntp.Packet, _ []byte) []byte {
+		return reply(req, func(p *ntp.Packet) { p.ReferenceID = refB })
+	})
+
+	n, err := NewNTP(NTPConfig{Name: "pool", Address: "ntp.test", Timeout: 100 * time.Millisecond},
+		clock.ReadOnly(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewNTP: %v", err)
+	}
+	var target atomic.Pointer[netip.AddrPort]
+	target.Store(&srvA.addr)
+	var lookups atomic.Int32
+	n.lookup = func(_ context.Context, host string, port uint16) (netip.AddrPort, error) {
+		if host != "ntp.test" || port != 123 {
+			t.Errorf("lookup %s:%d, want ntp.test:123", host, port)
+		}
+		lookups.Add(1)
+		return *target.Load(), nil
+	}
+	// Poll without delay until the poller has moved to B, then park it so
+	// the assertions below see exactly one exchange with B.
+	n.sleep = func(ctx context.Context, _ time.Duration) bool {
+		if n.Info().Resolved == srvB.addr {
+			<-ctx.Done()
+			return false
+		}
+		return ctx.Err() == nil
+	}
+	out, stop := run(t, n)
+	defer stop()
+
+	if m := next(t, out); !m.Valid || m.RefID == refB {
+		t.Fatalf("first measurement %+v, want a valid reply from A", m)
+	}
+	if got := lookups.Load(); got != 1 {
+		t.Fatalf("lookups after first poll = %d, want 1", got)
+	}
+
+	// A goes silent while the name already points at B. A request already
+	// in flight to A may still be answered; after that exactly
+	// resolveAfterTimeouts misses must pass before the name is looked up
+	// again and the first reply from B arrives.
+	drop.Store(true)
+	target.Store(&srvB.addr)
+	misses := 0
+	for {
+		m := next(t, out)
+		if m.Valid {
+			if m.RefID == refB {
+				break
+			}
+			continue
+		}
+		misses++
+		if misses > resolveAfterTimeouts {
+			t.Fatalf("%d misses without re-resolving", misses)
+		}
+	}
+	if misses != resolveAfterTimeouts {
+		t.Fatalf("re-resolved after %d misses, want %d", misses, resolveAfterTimeouts)
+	}
+	if got := lookups.Load(); got != 2 {
+		t.Fatalf("lookups = %d, want 2", got)
+	}
+	info := n.Info()
+	if info.Resolved != srvB.addr || info.Reach != 1 || info.Timeouts != resolveAfterTimeouts {
+		t.Fatalf("info %+v", info)
+	}
+	if n.filter.Len() != 1 {
+		t.Fatalf("filter has %d samples, want 1 after changing server", n.filter.Len())
+	}
+}
+
 func TestQuery(t *testing.T) {
 	srv := newFakeServer(t, plain)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
