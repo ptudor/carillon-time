@@ -43,8 +43,8 @@ type Response struct {
 	Synced      *bool        `json:"synced,omitempty"`
 }
 
-// Refclock is one local PPS clock's hardware, filtering and qualification
-// status.
+// Refclock is one local PPS or NMEA clock's hardware, filtering and
+// qualification status.
 type Refclock struct {
 	Name      string `json:"name"`
 	Type      string `json:"type"`
@@ -63,6 +63,14 @@ type Refclock struct {
 	LastInterval   float64   `json:"last_interval"`
 	LastPulse      time.Time `json:"last_pulse,omitempty"`
 	LastOffset     float64   `json:"last_offset"`
+	FixKnown       bool      `json:"fix_known"`
+	FixValid       bool      `json:"fix_valid"`
+	FixQuality     int       `json:"fix_quality"`
+	Satellites     int       `json:"satellites"`
+	Sentence       string    `json:"sentence,omitempty"`
+	LastSentence   time.Time `json:"last_sentence,omitempty"`
+	MeasuredLag    float64   `json:"measured_lag_seconds"`
+	LagSamples     int       `json:"lag_samples"`
 
 	Samples  uint64 `json:"samples"`
 	Timeouts uint64 `json:"timeouts"`
@@ -214,8 +222,9 @@ func SourcesOf(st *engine.Status) []Source {
 	return out
 }
 
-// RefclocksOf merges each PPS source's lock-free hardware snapshot with the
-// selector's global second-numbering decision.
+// RefclocksOf merges each local source's lock-free hardware snapshot with the
+// selector's second-numbering decision. Only pulse sources need global PPS
+// qualification; NMEA numbers its own seconds.
 func RefclocksOf(st *engine.Status) []Refclock {
 	out := make([]Refclock, 0)
 	for _, s := range st.Sources {
@@ -224,7 +233,11 @@ func RefclocksOf(st *engine.Status) []Refclock {
 			continue
 		}
 		r := info.Refclock
-		qualified := st.PPSQualified && s.Reach != 0
+		pulse := r.Type == "pps" || r.Type == "gps-pps"
+		qualified := s.Reach != 0
+		if pulse {
+			qualified = qualified && st.PPSQualified
+		}
 		out = append(out, Refclock{
 			Name: s.Name, Type: r.Type, Device: r.Device, Edge: r.Edge,
 			Reach: s.Reach, Poll: s.Poll, Sequence: r.Sequence,
@@ -233,6 +246,9 @@ func RefclocksOf(st *engine.Status) []Refclock {
 			IntervalJitter: r.IntervalJitter, LastInterval: r.LastInterval,
 			LastPulse: r.LastPulse, LastOffset: r.LastOffset, Samples: r.Samples, Timeouts: r.Timeouts,
 			Gaps: r.Gaps, Glitches: r.Glitches, Spikes: r.Spikes,
+			FixKnown: r.FixKnown, FixValid: r.FixValid, FixQuality: r.FixQuality, Satellites: r.Satellites,
+			Sentence: r.Sentence, LastSentence: r.LastSentence,
+			MeasuredLag: r.MeasuredLag, LagSamples: r.LagSamples,
 		})
 	}
 	return out

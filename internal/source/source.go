@@ -71,7 +71,7 @@ type Info struct {
 	Refclock *RefclockInfo
 }
 
-// RefclockInfo is the hardware/filter view of a local PPS reference clock.
+// RefclockInfo is the hardware/filter view of a local reference clock.
 // Qualification is added by the control layer because only the discipline
 // selector knows whether a numbering source currently survives.
 type RefclockInfo struct {
@@ -87,6 +87,15 @@ type RefclockInfo struct {
 	LastPulse      time.Time
 	LastOffset     float64
 	LastInterval   float64
+
+	FixKnown     bool
+	FixValid     bool
+	FixQuality   int
+	Satellites   int
+	Sentence     string
+	LastSentence time.Time
+	MeasuredLag  float64
+	LagSamples   int
 
 	Samples  uint64
 	Timeouts uint64

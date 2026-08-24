@@ -152,24 +152,71 @@ func runDaemon(args []string) int {
 	}
 	for i := range cfg.Refclocks {
 		r := &cfg.Refclocks[i]
-		edge, err := pps.ParseEdge(r.Edge)
-		if err != nil {
-			log.Error("refclock", "name", r.Name, "error", err)
-			return exitUsage
+		if r.Type == "pps" {
+			edge, err := pps.ParseEdge(r.Edge)
+			if err != nil {
+				log.Error("refclock", "name", r.Name, "error", err)
+				return exitUsage
+			}
+			src, err := refclock.NewPPS(refclock.PPSConfig{
+				Name: r.Name, Device: r.Device, Edge: edge, Offset: r.Offset,
+				LockJitter: r.LockJitter, PollMin: int8(r.PollMin), PollMax: int8(r.PollMax),
+			}, clk, log)
+			if err != nil {
+				log.Error("refclock", "name", r.Name, "error", err)
+				return exitRuntime
+			}
+			specs = append(specs, engine.SourceSpec{
+				Source:  src,
+				Options: discipline.Options{Prefer: r.Prefer, NoSelect: r.NoSelect, PPS: true},
+			})
+			continue
 		}
-		src, err := refclock.NewPPS(refclock.PPSConfig{
-			Name: r.Name, Device: r.Device, Edge: edge, Offset: r.Offset,
-			LockJitter: r.LockJitter, PollMin: int8(r.PollMin), PollMax: int8(r.PollMax),
+
+		var pulse *refclock.PulseTracker
+		if r.HasPPS() {
+			pulse = &refclock.PulseTracker{}
+		}
+		nmea, err := refclock.NewNMEA(refclock.NMEAConfig{
+			Name: r.Name + "/nmea", Device: r.Device, Baud: r.Baud,
+			Offset: r.NMEAOffset, Sentences: r.Sentences, BuildTime: buildinfo.Time(), Pulse: pulse,
 		}, clk, log)
 		if err != nil {
 			log.Error("refclock", "name", r.Name, "error", err)
 			return exitRuntime
 		}
 		specs = append(specs, engine.SourceSpec{
-			Source: src,
+			Source: nmea,
 			Options: discipline.Options{
-				Prefer: r.Prefer, NoSelect: r.NoSelect, PPS: true,
+				Prefer: r.Prefer && !r.HasPPS(), NoSelect: r.NoSelect, Numbering: true,
 			},
+		})
+		if !r.HasPPS() {
+			continue
+		}
+		edge, err := pps.ParseEdge(r.PPSEdge)
+		if err != nil {
+			_ = nmea.Close()
+			log.Error("refclock", "name", r.Name, "error", err)
+			return exitUsage
+		}
+		ppsDevice := r.PPS
+		if r.PPS == "dcd" || r.PPS == "cts" {
+			ppsDevice = r.Device
+		}
+		pulseSource, err := refclock.NewPPS(refclock.PPSConfig{
+			Name: r.Name + "/pps", Type: "gps-pps", Device: ppsDevice,
+			Edge: edge, Offset: r.PPSOffset, LockJitter: r.LockJitter,
+			PollMin: int8(r.PollMin), PollMax: int8(r.PollMax), OnPulse: pulse.Observe,
+		}, clk, log)
+		if err != nil {
+			_ = nmea.Close()
+			log.Error("refclock", "name", r.Name, "error", err)
+			return exitRuntime
+		}
+		specs = append(specs, engine.SourceSpec{
+			Source:  pulseSource,
+			Options: discipline.Options{Prefer: r.Prefer, NoSelect: r.NoSelect, PPS: true},
 		})
 	}
 

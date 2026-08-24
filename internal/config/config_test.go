@@ -138,6 +138,49 @@ prefer = true
 	}
 }
 
+func TestParseGPSRefclock(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[refclock]]
+name = "roof"
+type = "gps"
+device = "/dev/ttyS0"
+pps = "/dev/pps0"
+pps_offset = 0.000001
+nmea_offset = 0.15
+sentences = ["ZDA"]
+prefer = true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Refclocks[0]
+	if r.Baud != 9600 || r.PPSEdge != "assert" || r.PollMin != 4 || r.PollMax != 7 {
+		t.Fatalf("GPS defaults: %+v", r)
+	}
+	if got := r.SourceNames(); len(got) != 2 || got[0] != "roof/nmea" || got[1] != "roof/pps" {
+		t.Fatalf("logical names: %v", got)
+	}
+
+	nmeaOnly, err := Parse([]byte(`
+[[refclock]]
+name = "gps"
+type = "gps"
+device = "/dev/ttyS0"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(nmeaOnly); err != nil {
+		t.Fatal(err)
+	}
+	if nmeaOnly.Refclocks[0].PPS != "none" || nmeaOnly.Refclocks[0].HasPPS() {
+		t.Fatalf("NMEA-only defaults: %+v", nmeaOnly.Refclocks[0])
+	}
+}
+
 func TestParseUnknownKey(t *testing.T) {
 	_, err := Parse([]byte("[daemon]\nlog_levle = \"info\"\n[[server]]\naddress = \"a\"\n"))
 	if err == nil {
@@ -313,14 +356,23 @@ func TestValidateRules(t *testing.T) {
 		{"step limit", func(c *Config) { c.Step.Limit = -2 }, "limit -2"},
 		{"step panic", func(c *Config) { c.Step.Panic = 0.1 }, "panic 0.1 must be greater than threshold"},
 		{"bad refclock type", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "gps", Device: "/dev/null", Edge: "assert", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "not implemented"},
+			c.Refclocks = []Refclock{{Name: "p", Type: "shm", Device: "/dev/null", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "not pps or gps"},
 		{"bad refclock edge", func(c *Config) {
 			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "rising", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
 		}, "not assert or clear"},
 		{"bad refclock jitter", func(c *Config) {
 			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PollMin: 4, PollMax: 7}}
 		}, "lock_jitter"},
+		{"bad GPS baud", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "g", Type: "gps", Device: "/dev/null", Baud: 123, PPS: "none", PPSEdge: "assert", Sentences: []string{"RMC"}, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "baud 123"},
+		{"bad GPS PPS", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "g", Type: "gps", Device: "/dev/null", Baud: 9600, PPS: "serial", PPSEdge: "assert", Sentences: []string{"RMC"}, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "absolute device path"},
+		{"bad GPS sentence", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "g", Type: "gps", Device: "/dev/null", Baud: 9600, PPS: "none", PPSEdge: "assert", Sentences: []string{"GGA"}, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "not RMC or ZDA"},
 		{"duplicate source name", func(c *Config) {
 			c.Refclocks = []Refclock{{Name: "a", Type: "pps", Device: "/dev/null", Edge: "assert", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
 		}, "duplicate name"},

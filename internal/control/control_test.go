@@ -183,7 +183,10 @@ func TestRefclockConversion(t *testing.T) {
 	st := &engine.Status{
 		Status: discipline.Status{
 			PPSQualified: true,
-			Sources:      []discipline.SourceStatus{{Name: "pps0", Status: discipline.StatusSystem, Reach: 0xff, Poll: 4}},
+			Sources: []discipline.SourceStatus{
+				{Name: "pps0", Status: discipline.StatusSystem, Reach: 0xff, Poll: 4},
+				{Name: "gps/nmea", Status: discipline.StatusSurvivor, Reach: 0x0f, Poll: 4},
+			},
 		},
 		Infos: map[string]source.Info{
 			"pps0": {
@@ -193,10 +196,20 @@ func TestRefclockConversion(t *testing.T) {
 					Stable: true, Sequence: 42, WindowSamples: 16, WindowJitter: 2e-6,
 				},
 			},
+			"gps/nmea": {
+				Name: "gps/nmea",
+				Refclock: &source.RefclockInfo{
+					Type: "gps-nmea", Device: "/dev/ttyS0", Stable: true,
+					FixKnown: true, FixValid: true, Satellites: 9, MeasuredLag: 0.15, LagSamples: 8,
+				},
+			},
 		},
 	}
 	rs := RefclocksOf(st)
-	if len(rs) != 1 || !rs[0].Qualified || !rs[0].Locked || rs[0].Sequence != 42 {
+	if len(rs) != 2 || !rs[0].Qualified || !rs[0].Locked || rs[0].Sequence != 42 {
 		t.Fatalf("refclocks: %+v", rs)
+	}
+	if !rs[1].Qualified || !rs[1].Locked || !rs[1].FixValid || rs[1].Satellites != 9 || rs[1].LagSamples != 8 {
+		t.Fatalf("NMEA refclock: %+v", rs[1])
 	}
 }

@@ -35,6 +35,9 @@ type collector struct {
 	ppsSamples *prometheus.Desc
 	ppsJitter  *prometheus.Desc
 	ppsLocked  *prometheus.Desc
+	gpsFix     *prometheus.Desc
+	gpsSats    *prometheus.Desc
+	gpsLag     *prometheus.Desc
 
 	serverEnabled     *prometheus.Desc
 	serverRequests    *prometheus.Desc
@@ -80,6 +83,9 @@ func newCollector(snapshot func() Snapshot) *collector {
 		ppsSamples: desc("carillon_pps_samples_total", "PPS sample and rejection counters.", "source", "result"),
 		ppsJitter:  desc("carillon_pps_jitter_seconds", "Robust jitter of the current PPS sample window.", "source"),
 		ppsLocked:  desc("carillon_pps_locked", "Whether PPS is stable and qualified to discipline the clock.", "source"),
+		gpsFix:     desc("carillon_gps_fix_valid", "Whether the GPS receiver reports a valid fix.", "source"),
+		gpsSats:    desc("carillon_gps_satellites", "Satellites used by the GPS receiver.", "source"),
+		gpsLag:     desc("carillon_gps_nmea_lag_seconds", "Measured lag from the latest PPS edge to NMEA sentence arrival.", "source"),
 
 		serverEnabled:     desc("carillon_server_enabled", "Whether the NTP listener is configured."),
 		serverRequests:    desc("carillon_server_requests_total", "NTP listener request counters.", "result"),
@@ -95,7 +101,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.steps, c.updates, c.leapPending, c.buildInfo,
 		c.sourceOffset, c.sourceDelay, c.sourceJitter, c.sourceDistance,
 		c.sourceReach, c.sourceSelected, c.sourceLastRx, c.sourceNoKernelTS, c.sourceEvents,
-		c.ppsSamples, c.ppsJitter, c.ppsLocked,
+		c.ppsSamples, c.ppsJitter, c.ppsLocked, c.gpsFix, c.gpsSats, c.gpsLag,
 		c.serverEnabled, c.serverRequests, c.serverLastRequest, c.serverLastServed, c.serverNoKernelTS,
 	} {
 		ch <- d
@@ -153,14 +159,21 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for _, ref := range s.Refclocks {
-		for result, value := range map[string]uint64{
-			"ok": ref.Samples, "timeout": ref.Timeouts, "gap": ref.Gaps,
-			"glitch": ref.Glitches, "spike": ref.Spikes,
-		} {
-			counter(c.ppsSamples, value, ref.Name, result)
+		if ref.Type == "pps" || ref.Type == "gps-pps" {
+			for result, value := range map[string]uint64{
+				"ok": ref.Samples, "timeout": ref.Timeouts, "gap": ref.Gaps,
+				"glitch": ref.Glitches, "spike": ref.Spikes,
+			} {
+				counter(c.ppsSamples, value, ref.Name, result)
+			}
+			gauge(c.ppsJitter, ref.WindowJitter, ref.Name)
+			gauge(c.ppsLocked, boolValue(ref.Locked), ref.Name)
 		}
-		gauge(c.ppsJitter, ref.WindowJitter, ref.Name)
-		gauge(c.ppsLocked, boolValue(ref.Locked), ref.Name)
+		if ref.Type == "gps-nmea" {
+			gauge(c.gpsFix, boolValue(ref.FixValid), ref.Name)
+			gauge(c.gpsSats, float64(ref.Satellites), ref.Name)
+			gauge(c.gpsLag, ref.MeasuredLag, ref.Name)
+		}
 	}
 
 	gauge(c.serverEnabled, boolValue(s.Server.Enabled))

@@ -30,12 +30,14 @@ const (
 // PPSConfig configures a bare PPS reference clock.
 type PPSConfig struct {
 	Name       string
+	Type       string
 	Device     string
 	Edge       pps.Edge
 	Offset     float64
 	LockJitter float64
 	PollMin    int8
 	PollMax    int8
+	OnPulse    func(time.Time)
 }
 
 // PPS consumes kernel-timestamped pulse edges and emits robust, averaged
@@ -93,7 +95,7 @@ func newPPS(cfg PPSConfig, clk clock.Clock, log *slog.Logger, r pps.Reader, open
 	}
 	p.info.Store(&source.Info{
 		Name: cfg.Name, Address: cfg.Device, Poll: cfg.PollMin,
-		Refclock: &source.RefclockInfo{Type: "pps", Device: cfg.Device, Edge: cfg.Edge.String()},
+		Refclock: &source.RefclockInfo{Type: cfg.Type, Device: cfg.Device, Edge: cfg.Edge.String()},
 	})
 	return p
 }
@@ -101,6 +103,12 @@ func newPPS(cfg PPSConfig, clk clock.Clock, log *slog.Logger, r pps.Reader, open
 func defaultAndValidatePPS(cfg *PPSConfig, clk clock.Clock) error {
 	if cfg.Name == "" {
 		cfg.Name = "pps"
+	}
+	if cfg.Type == "" {
+		cfg.Type = "pps"
+	}
+	if cfg.Type != "pps" && cfg.Type != "gps-pps" {
+		return fmt.Errorf("refclock %q: invalid PPS type %q", cfg.Name, cfg.Type)
 	}
 	if cfg.Device == "" {
 		return fmt.Errorf("refclock %q: device is empty", cfg.Name)
@@ -143,6 +151,17 @@ func (p *PPS) Info() source.Info { return *p.info.Load() }
 // Reset implements source.Source. Reach is intentionally retained, while
 // samples captured before a clock step are discarded.
 func (p *PPS) Reset() { p.resetRequested.Store(true) }
+
+// Close releases the PPS device before Run starts. Run owns closure after it
+// has started; Close principally supports unwinding a multi-source GPS setup.
+func (p *PPS) Close() error {
+	if p == nil || p.reader == nil {
+		return nil
+	}
+	err := p.reader.Close()
+	p.reader = nil
+	return err
+}
 
 // Run implements source.Source.
 func (p *PPS) Run(ctx context.Context, out chan<- discipline.Measurement) error {
@@ -280,6 +299,9 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 		p.log.Info("PPS pulse returned")
 	}
 	p.haveEverPulse = true
+	if p.cfg.OnPulse != nil {
+		p.cfg.OnPulse(s.Time)
+	}
 	m.Reach = p.reach
 	p.appendWindow(theta)
 	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) {

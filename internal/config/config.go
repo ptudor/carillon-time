@@ -47,8 +47,8 @@ type Config struct {
 	Step       Step       `toml:"step"`
 }
 
-// Refclock is one local reference clock. Milestone M3 implements type "pps";
-// the later GPS type extends this same strict table.
+// Refclock is one local PPS or GPS reference clock. A GPS receiver always
+// creates a <name>/nmea source and, when PPS is enabled, a <name>/pps source.
 type Refclock struct {
 	Name   string `toml:"name"`
 	Type   string `toml:"type"`
@@ -64,6 +64,29 @@ type Refclock struct {
 	LockJitter float64 `toml:"lock_jitter"`
 	PollMin    int     `toml:"poll_min"`
 	PollMax    int     `toml:"poll_max"`
+
+	// GPS-only serial, sentence and optional PPS settings.
+	Baud       int      `toml:"baud"`
+	PPS        string   `toml:"pps"`
+	PPSEdge    string   `toml:"pps_edge"`
+	PPSOffset  float64  `toml:"pps_offset"`
+	NMEAOffset float64  `toml:"nmea_offset"`
+	Sentences  []string `toml:"sentences"`
+}
+
+// HasPPS reports whether this refclock produces a PPS logical source.
+func (r *Refclock) HasPPS() bool { return r.Type == "pps" || (r.Type == "gps" && r.PPS != "none") }
+
+// SourceNames returns the logical source names produced by this refclock.
+func (r *Refclock) SourceNames() []string {
+	if r.Type != "gps" {
+		return []string{r.Name}
+	}
+	names := []string{r.Name + "/nmea"}
+	if r.HasPPS() {
+		names = append(names, r.Name+"/pps")
+	}
+	return names
 }
 
 // Daemon holds process-wide paths and logging.
@@ -292,8 +315,22 @@ func Parse(data []byte) (*Config, error) {
 				r.Name = r.Type
 			}
 		}
-		if r.Edge == "" {
+		if r.Type == "pps" && r.Edge == "" {
 			r.Edge = "assert"
+		}
+		if r.Type == "gps" {
+			if r.Baud == 0 {
+				r.Baud = 9600
+			}
+			if r.PPS == "" {
+				r.PPS = "none"
+			}
+			if r.PPSEdge == "" {
+				r.PPSEdge = "assert"
+			}
+			if len(r.Sentences) == 0 {
+				r.Sentences = []string{"RMC", "ZDA"}
+			}
 		}
 		if r.LockJitter == 0 {
 			r.LockJitter = 200e-6
@@ -467,21 +504,28 @@ func Validate(cfg *Config) error {
 		label := fmt.Sprintf("refclock %q", r.Name)
 		if r.Name == "" {
 			fail("refclock #%d: name is empty", i+1)
-		} else if names[r.Name] {
-			fail("%s: duplicate name", label)
 		}
-		names[r.Name] = true
-		if r.Type != "pps" {
-			fail("%s: type %q is not implemented; M3 supports pps", label, r.Type)
+		if r.Type != "pps" && r.Type != "gps" {
+			fail("%s: type %q is not pps or gps", label, r.Type)
 		}
 		if r.Device == "" {
 			fail("%s: device must be set", label)
 		}
-		if r.Edge != "assert" && r.Edge != "clear" {
-			fail("%s: edge %q is not assert or clear", label, r.Edge)
+		for _, name := range r.SourceNames() {
+			if names[name] {
+				fail("%s: duplicate name %q for logical source", label, name)
+			}
+			names[name] = true
 		}
-		if math.IsNaN(r.Offset) || math.IsInf(r.Offset, 0) {
-			fail("%s: offset must be finite", label)
+		if r.Type == "pps" {
+			if r.Edge != "assert" && r.Edge != "clear" {
+				fail("%s: edge %q is not assert or clear", label, r.Edge)
+			}
+			if math.IsNaN(r.Offset) || math.IsInf(r.Offset, 0) {
+				fail("%s: offset must be finite", label)
+			}
+		} else if r.Type == "gps" {
+			validateGPSRefclock(r, label, fail)
 		}
 		if !(r.LockJitter > 0) || math.IsInf(r.LockJitter, 0) || math.IsNaN(r.LockJitter) {
 			fail("%s: lock_jitter %v must be greater than zero", label, r.LockJitter)
@@ -535,6 +579,43 @@ func Validate(cfg *Config) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func validateGPSRefclock(r *Refclock, label string, fail func(string, ...any)) {
+	if r.Edge != "" || r.Offset != 0 {
+		fail("%s: edge and offset apply only to type pps; use pps_edge and pps_offset", label)
+	}
+	switch r.Baud {
+	case 4800, 9600, 19200, 38400, 57600, 115200:
+	default:
+		fail("%s: baud %d is not one of 4800, 9600, 19200, 38400, 57600, 115200", label, r.Baud)
+	}
+	switch r.PPS {
+	case "none", "dcd", "cts":
+	default:
+		if !filepath.IsAbs(r.PPS) {
+			fail("%s: pps %q is not none, dcd, cts, or an absolute device path", label, r.PPS)
+		}
+	}
+	if r.PPS != "none" && r.PPSEdge != "assert" && r.PPSEdge != "clear" {
+		fail("%s: pps_edge %q is not assert or clear", label, r.PPSEdge)
+	}
+	if math.IsNaN(r.PPSOffset) || math.IsInf(r.PPSOffset, 0) {
+		fail("%s: pps_offset must be finite", label)
+	}
+	if math.IsNaN(r.NMEAOffset) || math.IsInf(r.NMEAOffset, 0) {
+		fail("%s: nmea_offset must be finite", label)
+	}
+	seen := make(map[string]bool, len(r.Sentences))
+	for _, sentence := range r.Sentences {
+		if sentence != "RMC" && sentence != "ZDA" {
+			fail("%s: sentence %q is not RMC or ZDA", label, sentence)
+		}
+		if seen[sentence] {
+			fail("%s: duplicate sentence %q", label, sentence)
+		}
+		seen[sentence] = true
+	}
 }
 
 func validateMonitor(m *Monitor, fail func(string, ...any)) {
@@ -749,17 +830,29 @@ func Check(cfg *Config) error {
 }
 
 func checkRefclockDevice(r *Refclock) error {
-	st, err := os.Stat(r.Device)
-	if err != nil {
-		return fmt.Errorf("device %s: %w", r.Device, err)
+	if err := checkCharacterDevice(r.Device); err != nil {
+		return err
 	}
-	if st.Mode()&(os.ModeDevice|os.ModeCharDevice) != os.ModeDevice|os.ModeCharDevice {
-		return fmt.Errorf("device %s is not a character device", r.Device)
-	}
-	if err := unix.Access(r.Device, unix.R_OK|unix.W_OK); err != nil {
-		return fmt.Errorf("device %s is not readable and writable: %w", r.Device, err)
+	if r.Type == "gps" && filepath.IsAbs(r.PPS) && r.PPS != r.Device {
+		if err := checkCharacterDevice(r.PPS); err != nil {
+			return fmt.Errorf("PPS %w", err)
+		}
 	}
 	return checkRefclockPlatform(r)
+}
+
+func checkCharacterDevice(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("device %s: %w", path, err)
+	}
+	if st.Mode()&(os.ModeDevice|os.ModeCharDevice) != os.ModeDevice|os.ModeCharDevice {
+		return fmt.Errorf("device %s is not a character device", path)
+	}
+	if err := unix.Access(path, unix.R_OK|unix.W_OK); err != nil {
+		return fmt.Errorf("device %s is not readable and writable: %w", path, err)
+	}
+	return nil
 }
 
 // checkWritableFileOrDir accepts an existing writable regular file, or a
