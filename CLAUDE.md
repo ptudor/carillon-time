@@ -7,14 +7,14 @@ second job is the two-host topology: the **home** box (GPS + PPS, stratum 1)
 is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
-**Status (2026-08-23):** milestones M0–M2 of `DESIGN.md` §15 are implemented
-in code — wire format, CMAC auth, config, Linux/FreeBSD clock actuators, the
-discipline pipeline with simulation tests, the NTP client source, engine,
-safe NTP server, control socket, `carillon` (with `-check` and `query`) and
-`carillonctl`. Not yet built: the PPS and GPS refclocks (M3),
-leapfile/stats/metrics (M4), OpenWrt packaging (M5). Nothing has run on real
-hardware yet; the home → colo topology, `hwtest`-tagged tests, and `deploy/`
-scripts are the next things to exercise on the FreeBSD/Linux boxes.
+**Status (2026-08-23):** milestones M0–M2 of `DESIGN.md` §15 are implemented.
+The authenticated two-host topology is deployed on `gummi` (Fedora 43) and
+`twocom` (FreeBSD 15): both clock backends, init systems, drift persistence,
+IPv4/IPv6 listeners, ACLs, CMAC, and client/server paths have passed an initial
+real-host acceptance run (`deploy/ACCEPTANCE.md`). They are now the long-term
+in-house test hosts. Not yet built: the PPS and GPS refclocks (M3),
+leapfile/stats/metrics (M4), and OpenWrt packaging (M5). Real PPS hardware
+tests and the long-duration accuracy comparison remain ahead.
 
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
@@ -164,15 +164,15 @@ dependency.
 - State: `/var/db/carillon/` (FreeBSD) or `/var/lib/carillon/` (Linux) — drift file.
 - Control socket: `/var/run/carillon/carillon.sock`; init creates the
   daemon-owned `/var/run/carillon` directory.
-- rc.d script uses `/usr/sbin/daemon -f -p <pidfile> -u carillon`, matching the
-  other daemons in `~/Git/daemons/`.
+- rc.d invokes `/usr/sbin/daemon` with `-f -S -T carillon`, a pidfile, and
+  `-u carillon`; `-S` preserves structured stderr in syslog.
 - `carillon` must refuse to start if UDP 123 is already bound, with a message that
   names the likely culprit (ntpd, chrony, systemd-timesyncd).
 
 ## Git
 
-Repository is initialised on `main` with no commits and no remote yet. Commit
-directly to `main` (global rule). Ask before adding a remote.
+The repository is on `main` with `origin` configured. Commit directly to
+`main` and push useful checkpoints regularly.
 
 ## Vocabulary
 
