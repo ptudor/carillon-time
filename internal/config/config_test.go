@@ -93,6 +93,30 @@ func TestParseFull(t *testing.T) {
 	}
 }
 
+func TestParsePPSRefclock(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[[refclock]]
+name = "pps0"
+type = "pps"
+device = "/dev/pps0"
+offset = 0.000001
+prefer = true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Refclocks) != 1 {
+		t.Fatalf("refclocks: %+v", cfg.Refclocks)
+	}
+	r := cfg.Refclocks[0]
+	if r.Edge != "assert" || r.PollMin != 4 || r.PollMax != 7 || r.LockJitter != 200e-6 || !r.Prefer {
+		t.Fatalf("defaults: %+v", r)
+	}
+}
+
 func TestParseUnknownKey(t *testing.T) {
 	_, err := Parse([]byte("[daemon]\nlog_levle = \"info\"\n[[server]]\naddress = \"a\"\n"))
 	if err == nil {
@@ -208,7 +232,7 @@ func TestValidateRules(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		{"no servers", func(c *Config) { c.Servers = nil }, "at least one upstream"},
+		{"no sources", func(c *Config) { c.Servers = nil }, "at least one [[server]] or [[refclock]]"},
 		{"duplicate name", func(c *Config) { c.Servers[1].Name = "a" }, "duplicate name"},
 		{"empty address", func(c *Config) { c.Servers[0].Address = "" }, "address must be set"},
 		{"bad address", func(c *Config) { c.Servers[0].Address = "[::1" }, "missing ']'"},
@@ -216,7 +240,7 @@ func TestValidateRules(t *testing.T) {
 		{"poll_min low", func(c *Config) { c.Servers[0].PollMin = 1 }, "poll_min 1 out of range"},
 		{"poll_max high", func(c *Config) { c.Servers[0].PollMax = 20 }, "poll_max 20 out of range"},
 		{"poll inverted", func(c *Config) { c.Servers[0].PollMin, c.Servers[0].PollMax = 8, 6 }, "poll_max 6 is less than poll_min 8"},
-		{"two prefer", func(c *Config) { c.Servers[0].Prefer, c.Servers[1].Prefer = true, true }, "at most one server may be preferred"},
+		{"two prefer", func(c *Config) { c.Servers[0].Prefer, c.Servers[1].Prefer = true, true }, "at most one source may be preferred"},
 		{"prefer+noselect", func(c *Config) { c.Servers[0].Prefer, c.Servers[0].NoSelect = true, true }, "mutually exclusive"},
 		{"key without keys file", func(c *Config) { c.Servers[0].Key = 1 }, "keys must be set"},
 		{"serve no listen", func(c *Config) { c.Serve.Allow = []string{"127.0.0.0/8"} }, "listen must contain"},
@@ -242,6 +266,18 @@ func TestValidateRules(t *testing.T) {
 		{"step threshold", func(c *Config) { c.Step.Threshold = 0 }, "threshold"},
 		{"step limit", func(c *Config) { c.Step.Limit = -2 }, "limit -2"},
 		{"step panic", func(c *Config) { c.Step.Panic = 0.1 }, "panic 0.1 must be greater than threshold"},
+		{"bad refclock type", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "gps", Device: "/dev/null", Edge: "assert", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "not implemented"},
+		{"bad refclock edge", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "rising", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "not assert or clear"},
+		{"bad refclock jitter", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PollMin: 4, PollMax: 7}}
+		}, "lock_jitter"},
+		{"duplicate source name", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "a", Type: "pps", Device: "/dev/null", Edge: "assert", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "duplicate name"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

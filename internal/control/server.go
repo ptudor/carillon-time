@@ -122,6 +122,8 @@ func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Respo
 		return Response{Tracking: TrackingOf(s.eng.Status())}
 	case CmdSources:
 		return Response{Sources: SourcesOf(s.eng.Status())}
+	case CmdRefclock:
+		return Response{Refclocks: RefclocksOf(s.eng.Status())}
 	case CmdServerStats:
 		return Response{ServerStats: ServerStatsOf(s.stats.Snapshot())}
 	case CmdWaitSync:

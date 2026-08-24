@@ -17,6 +17,7 @@ import (
 const (
 	CmdTracking    = "tracking"
 	CmdSources     = "sources"
+	CmdRefclock    = "refclock"
 	CmdServerStats = "serverstats"
 	CmdWaitSync    = "waitsync"
 	CmdVersion     = "version"
@@ -37,8 +38,36 @@ type Response struct {
 	Version     string       `json:"version,omitempty"`
 	Tracking    *Tracking    `json:"tracking,omitempty"`
 	Sources     []Source     `json:"sources,omitempty"`
+	Refclocks   []Refclock   `json:"refclocks,omitempty"`
 	ServerStats *ServerStats `json:"serverstats,omitempty"`
 	Synced      *bool        `json:"synced,omitempty"`
+}
+
+// Refclock is one local PPS clock's hardware, filtering and qualification
+// status.
+type Refclock struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Device    string `json:"device"`
+	Edge      string `json:"edge"`
+	Reach     uint8  `json:"reach"`
+	Poll      int8   `json:"poll"`
+	Sequence  uint32 `json:"sequence"`
+	Qualified bool   `json:"qualified"`
+	Stable    bool   `json:"stable"`
+	Locked    bool   `json:"locked"`
+
+	WindowSamples  int       `json:"window_samples"`
+	WindowJitter   float64   `json:"window_jitter"`
+	IntervalJitter float64   `json:"interval_jitter"`
+	LastInterval   float64   `json:"last_interval"`
+	LastPulse      time.Time `json:"last_pulse,omitempty"`
+
+	Samples  uint64 `json:"samples"`
+	Timeouts uint64 `json:"timeouts"`
+	Gaps     uint64 `json:"gaps"`
+	Glitches uint64 `json:"glitches"`
+	Spikes   uint64 `json:"spikes"`
 }
 
 // ServerStats is the NTP listener's request-counter snapshot.
@@ -174,6 +203,30 @@ func SourcesOf(st *engine.Status) []Source {
 			line.Poll = info.Poll
 		}
 		out = append(out, line)
+	}
+	return out
+}
+
+// RefclocksOf merges each PPS source's lock-free hardware snapshot with the
+// selector's global second-numbering decision.
+func RefclocksOf(st *engine.Status) []Refclock {
+	out := make([]Refclock, 0)
+	for _, s := range st.Sources {
+		info, ok := st.Infos[s.Name]
+		if !ok || info.Refclock == nil {
+			continue
+		}
+		r := info.Refclock
+		qualified := st.PPSQualified && s.Reach != 0
+		out = append(out, Refclock{
+			Name: s.Name, Type: r.Type, Device: r.Device, Edge: r.Edge,
+			Reach: s.Reach, Poll: s.Poll, Sequence: r.Sequence,
+			Qualified: qualified, Stable: r.Stable, Locked: qualified && r.Stable,
+			WindowSamples: r.WindowSamples, WindowJitter: r.WindowJitter,
+			IntervalJitter: r.IntervalJitter, LastInterval: r.LastInterval,
+			LastPulse: r.LastPulse, Samples: r.Samples, Timeouts: r.Timeouts,
+			Gaps: r.Gaps, Glitches: r.Glitches, Spikes: r.Spikes,
+		})
 	}
 	return out
 }

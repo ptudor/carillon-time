@@ -5,6 +5,7 @@
 //
 //	carillonctl [-socket path] [-json] tracking
 //	carillonctl [-socket path] [-json] sources
+//	carillonctl [-socket path] [-json] refclock
 //	carillonctl [-socket path] [-json] serverstats
 //	carillonctl [-socket path] waitsync [seconds]
 //	carillonctl [-socket path] version
@@ -34,7 +35,7 @@ func run(args []string) int {
 	sock := fs.String("socket", config.Default().Daemon.Control, "control socket path")
 	asJSON := fs.Bool("json", false, "print the raw JSON response")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "usage: carillonctl [-socket path] [-json] tracking|sources|serverstats|version\n       carillonctl [-socket path] waitsync [seconds]\n")
+		fmt.Fprintf(fs.Output(), "usage: carillonctl [-socket path] [-json] tracking|sources|refclock|serverstats|version\n       carillonctl [-socket path] waitsync [seconds]\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -78,6 +79,8 @@ func run(args []string) int {
 		printTracking(resp.Tracking)
 	case control.CmdSources:
 		printSources(resp.Sources)
+	case control.CmdRefclock:
+		printRefclocks(resp.Refclocks)
 	case control.CmdServerStats:
 		printServerStats(resp.ServerStats)
 	case control.CmdWaitSync:
@@ -88,6 +91,18 @@ func run(args []string) int {
 		fmt.Println("synchronized")
 	}
 	return 0
+}
+
+func printRefclocks(rs []control.Refclock) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer w.Flush()
+	fmt.Fprintln(w, "NAME\tDEVICE\tEDGE\tREACH\tPOLL\tWINDOW σ\tINTERVAL σ\tQUALIFIED\tLOCKED\tSEQ\tGAPS/GLITCHES/SPIKES")
+	for _, r := range rs {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%v\t%v\t%d\t%d/%d/%d\n",
+			r.Name, r.Device, r.Edge, control.ReachOctal(r.Reach), r.Poll,
+			seconds(r.WindowJitter, false), seconds(r.IntervalJitter, false),
+			r.Qualified, r.Locked, r.Sequence, r.Gaps, r.Glitches, r.Spikes)
+	}
 }
 
 func printServerStats(s *control.ServerStats) {

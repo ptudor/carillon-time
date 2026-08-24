@@ -65,6 +65,11 @@ type Measurement struct {
 	// Source, Now, Reach and Poll are meaningful.
 	Valid bool
 
+	// Invalidate explicitly discards the source's previous estimate while
+	// retaining reachability. Ordinary misses leave it false so an older NTP
+	// estimate can age naturally; a PPS window that loses lock sets it true.
+	Invalidate bool
+
 	// At is the monotonic time of the sample the clock filter selected.
 	At float64
 

@@ -190,6 +190,18 @@ func TestSelectPPSQualification(t *testing.T) {
 	}
 }
 
+func TestMeasurementCanInvalidatePreviousEstimate(t *testing.T) {
+	s := &SourceState{Name: "pps", Options: Options{PPS: true}}
+	s.apply(Measurement{Reach: 1, Poll: 4, Valid: true, Offset: 1e-6, Leap: ntp.LeapNone})
+	if !s.Valid {
+		t.Fatal("valid sample was not recorded")
+	}
+	s.apply(Measurement{Reach: 3, Poll: 4, Invalidate: true})
+	if s.Valid || s.Reach != 3 {
+		t.Fatalf("invalidate did not retain reach and discard estimate: %+v", s)
+	}
+}
+
 func TestMajorityLeap(t *testing.T) {
 	a := src("a", 0, 0.01, Options{})
 	b := src("b", 0, 0.01, Options{})

@@ -102,6 +102,9 @@ type SourceState struct {
 func (s *SourceState) apply(m Measurement) {
 	s.Reach = m.Reach
 	s.Poll = m.Poll
+	if m.Invalidate {
+		s.Valid = false
+	}
 	if !m.Valid {
 		return
 	}
