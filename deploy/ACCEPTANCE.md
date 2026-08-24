@@ -61,6 +61,28 @@ This verifies both real kernel ABI paths through the no-pulse failure case.
 M3 stratum-1 acceptance remains pending until a serial input is wired to a
 live 1 Hz source.
 
+## M3 regression deployment — 2026-08-23
+
+Revision: `a5e3f65` (`Complete PPS refclock milestone`)
+
+- Both hosts passed the new strict config check with three upstreams, zero
+  enabled refclocks, and two listeners. The previous daemon/control binaries
+  remain installed as `.prev` rollback copies.
+- `gummi` synchronized eight seconds after restart; `twocom` synchronized
+  after 3 minutes 35 seconds. Both restarted from their drift files and made
+  zero clock steps.
+- `carillonctl refclock` returns an empty table on each host, confirming the
+  dormant M3 path does not affect an NTP-only configuration.
+- The authenticated `twocom` → `gummi` query and the ACL-authorized `gummi` →
+  `twocom` query succeeded with kernel receive timestamps after the upgrade.
+- Both hosts own IPv4 and IPv6 UDP/123 exclusively. The former Linux time
+  services remain disabled; FreeBSD retains `ntpd_enable=NO` and
+  `carillon_enable=YES`.
+
+The longer FreeBSD settling interval came from waiting for a third fresh
+lowest-delay filter estimate. It remained inside the documented 300-second
+upgrade check and is now part of the long-term soak baseline.
+
 ## Repeatable checklist
 
 On each host:
