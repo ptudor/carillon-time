@@ -165,8 +165,11 @@ func (l *udpListener) serve(ctx context.Context) error {
 		if ts, ok := sockts.Parse(oob[:oobn]); ok {
 			received = ts
 		} else if !missingTimestampWarned {
+			l.handler.stats.missingKernelTS.Add(1)
 			l.log.Warn("kernel receive timestamp missing; using a user-space timestamp")
 			missingTimestampWarned = true
+		} else {
+			l.handler.stats.missingKernelTS.Add(1)
 		}
 		replyOOB := sourceControl(oob[:oobn], l.network)
 		response := l.handler.Handle(buf[:n], from.Addr(), received, time.Now())

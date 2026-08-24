@@ -96,7 +96,7 @@ func TestReplyFieldsAndVersionEcho(t *testing.T) {
 			t.Fatalf("root delay %v", p.RootDelay.Seconds())
 		}
 	}
-	if got := stats.Snapshot(); got.Served != 4 || got.Unsynced != 0 {
+	if got := stats.Snapshot(); got.Served != 4 || got.Unsynced != 0 || !got.LastRequest.Equal(testWall) || !got.LastServed.Equal(testWall) {
 		t.Fatalf("stats %+v", got)
 	}
 }

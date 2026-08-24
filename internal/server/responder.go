@@ -137,6 +137,7 @@ func (h *Handler) Handle(request []byte, client netip.Addr, receive, monotonicNo
 	if err != nil || pkt.Mode != ntp.ModeClient {
 		return nil
 	}
+	storeLatest(&h.stats.lastRequest, receive)
 	client = client.Unmap()
 	if !h.permitted(client) {
 		h.stats.denied.Add(1)
@@ -176,6 +177,7 @@ func (h *Handler) Handle(request []byte, client netip.Addr, receive, monotonicNo
 	response := h.reply(&pkt, receive, st, refID, replyKey, !st.Synced)
 	if response != nil {
 		h.stats.served.Add(1)
+		storeLatest(&h.stats.lastServed, receive)
 		if !st.Synced {
 			h.stats.unsynced.Add(1)
 		}
@@ -248,21 +250,27 @@ func (h *Handler) reply(req *ntp.Packet, receive time.Time, st SystemStatus, ref
 
 // Stats contains lock-free counters shared by all listeners.
 type Stats struct {
-	served      atomic.Uint64
-	denied      atomic.Uint64
-	rateLimited atomic.Uint64
-	badAuth     atomic.Uint64
-	unsynced    atomic.Uint64
+	served          atomic.Uint64
+	denied          atomic.Uint64
+	rateLimited     atomic.Uint64
+	badAuth         atomic.Uint64
+	unsynced        atomic.Uint64
+	missingKernelTS atomic.Uint64
+	lastRequest     atomic.Int64
+	lastServed      atomic.Int64
 }
 
 // StatsSnapshot is a consistent-enough operational view of the independent
 // monotonic counters. Exact cross-field simultaneity is not required.
 type StatsSnapshot struct {
-	Served      uint64 `json:"served"`
-	Denied      uint64 `json:"denied"`
-	RateLimited uint64 `json:"ratelimited"`
-	BadAuth     uint64 `json:"badauth"`
-	Unsynced    uint64 `json:"unsynced"`
+	Served      uint64    `json:"served"`
+	Denied      uint64    `json:"denied"`
+	RateLimited uint64    `json:"ratelimited"`
+	BadAuth     uint64    `json:"badauth"`
+	Unsynced    uint64    `json:"unsynced"`
+	NoKernelTS  uint64    `json:"no_kernel_timestamp"`
+	LastRequest time.Time `json:"last_request,omitempty"`
+	LastServed  time.Time `json:"last_served,omitempty"`
 }
 
 // Snapshot returns the current counters.
@@ -276,5 +284,24 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		RateLimited: s.rateLimited.Load(),
 		BadAuth:     s.badAuth.Load(),
 		Unsynced:    s.unsynced.Load(),
+		NoKernelTS:  s.missingKernelTS.Load(),
+		LastRequest: atomicTime(s.lastRequest.Load()),
+		LastServed:  atomicTime(s.lastServed.Load()),
+	}
+}
+
+func atomicTime(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns).UTC()
+}
+
+func storeLatest(dst *atomic.Int64, t time.Time) {
+	ns := t.UnixNano()
+	for old := dst.Load(); ns > old; old = dst.Load() {
+		if dst.CompareAndSwap(old, ns) {
+			return
+		}
 	}
 }

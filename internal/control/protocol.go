@@ -72,18 +72,22 @@ type Refclock struct {
 
 // ServerStats is the NTP listener's request-counter snapshot.
 type ServerStats struct {
-	Served      uint64 `json:"served"`
-	Denied      uint64 `json:"denied"`
-	RateLimited uint64 `json:"ratelimited"`
-	BadAuth     uint64 `json:"badauth"`
-	Unsynced    uint64 `json:"unsynced"`
+	Served      uint64    `json:"served"`
+	Denied      uint64    `json:"denied"`
+	RateLimited uint64    `json:"ratelimited"`
+	BadAuth     uint64    `json:"badauth"`
+	Unsynced    uint64    `json:"unsynced"`
+	NoKernelTS  uint64    `json:"no_kernel_timestamp"`
+	LastRequest time.Time `json:"last_request,omitempty"`
+	LastServed  time.Time `json:"last_served,omitempty"`
 }
 
 // ServerStatsOf converts the server package's atomic counter snapshot.
 func ServerStatsOf(s ntpserver.StatsSnapshot) *ServerStats {
 	return &ServerStats{
 		Served: s.Served, Denied: s.Denied, RateLimited: s.RateLimited,
-		BadAuth: s.BadAuth, Unsynced: s.Unsynced,
+		BadAuth: s.BadAuth, Unsynced: s.Unsynced, NoKernelTS: s.NoKernelTS,
+		LastRequest: s.LastRequest, LastServed: s.LastServed,
 	}
 }
 
@@ -128,17 +132,18 @@ type Source struct {
 	RefID      string  `json:"refid"`
 	Leap       string  `json:"leap"`
 
-	Address   string    `json:"address,omitempty"`
-	Resolved  string    `json:"resolved,omitempty"`
-	LastRx    time.Time `json:"last_rx,omitempty"`
-	LastError string    `json:"last_error,omitempty"`
-	Sent      uint64    `json:"sent"`
-	Received  uint64    `json:"received"`
-	Timeouts  uint64    `json:"timeouts"`
-	Bogus     uint64    `json:"bogus"`
-	BadAuth   uint64    `json:"bad_auth"`
-	Kiss      uint64    `json:"kiss"`
-	Denied    bool      `json:"denied"`
+	Address    string    `json:"address,omitempty"`
+	Resolved   string    `json:"resolved,omitempty"`
+	LastRx     time.Time `json:"last_rx,omitempty"`
+	LastError  string    `json:"last_error,omitempty"`
+	Sent       uint64    `json:"sent"`
+	Received   uint64    `json:"received"`
+	Timeouts   uint64    `json:"timeouts"`
+	Bogus      uint64    `json:"bogus"`
+	BadAuth    uint64    `json:"bad_auth"`
+	Kiss       uint64    `json:"kiss"`
+	NoKernelTS uint64    `json:"no_kernel_timestamp"`
+	Denied     bool      `json:"denied"`
 }
 
 // TrackingOf converts an engine snapshot.
@@ -198,6 +203,7 @@ func SourcesOf(st *engine.Status) []Source {
 			line.LastError = info.LastError
 			line.Sent, line.Received, line.Timeouts = info.Sent, info.Received, info.Timeouts
 			line.Bogus, line.BadAuth, line.Kiss = info.Bogus, info.BadAuth, info.Kiss
+			line.NoKernelTS = info.NoKernelTS
 			line.Denied = info.Denied
 			line.Reach = info.Reach
 			line.Poll = info.Poll
