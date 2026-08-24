@@ -99,6 +99,47 @@ systemctl enable --now ntpd.service
 Substitute the host's former service (`chronyd` or `systemd-timesyncd`) in
 the last command when appropriate.
 
+## HTTP monitoring and statistics
+
+Enable the read-only snapshot, health, and Prometheus endpoints on loopback:
+
+```toml
+[monitor]
+listen = "127.0.0.1:9123"
+id = "twocom"
+name = "Twocom"
+roles = ["colo", "ntp-pool"]
+```
+
+The omitted `allow` retains the loopback-only default. After restarting:
+
+```sh
+curl --fail http://127.0.0.1:9123/api/v1/status
+curl --fail http://127.0.0.1:9123/healthz
+curl --fail http://127.0.0.1:9123/metrics
+```
+
+For a public NTP host, keep that listener on loopback and use the authenticated
+HTTPS example in `apache/carillon-monitor.conf`. Do not expose the full status
+document anonymously: it contains source addresses, device names, and recent
+errors. For direct LAN access instead, bind the host's private numeric address
+and set `monitor.allow` to the LAN prefixes. The daemon checks the immediate
+TCP peer and deliberately ignores `X-Forwarded-For`.
+
+Daily tuning data is separate and optional:
+
+```sh
+install -d -o carillon -g carillon -m 0750 /var/lib/carillon/stats
+```
+
+```toml
+[stats]
+dir = "/var/lib/carillon/stats"
+```
+
+Use `/var/db/carillon/stats` on FreeBSD. Files are named `loop.YYYY-MM-DD.tsv`,
+`sources.YYYY-MM-DD.tsv`, and `pps.YYYY-MM-DD.tsv` in UTC.
+
 ## FreeBSD with rc.d
 
 Create the daemon account and directories, then install the binaries, rc.d

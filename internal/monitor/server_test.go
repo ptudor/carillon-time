@@ -75,6 +75,25 @@ func TestStatusAndHealthHandlers(t *testing.T) {
 		t.Fatalf("health: %s", health.Status)
 	}
 
+	metrics, err := http.Get(base + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsBody, err := io.ReadAll(metrics.Body)
+	metrics.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`carillon_state{state="synced"} 1`,
+		`carillon_build_info{version="test-version"} 1`,
+		`carillon_server_requests_total{result="served"} 0`,
+	} {
+		if !strings.Contains(string(metricsBody), want) {
+			t.Errorf("metrics missing %q:\n%s", want, metricsBody)
+		}
+	}
+
 	req, err := http.NewRequest(http.MethodPost, base+"/api/v1/status", strings.NewReader(""))
 	if err != nil {
 		t.Fatal(err)

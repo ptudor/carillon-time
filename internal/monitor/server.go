@@ -96,6 +96,7 @@ func Listen(cfg Config) (*Server, error) {
 			Health     Health    `json:"health"`
 		}{Schema: s.Schema, SnapshotAt: s.SnapshotAt, Health: s.Health})
 	})
+	mux.Handle("GET /metrics", newMetricsHandler(snapshot))
 
 	h := securityHeaders(allowPeers(allow, mux))
 	httpServer := &http.Server{

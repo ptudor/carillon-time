@@ -289,6 +289,7 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 		i.Received++
 		r.Sequence = s.Sequence
 		r.LastPulse = s.Time
+		r.LastOffset = theta + p.cfg.Offset
 		r.Samples++
 	})
 

@@ -33,6 +33,7 @@ import (
 	"carillon/internal/refclock"
 	ntpserver "carillon/internal/server"
 	"carillon/internal/source"
+	"carillon/internal/stats"
 )
 
 // Exit codes: 1 runtime failure, 2 configuration or usage error.
@@ -172,6 +173,13 @@ func runDaemon(args []string) int {
 		})
 	}
 
+	var statsRecorder *stats.Recorder
+	var observe func(*engine.Status)
+	if cfg.Stats.Enabled() {
+		statsRecorder = stats.New(cfg.Stats.Dir, log)
+		observe = statsRecorder.Record
+	}
+
 	eng, err := engine.New(engine.Config{
 		Discipline: discipline.Config{
 			Loop: discipline.LoopConfig{
@@ -190,6 +198,7 @@ func runDaemon(args []string) int {
 		DriftFile: cfg.Daemon.DriftFile,
 		Sources:   specs,
 		Version:   buildinfo.Version,
+		Observe:   observe,
 	}, clk, log)
 	if err != nil {
 		log.Error("engine", "error", err)
@@ -266,8 +275,18 @@ func runDaemon(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	statsCtx, stopStats := context.WithCancel(context.Background())
+	defer stopStats()
 	auxErr := make(chan error, 3)
 	var wg sync.WaitGroup
+	if statsRecorder != nil {
+		log.Info("statistics enabled", "directory", cfg.Stats.Dir)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			statsRecorder.Run(statsCtx)
+		}()
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -300,6 +319,7 @@ func runDaemon(args []string) int {
 		}()
 	}
 	runErr := eng.Run(ctx)
+	stopStats()
 	stop()
 	wg.Wait()
 	if runErr == nil {

@@ -49,6 +49,9 @@ id = "twocom"
 name = "Twocom"
 roles = ["colo", "ntp-pool"]
 
+[stats]
+dir = "/var/db/carillon/stats"
+
 [discipline]
 min_survivors = 1
 holdover_max  = 3600
@@ -91,6 +94,9 @@ func TestParseFull(t *testing.T) {
 	}
 	if got := cfg.MonitorPrefixes(); len(got) != 2 || got[0] != netip.MustParsePrefix("127.0.0.0/8") {
 		t.Fatalf("monitor allow: %v", got)
+	}
+	if !cfg.Stats.Enabled() || cfg.Stats.Dir != "/var/db/carillon/stats" {
+		t.Fatalf("stats: %+v", cfg.Stats)
 	}
 	allow, deny, require := cfg.ServePrefixes()
 	if len(allow) != 2 || len(deny) != 1 || require[netip.MustParsePrefix("203.0.113.7/32")] != 1 {
@@ -147,6 +153,10 @@ func TestParseUnknownKey(t *testing.T) {
 	_, err = Parse([]byte("[monitor]\nlistne = \"127.0.0.1:9123\"\n"))
 	if err == nil || !strings.Contains(err.Error(), "listne") {
 		t.Fatalf("unknown [monitor] key must be rejected: %v", err)
+	}
+	_, err = Parse([]byte("[stats]\ndri = \"/tmp\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "dri") {
+		t.Fatalf("unknown [stats] key must be rejected: %v", err)
 	}
 }
 
@@ -291,6 +301,7 @@ func TestValidateRules(t *testing.T) {
 		{"monitor bad name", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Name = " trailing " }, "monitor: name"},
 		{"monitor bad role", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Roles = []string{"bad role"} }, "monitor: role"},
 		{"monitor duplicate role", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Roles = []string{"pool", "pool"} }, "duplicate role"},
+		{"stats current directory", func(c *Config) { c.Stats.Dir = "." }, "stats: dir"},
 		{"bad log level", func(c *Config) { c.Daemon.LogLevel = "verbose" }, "log_level"},
 		{"empty drift", func(c *Config) { c.Daemon.DriftFile = "" }, "drift_file must be set"},
 		{"empty control", func(c *Config) { c.Daemon.Control = "" }, "control must be set"},
@@ -391,13 +402,14 @@ func TestCheck(t *testing.T) {
 	cfg.Daemon.Control = filepath.Join(dir, "run", "carillon.sock")
 	cfg.Daemon.Keys = filepath.Join(dir, "keys")
 	cfg.Daemon.LeapFile = filepath.Join(dir, "leap-seconds.list")
+	cfg.Stats.Dir = filepath.Join(dir, "stats")
 
-	// Everything missing: four problems.
+	// Everything missing.
 	err := Check(cfg)
 	if err == nil {
 		t.Fatal("expected errors")
 	}
-	for _, want := range []string{"drift_file", "control", "keys", "leapfile"} {
+	for _, want := range []string{"drift_file", "control", "keys", "leapfile", "stats"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("missing %q in %v", want, err)
 		}
@@ -407,6 +419,9 @@ func TestCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "run"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cfg.Stats.Dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(cfg.Daemon.Keys, []byte("1 AES128CMAC 00\n"), 0o644); err != nil {

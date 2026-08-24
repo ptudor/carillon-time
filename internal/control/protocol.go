@@ -62,6 +62,7 @@ type Refclock struct {
 	IntervalJitter float64   `json:"interval_jitter"`
 	LastInterval   float64   `json:"last_interval"`
 	LastPulse      time.Time `json:"last_pulse,omitempty"`
+	LastOffset     float64   `json:"last_offset"`
 
 	Samples  uint64 `json:"samples"`
 	Timeouts uint64 `json:"timeouts"`
@@ -230,7 +231,7 @@ func RefclocksOf(st *engine.Status) []Refclock {
 			Qualified: qualified, Stable: r.Stable, Locked: qualified && r.Stable,
 			WindowSamples: r.WindowSamples, WindowJitter: r.WindowJitter,
 			IntervalJitter: r.IntervalJitter, LastInterval: r.LastInterval,
-			LastPulse: r.LastPulse, Samples: r.Samples, Timeouts: r.Timeouts,
+			LastPulse: r.LastPulse, LastOffset: r.LastOffset, Samples: r.Samples, Timeouts: r.Timeouts,
 			Gaps: r.Gaps, Glitches: r.Glitches, Spikes: r.Spikes,
 		})
 	}
