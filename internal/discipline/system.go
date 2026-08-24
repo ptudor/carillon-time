@@ -61,6 +61,8 @@ const (
 	EventPreferRegained                  // the prefer source is back
 	EventSystemSource                    // Source became the system source
 	EventUnknownSource                   // a measurement arrived for an unregistered source
+	EventPPSUnqualified                  // PPS is stable but no numbering source survives
+	EventPPSQualified                    // PPS has a numbering source again
 )
 
 // Event is a notable occurrence, for the engine to log and count.
@@ -95,6 +97,7 @@ type Status struct {
 
 	SystemSource string
 	PreferLost   bool
+	PPSQualified bool
 	LastUpdate   float64 // monotonic; zero if never
 	Updates      int
 	Steps        int
@@ -242,6 +245,13 @@ func (s *System) reselect(now float64) Result {
 		if was == StatusFalseticker && is != StatusFalseticker && is != StatusUnreachable {
 			res.Events = append(res.Events, Event{Kind: EventTruechimer, Source: src.Name, Value: src.Offset})
 		}
+		if src.PPS {
+			if is == StatusUnqualified && was != StatusUnqualified {
+				res.Events = append(res.Events, Event{Kind: EventPPSUnqualified, Source: src.Name})
+			} else if was == StatusUnqualified && is != StatusUnqualified && is != StatusUnreachable && is != StatusInvalid {
+				res.Events = append(res.Events, Event{Kind: EventPPSQualified, Source: src.Name})
+			}
+		}
 	}
 	if sel.PreferLost != s.preferLost {
 		kind := EventPreferRegained
@@ -350,6 +360,7 @@ func (s *System) Status(now float64) Status {
 		Pending:      s.loop.Pending,
 		SystemSource: s.sysName,
 		PreferLost:   s.preferLost,
+		PPSQualified: s.sel.PPSQualified,
 		Updates:      s.loop.Updates,
 		Steps:        s.loop.Steps,
 	}

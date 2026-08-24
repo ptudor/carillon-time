@@ -28,6 +28,8 @@ import (
 	"carillon/internal/engine"
 	"carillon/internal/ntp"
 	"carillon/internal/ntp/auth"
+	"carillon/internal/pps"
+	"carillon/internal/refclock"
 	ntpserver "carillon/internal/server"
 	"carillon/internal/source"
 )
@@ -84,7 +86,7 @@ func runDaemon(args []string) int {
 		if cfg.Serve.Enabled() {
 			listeners = len(cfg.Serve.Listen)
 		}
-		fmt.Printf("%s: configuration OK (%d upstreams, %d listeners)\n", *cfgPath, len(cfg.Servers), listeners)
+		fmt.Printf("%s: configuration OK (%d upstreams, %d refclocks, %d listeners)\n", *cfgPath, len(cfg.Servers), len(cfg.Refclocks), listeners)
 		return 0
 	}
 
@@ -140,6 +142,28 @@ func runDaemon(args []string) int {
 		specs = append(specs, engine.SourceSpec{
 			Source:  src,
 			Options: discipline.Options{Prefer: s.Prefer, NoSelect: s.NoSelect, Numbering: true},
+		})
+	}
+	for i := range cfg.Refclocks {
+		r := &cfg.Refclocks[i]
+		edge, err := pps.ParseEdge(r.Edge)
+		if err != nil {
+			log.Error("refclock", "name", r.Name, "error", err)
+			return exitUsage
+		}
+		src, err := refclock.NewPPS(refclock.PPSConfig{
+			Name: r.Name, Device: r.Device, Edge: edge, Offset: r.Offset,
+			LockJitter: r.LockJitter, PollMin: int8(r.PollMin), PollMax: int8(r.PollMax),
+		}, clk, log)
+		if err != nil {
+			log.Error("refclock", "name", r.Name, "error", err)
+			return exitRuntime
+		}
+		specs = append(specs, engine.SourceSpec{
+			Source: src,
+			Options: discipline.Options{
+				Prefer: r.Prefer, NoSelect: r.NoSelect, PPS: true,
+			},
 		})
 	}
 

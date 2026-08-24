@@ -9,6 +9,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -38,9 +39,29 @@ const (
 type Config struct {
 	Daemon     Daemon     `toml:"daemon"`
 	Servers    []Server   `toml:"server"`
+	Refclocks  []Refclock `toml:"refclock"`
 	Serve      Serve      `toml:"serve"`
 	Discipline Discipline `toml:"discipline"`
 	Step       Step       `toml:"step"`
+}
+
+// Refclock is one local reference clock. Milestone M3 implements type "pps";
+// the later GPS type extends this same strict table.
+type Refclock struct {
+	Name   string `toml:"name"`
+	Type   string `toml:"type"`
+	Device string `toml:"device"`
+	Edge   string `toml:"edge"`
+
+	// Offset is added to each PPS offset for fixed cable/driver delay.
+	Offset float64 `toml:"offset"`
+
+	Prefer   bool `toml:"prefer"`
+	NoSelect bool `toml:"noselect"`
+
+	LockJitter float64 `toml:"lock_jitter"`
+	PollMin    int     `toml:"poll_min"`
+	PollMax    int     `toml:"poll_max"`
 }
 
 // Daemon holds process-wide paths and logging.
@@ -233,6 +254,27 @@ func Parse(data []byte) (*Config, error) {
 			s.PollMax = DefaultPollMax
 		}
 	}
+	for i := range cfg.Refclocks {
+		r := &cfg.Refclocks[i]
+		if r.Name == "" {
+			r.Name = r.Device
+			if r.Name == "" {
+				r.Name = r.Type
+			}
+		}
+		if r.Edge == "" {
+			r.Edge = "assert"
+		}
+		if r.LockJitter == 0 {
+			r.LockJitter = 200e-6
+		}
+		if r.PollMin == 0 {
+			r.PollMin = 4
+		}
+		if r.PollMax == 0 {
+			r.PollMax = 7
+		}
+	}
 	return cfg, nil
 }
 
@@ -348,10 +390,10 @@ func Validate(cfg *Config) error {
 		fail("daemon: log_level %q is not one of debug, info, warn, error", cfg.Daemon.LogLevel)
 	}
 
-	if len(cfg.Servers) == 0 {
-		fail("no [[server]] configured: a daemon needs at least one upstream server (reference clocks arrive in a later milestone)")
+	if len(cfg.Servers) == 0 && len(cfg.Refclocks) == 0 {
+		fail("no time source configured: add at least one [[server]] or [[refclock]]")
 	}
-	names := make(map[string]bool, len(cfg.Servers))
+	names := make(map[string]bool, len(cfg.Servers)+len(cfg.Refclocks))
 	preferred := 0
 	needKeys := false
 	for i := range cfg.Servers {
@@ -390,8 +432,48 @@ func Validate(cfg *Config) error {
 			}
 		}
 	}
+	for i := range cfg.Refclocks {
+		r := &cfg.Refclocks[i]
+		label := fmt.Sprintf("refclock %q", r.Name)
+		if r.Name == "" {
+			fail("refclock #%d: name is empty", i+1)
+		} else if names[r.Name] {
+			fail("%s: duplicate name", label)
+		}
+		names[r.Name] = true
+		if r.Type != "pps" {
+			fail("%s: type %q is not implemented; M3 supports pps", label, r.Type)
+		}
+		if r.Device == "" {
+			fail("%s: device must be set", label)
+		}
+		if r.Edge != "assert" && r.Edge != "clear" {
+			fail("%s: edge %q is not assert or clear", label, r.Edge)
+		}
+		if math.IsNaN(r.Offset) || math.IsInf(r.Offset, 0) {
+			fail("%s: offset must be finite", label)
+		}
+		if !(r.LockJitter > 0) || math.IsInf(r.LockJitter, 0) || math.IsNaN(r.LockJitter) {
+			fail("%s: lock_jitter %v must be greater than zero", label, r.LockJitter)
+		}
+		if r.PollMin < MinPoll || r.PollMin > MaxPoll {
+			fail("%s: poll_min %d out of range %d..%d", label, r.PollMin, MinPoll, MaxPoll)
+		}
+		if r.PollMax < MinPoll || r.PollMax > MaxPoll {
+			fail("%s: poll_max %d out of range %d..%d", label, r.PollMax, MinPoll, MaxPoll)
+		}
+		if r.PollMin <= MaxPoll && r.PollMax >= MinPoll && r.PollMax < r.PollMin {
+			fail("%s: poll_max %d is less than poll_min %d", label, r.PollMax, r.PollMin)
+		}
+		if r.Prefer {
+			preferred++
+			if r.NoSelect {
+				fail("%s: prefer and noselect are mutually exclusive", label)
+			}
+		}
+	}
 	if preferred > 1 {
-		fail("prefer is set on %d servers; at most one server may be preferred", preferred)
+		fail("prefer is set on %d sources; at most one source may be preferred", preferred)
 	}
 	validateServe(&cfg.Serve, &needKeys, fail)
 	if needKeys && cfg.Daemon.Keys == "" {
@@ -540,7 +622,27 @@ func Check(cfg *Config) error {
 			f.Close()
 		}
 	}
+	for i := range cfg.Refclocks {
+		r := &cfg.Refclocks[i]
+		if err := checkRefclockDevice(r); err != nil {
+			errs = append(errs, fmt.Errorf("refclock %q: %w", r.Name, err))
+		}
+	}
 	return errors.Join(errs...)
+}
+
+func checkRefclockDevice(r *Refclock) error {
+	st, err := os.Stat(r.Device)
+	if err != nil {
+		return fmt.Errorf("device %s: %w", r.Device, err)
+	}
+	if st.Mode()&(os.ModeDevice|os.ModeCharDevice) != os.ModeDevice|os.ModeCharDevice {
+		return fmt.Errorf("device %s is not a character device", r.Device)
+	}
+	if err := unix.Access(r.Device, unix.R_OK|unix.W_OK); err != nil {
+		return fmt.Errorf("device %s is not readable and writable: %w", r.Device, err)
+	}
+	return checkRefclockPlatform(r)
 }
 
 // checkWritableFileOrDir accepts an existing writable regular file, or a

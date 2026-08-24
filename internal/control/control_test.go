@@ -11,6 +11,7 @@ import (
 	"carillon/internal/clock"
 	"carillon/internal/discipline"
 	"carillon/internal/engine"
+	"carillon/internal/source"
 )
 
 func socketPath(t *testing.T) string {
@@ -68,6 +69,10 @@ func TestServerRoundTrip(t *testing.T) {
 	if err != nil || len(resp.Sources) != 0 {
 		t.Fatalf("sources: %+v %v", resp, err)
 	}
+	resp, err = Call(ctx, path, Request{Command: CmdRefclock})
+	if err != nil || len(resp.Refclocks) != 0 {
+		t.Fatalf("refclock: %+v %v", resp, err)
+	}
 	resp, err = Call(ctx, path, Request{Command: CmdServerStats})
 	if err != nil || resp.ServerStats == nil || *resp.ServerStats != (ServerStats{}) {
 		t.Fatalf("serverstats: %+v %v", resp, err)
@@ -117,5 +122,27 @@ func TestConversions(t *testing.T) {
 	}
 	if ReachOctal(0xff) != "377" || ReachOctal(1) != "001" {
 		t.Fatal("reach octal")
+	}
+}
+
+func TestRefclockConversion(t *testing.T) {
+	st := &engine.Status{
+		Status: discipline.Status{
+			PPSQualified: true,
+			Sources:      []discipline.SourceStatus{{Name: "pps0", Status: discipline.StatusSystem, Reach: 0xff, Poll: 4}},
+		},
+		Infos: map[string]source.Info{
+			"pps0": {
+				Name: "pps0",
+				Refclock: &source.RefclockInfo{
+					Type: "pps", Device: "/dev/pps0", Edge: "assert",
+					Stable: true, Sequence: 42, WindowSamples: 16, WindowJitter: 2e-6,
+				},
+			},
+		},
+	}
+	rs := RefclocksOf(st)
+	if len(rs) != 1 || !rs[0].Qualified || !rs[0].Locked || rs[0].Sequence != 42 {
+		t.Fatalf("refclocks: %+v", rs)
 	}
 }

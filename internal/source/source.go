@@ -65,4 +65,31 @@ type Info struct {
 	BadAuth    uint64
 	Kiss       uint64
 	NoKernelTS uint64
+
+	// Refclock is non-nil for a local reference clock. The pointed-to value
+	// is immutable and replaced with every Info snapshot.
+	Refclock *RefclockInfo
+}
+
+// RefclockInfo is the hardware/filter view of a local PPS reference clock.
+// Qualification is added by the control layer because only the discipline
+// selector knows whether a numbering source currently survives.
+type RefclockInfo struct {
+	Type   string
+	Device string
+	Edge   string
+
+	Sequence       uint32
+	WindowSamples  int
+	WindowJitter   float64
+	IntervalJitter float64
+	Stable         bool
+	LastPulse      time.Time
+	LastInterval   float64
+
+	Samples  uint64
+	Timeouts uint64
+	Gaps     uint64
+	Glitches uint64
+	Spikes   uint64
 }

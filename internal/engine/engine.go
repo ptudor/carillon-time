@@ -361,6 +361,10 @@ func (e *Engine) logEvent(ev discipline.Event) {
 		e.log.Info("system source", "source", ev.Source)
 	case discipline.EventUnknownSource:
 		e.log.Error("measurement from an unregistered source", "source", ev.Source)
+	case discipline.EventPPSUnqualified:
+		e.log.Error("PPS present but nothing to number its seconds — add an NTP server or use a gps refclock", "source", ev.Source)
+	case discipline.EventPPSQualified:
+		e.log.Info("PPS seconds qualified again", "source", ev.Source)
 	}
 }
 
