@@ -6,12 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
+	"syscall"
 	"time"
 )
 
-// maxResponse bounds a response line.
-const maxResponse = 1 << 20
+const (
+	// maxResponse bounds a response line.
+	maxResponse = 1 << 20
+
+	// connectRetry is how long WaitSync pauses between attempts to reach a
+	// daemon that is still starting.
+	connectRetry = 250 * time.Millisecond
+)
 
 // Call sends one request to the daemon at path and returns its response.
 // A Response with a non-empty Error is returned as an error.
@@ -51,6 +59,60 @@ func Call(ctx context.Context, path string, req Request) (*Response, error) {
 		return &resp, errors.New(resp.Error)
 	}
 	return &resp, nil
+}
+
+// WaitSync asks the daemon at path to wait until the clock is synchronized,
+// for at most timeout (zero waits indefinitely), and reports whether it was.
+// Unlike Call it tolerates a daemon that is still starting: while the socket
+// is missing or nothing is listening on it, WaitSync keeps retrying until
+// the deadline, so it can directly follow a service restart. If the daemon
+// never appears, the last connection error is returned.
+func WaitSync(ctx context.Context, path string, timeout time.Duration) (bool, error) {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	var lastErr error
+	for {
+		req := Request{Command: CmdWaitSync}
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false, lastErr
+			}
+			req.Timeout = remaining.Seconds()
+		}
+		resp, err := Call(ctx, path, req)
+		if err == nil {
+			return resp.Synced != nil && *resp.Synced, nil
+		}
+		if !daemonStarting(err) {
+			return false, err
+		}
+		lastErr = err
+		wait := connectRetry
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false, err
+			}
+			if remaining < wait {
+				wait = remaining
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// daemonStarting reports whether err is the kind of connection failure a
+// daemon that has not finished starting would cause: no socket file yet, or
+// a socket file nobody listens on.
+func daemonStarting(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
 func readLine(r *bufio.Reader, limit int) ([]byte, error) {
