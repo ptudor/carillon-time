@@ -7,14 +7,17 @@ second job is the two-host topology: the **home** box (GPS + PPS, stratum 1)
 is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
-**Status (2026-08-23):** milestones M0–M2 of `DESIGN.md` §15 are implemented.
+**Status (2026-08-23):** milestones M0–M3 of `DESIGN.md` §15 are implemented
+in code.
 The authenticated two-host topology is deployed on `gummi` (Fedora 43) and
 `twocom` (FreeBSD 15): both clock backends, init systems, drift persistence,
 IPv4/IPv6 listeners, ACLs, CMAC, and client/server paths have passed an initial
 real-host acceptance run (`deploy/ACCEPTANCE.md`). They are now the long-term
-in-house test hosts. Not yet built: the PPS and GPS refclocks (M3),
-leapfile/stats/metrics (M4), and OpenWrt packaging (M5). Real PPS hardware
-tests and the long-duration accuracy comparison remain ahead.
+in-house test hosts. Linux and FreeBSD PPS API/capability/fetch paths have
+also run on them, but none of their configured serial inputs currently has a
+live pulse, so stratum-1 acceptance remains pending. Not yet built: the GPS
+refclock, leapfile/stats/metrics (M4), and OpenWrt packaging (M5). A live PPS
+test and the long-duration accuracy comparison remain ahead.
 
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
@@ -56,9 +59,9 @@ internal/ntp/         wire format, timestamps/eras, MAC (auth/), KoD codes — p
 internal/source/      Source interface + NTP client source (poller, clock filter, Query)
 internal/sockts/      kernel receive timestamps on UDP sockets, per OS
 internal/buildinfo/   version and build time stamped by the Makefile
-internal/refclock/    (M3) PPS and GPS(NMEA+PPS) refclocks; nmea/ parser
-internal/pps/         (M3) RFC 2783 bindings: pps_linux.go, pps_freebsd.go, pps_other.go
-internal/serial/      (M3) termios open/configure; Linux N_PPS line-discipline attach
+internal/refclock/    PPS refclock (M3); GPS(NMEA+PPS) refclock in M4
+internal/pps/         RFC 2783 bindings: pps_linux.go, pps_freebsd.go, pps_other.go
+internal/serial/      termios open/configure; Linux N_PPS line-discipline attach
 internal/clock/       actuator: Clock interface, sysclock_linux.go, sysclock_freebsd.go,
                       sysclock_other.go (stub), fake.go (deterministic, for tests)
 internal/discipline/  filter → select → combine → loop; pure functions, no wall clock

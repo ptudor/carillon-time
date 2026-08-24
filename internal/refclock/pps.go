@@ -299,7 +299,7 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 	values := p.windowTail(1 << p.poll)
 	median, mad := medianMAD(values)
 	sigma := mad * 1.4826
-	stable := len(values) >= 4 && sigma < p.cfg.LockJitter
+	stable := ppsWindowStable(p.stable, len(values), sigma, p.cfg.LockJitter)
 	if stable != p.stable {
 		if stable {
 			p.log.Info("PPS window stable", "jitter", sigma, "samples", len(values))
@@ -468,6 +468,16 @@ func middle(v []float64) float64 {
 func intervalJitter(values []float64) float64 {
 	_, mad := medianMAD(values)
 	return mad * 1.4826
+}
+
+func ppsWindowStable(wasStable bool, samples int, sigma, limit float64) bool {
+	if samples < 4 {
+		return false
+	}
+	if wasStable {
+		return sigma <= 4*limit
+	}
+	return sigma < limit
 }
 
 func adaptPoll(poll int8, offset, jitter float64, min, max int8) int8 {

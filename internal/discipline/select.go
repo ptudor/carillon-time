@@ -404,8 +404,14 @@ func cluster(surv []*SourceState) []*SourceState {
 // majorityLeap returns the leap indication agreed by more than half of the
 // survivors, or LeapNone.
 func majorityLeap(surv []*SourceState) ntp.Leap {
-	var ins, del int
+	var ins, del, voters int
 	for _, s := range surv {
+		// A bare PPS edge has no calendar information. Its selected numbering
+		// sources, not the pulse itself, vote on leap warnings.
+		if s.PPS {
+			continue
+		}
+		voters++
 		switch s.Leap {
 		case ntp.LeapInsert:
 			ins++
@@ -414,9 +420,9 @@ func majorityLeap(surv []*SourceState) ntp.Leap {
 		}
 	}
 	switch {
-	case ins*2 > len(surv):
+	case ins*2 > voters:
 		return ntp.LeapInsert
-	case del*2 > len(surv):
+	case del*2 > voters:
 		return ntp.LeapDelete
 	}
 	return ntp.LeapNone

@@ -43,6 +43,18 @@ func TestMedianMAD(t *testing.T) {
 	}
 }
 
+func TestPPSLockHysteresis(t *testing.T) {
+	if ppsWindowStable(false, 3, 0, 1) || ppsWindowStable(false, 8, 1, 1) {
+		t.Fatal("window locked without enough samples or below-threshold jitter")
+	}
+	if !ppsWindowStable(false, 8, 0.9, 1) {
+		t.Fatal("window did not acquire below threshold")
+	}
+	if !ppsWindowStable(true, 8, 4, 1) || ppsWindowStable(true, 8, 4.1, 1) {
+		t.Fatal("window did not retain lock through the 4x hysteresis band")
+	}
+}
+
 func TestPPSStableWindowEmitsMeasurement(t *testing.T) {
 	p, clk := testPPS(t)
 	p.cfg.Offset = 50e-6

@@ -52,6 +52,22 @@ old daemon:
 /usr/local/sbin/carillon -check -config /etc/carillon/carillon.toml
 ```
 
+For Linux PPS, install the line discipline and a udev rule before adding a
+`[[refclock]]`. A configured tty makes carillon attach `N_PPS`; an existing
+`/dev/ppsN` is opened directly. The rule gives the unprivileged daemon access
+to either kind:
+
+```sh
+printf 'pps_ldisc\n' > /etc/modules-load.d/carillon.conf
+modprobe pps_ldisc
+printf 'SUBSYSTEM=="pps", GROUP="carillon", MODE="0660"\n' > /etc/udev/rules.d/60-carillon-pps.rules
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=pps
+```
+
+Before enabling it, confirm that the sequence after `#` increases once per
+second in `/sys/class/pps/pps0/assert` (or `clear` for the selected edge).
+
 Then disable every installed competitor and enable carillon:
 
 ```sh
@@ -60,6 +76,7 @@ systemctl enable --now carillon.service
 systemctl --no-pager --full status carillon.service
 carillonctl tracking
 carillonctl sources
+carillonctl refclock
 carillonctl serverstats
 journalctl -u carillon.service --no-pager -n 50
 ```
@@ -112,6 +129,19 @@ sysrc -f /boot/loader.conf mac_ntpd_load=YES
 printf 'security.mac.ntpd.uid="%s"\n' "$(id -u carillon)" > /boot/loader.conf.d/carillon.conf
 ```
 
+For a FreeBSD UART PPS input, use its callout device and enable kernel capture
+on the wired modem-control pin. `1` selects CTS and `2` selects DCD; the
+example below persists DCD capture on UART 0:
+
+```sh
+sysctl dev.uart.0.pps_mode=2
+install -d -o root -g wheel -m 0755 /etc/sysctl.conf.d
+printf 'dev.uart.0.pps_mode=2\n' > /etc/sysctl.conf.d/carillon-pps.conf
+```
+
+Set `device = "/dev/cuau0"` in the `[[refclock]]`. `carillon -check` rejects
+a disabled `pps_mode`, and the `dialer` group grants device access.
+
 The rc.d prestart also recreates `/var/run/carillon` after every boot. Adding
 operators to the `carillon` group lets them use the mode-`0660` control socket;
 they need a fresh login for the group to take effect. The rc.d wrapper sends
@@ -132,6 +162,7 @@ service carillon start
 service carillon status
 carillonctl tracking
 carillonctl sources
+carillonctl refclock
 carillonctl serverstats
 grep carillon /var/log/messages | tail -n 50
 ```

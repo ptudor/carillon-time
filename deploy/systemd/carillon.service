@@ -14,7 +14,7 @@
 #   systemctl disable --now systemd-timesyncd chrony ntp 2>/dev/null
 #   systemctl enable --now carillon
 #
-# Serial-port PPS (later milestone) needs the pps_ldisc module:
+# Serial-port PPS needs the pps_ldisc module:
 #   echo pps_ldisc > /etc/modules-load.d/carillon.conf
 
 [Unit]

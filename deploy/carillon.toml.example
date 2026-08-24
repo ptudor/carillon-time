@@ -1,4 +1,4 @@
-# carillon configuration — NTP client/server (milestone M2: no refclock yet).
+# carillon configuration — NTP client/server with optional PPS refclock.
 #
 # Install as:
 #   /usr/local/etc/carillon/carillon.toml   (FreeBSD)
@@ -29,6 +29,27 @@
 
 # debug | info | warn | error
 log_level = "info"
+
+# --- PPS reference clock ---------------------------------------------------
+# A bare PPS supplies a precise second boundary but not the second number. At
+# least one selected [[server]] must keep the system within 0.4 seconds before
+# PPS can qualify. When PPS is preferred, no server may also set prefer=true.
+# Linux accepts either a tty (carillon attaches N_PPS) or an existing
+# /dev/ppsN. FreeBSD uses the callout tty, never /dev/ttyuN.
+
+#[[refclock]]
+#name        = "pps0"
+#type        = "pps"
+#device      = "/dev/pps0"   # Linux; e.g. /dev/cuau0 on FreeBSD
+#edge        = "assert"      # assert or clear
+#offset      = 0.0            # fixed cable/driver correction, seconds
+#prefer      = true
+#noselect    = false
+#lock_jitter = 0.0002         # use about 0.000020 for a real UART
+#poll_min    = 4              # 16-s robust averaging window
+#poll_max    = 7              # up to 128 s
+#
+# Inspect the pulse window with: carillonctl refclock
 
 # --- Upstream servers -------------------------------------------------------
 # Each [[server]] is polled independently. Three or more independent servers
