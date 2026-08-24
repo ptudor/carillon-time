@@ -3,6 +3,11 @@
 // discipline where needed.
 package serial
 
+import "errors"
+
+// ErrTimeout means no serial data was readable before the requested timeout.
+var ErrTimeout = errors.New("serial read timed out")
+
 // Port is an open serial port whose descriptor is held for the lifetime of
 // a reference clock.
 type Port struct {
