@@ -10,14 +10,16 @@ import (
 
 	"carillon/internal/discipline"
 	"carillon/internal/engine"
+	ntpserver "carillon/internal/server"
 )
 
 // Commands understood by the server.
 const (
-	CmdTracking = "tracking"
-	CmdSources  = "sources"
-	CmdWaitSync = "waitsync"
-	CmdVersion  = "version"
+	CmdTracking    = "tracking"
+	CmdSources     = "sources"
+	CmdServerStats = "serverstats"
+	CmdWaitSync    = "waitsync"
+	CmdVersion     = "version"
 )
 
 // Request is one line of JSON from the client.
@@ -31,11 +33,29 @@ type Request struct {
 // Response is one line of JSON from the server. Exactly one of the payload
 // fields is set, or Error.
 type Response struct {
-	Error    string    `json:"error,omitempty"`
-	Version  string    `json:"version,omitempty"`
-	Tracking *Tracking `json:"tracking,omitempty"`
-	Sources  []Source  `json:"sources,omitempty"`
-	Synced   *bool     `json:"synced,omitempty"`
+	Error       string       `json:"error,omitempty"`
+	Version     string       `json:"version,omitempty"`
+	Tracking    *Tracking    `json:"tracking,omitempty"`
+	Sources     []Source     `json:"sources,omitempty"`
+	ServerStats *ServerStats `json:"serverstats,omitempty"`
+	Synced      *bool        `json:"synced,omitempty"`
+}
+
+// ServerStats is the NTP listener's request-counter snapshot.
+type ServerStats struct {
+	Served      uint64 `json:"served"`
+	Denied      uint64 `json:"denied"`
+	RateLimited uint64 `json:"ratelimited"`
+	BadAuth     uint64 `json:"badauth"`
+	Unsynced    uint64 `json:"unsynced"`
+}
+
+// ServerStatsOf converts the server package's atomic counter snapshot.
+func ServerStatsOf(s ntpserver.StatsSnapshot) *ServerStats {
+	return &ServerStats{
+		Served: s.Served, Denied: s.Denied, RateLimited: s.RateLimited,
+		BadAuth: s.BadAuth, Unsynced: s.Unsynced,
+	}
 }
 
 // Tracking is the system-level state.

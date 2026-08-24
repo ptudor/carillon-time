@@ -28,6 +28,7 @@ import (
 	"carillon/internal/engine"
 	"carillon/internal/ntp"
 	"carillon/internal/ntp/auth"
+	ntpserver "carillon/internal/server"
 	"carillon/internal/source"
 )
 
@@ -79,7 +80,11 @@ func runDaemon(args []string) int {
 			fmt.Fprintf(os.Stderr, "carillon: %v\n", err)
 			return exitUsage
 		}
-		fmt.Printf("%s: configuration OK (%d servers)\n", *cfgPath, len(cfg.Servers))
+		listeners := 0
+		if cfg.Serve.Enabled() {
+			listeners = len(cfg.Serve.Listen)
+		}
+		fmt.Printf("%s: configuration OK (%d upstreams, %d listeners)\n", *cfgPath, len(cfg.Servers), listeners)
 		return 0
 	}
 
@@ -162,7 +167,49 @@ func runDaemon(args []string) int {
 		return exitRuntime
 	}
 
-	ctl, err := control.Listen(cfg.Daemon.Control, eng, buildinfo.Version, log)
+	serverStats := &ntpserver.Stats{}
+	var timeServer *ntpserver.Service
+	if cfg.Serve.Enabled() {
+		allow, deny, require := cfg.ServePrefixes()
+		timeServer, err = ntpserver.Listen(ntpserver.ServiceConfig{
+			Listen: cfg.ServeListenAddrs(),
+			Handler: ntpserver.Config{
+				Allow:        allow,
+				Deny:         deny,
+				RequireKey:   require,
+				Keys:         keys,
+				RateLimitPPS: cfg.Serve.RateLimitPPS,
+				RateBurst:    cfg.Serve.RateBurst,
+				KoD:          cfg.Serve.KoD,
+				Status: func() ntpserver.SystemStatus {
+					st := eng.Status()
+					return ntpserver.SystemStatus{
+						Synced:         st.State == discipline.StateSynced || st.State == discipline.StateHoldover,
+						Leap:           st.Leap,
+						Stratum:        st.Stratum,
+						Precision:      st.Precision,
+						RootDelay:      st.RootDelay,
+						RootDispersion: st.RootDisp,
+						ReferenceID:    st.RefID,
+						ReferenceTime:  st.RefTime,
+					}
+				},
+				Now:   clk.Now,
+				Stats: serverStats,
+			},
+			Log: log,
+		})
+		if err != nil {
+			log.Error("NTP server", "error", err)
+			return exitRuntime
+		}
+		defer timeServer.Close()
+		for _, addr := range timeServer.Addrs() {
+			log.Info("NTP server listening", "address", addr)
+		}
+	}
+
+	ctl, err := control.Listen(cfg.Daemon.Control, eng, serverStats, buildinfo.Version, log)
 	if err != nil {
 		log.Error("control socket", "error", err)
 		return exitRuntime
@@ -170,19 +217,39 @@ func runDaemon(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	auxErr := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if err := ctl.Serve(ctx); err != nil {
 			log.Error("control socket", "error", err)
+			auxErr <- err
+			stop()
 		}
 	}()
+	if timeServer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := timeServer.Serve(ctx); err != nil {
+				log.Error("NTP server", "error", err)
+				auxErr <- err
+				stop()
+			}
+		}()
+	}
 	runErr := eng.Run(ctx)
 	stop()
 	wg.Wait()
+	if runErr == nil {
+		select {
+		case runErr = <-auxErr:
+		default:
+		}
+	}
 	if runErr != nil {
-		log.Error("engine stopped", "error", runErr)
+		log.Error("daemon stopped", "error", runErr)
 		return exitRuntime
 	}
 	log.Info("stopped")
@@ -206,6 +273,11 @@ func loadKeys(cfg *config.Config) (auth.Keys, error) {
 		}
 		if _, ok := keys[s.Key]; !ok {
 			return nil, fmt.Errorf("server %q: key %d is not in %s", s.Name, s.Key, cfg.Daemon.Keys)
+		}
+	}
+	for prefix, id := range cfg.Serve.RequireKey {
+		if _, ok := keys[id]; !ok {
+			return nil, fmt.Errorf("serve require_key %q: key %d is not in %s", prefix, id, cfg.Daemon.Keys)
 		}
 	}
 	return keys, nil

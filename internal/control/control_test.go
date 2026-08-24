@@ -40,7 +40,7 @@ func newEngine(t *testing.T) *engine.Engine {
 func TestServerRoundTrip(t *testing.T) {
 	path := socketPath(t)
 	eng := newEngine(t)
-	srv, err := Listen(path, eng, "v-test", nil)
+	srv, err := Listen(path, eng, nil, "v-test", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +68,10 @@ func TestServerRoundTrip(t *testing.T) {
 	if err != nil || len(resp.Sources) != 0 {
 		t.Fatalf("sources: %+v %v", resp, err)
 	}
+	resp, err = Call(ctx, path, Request{Command: CmdServerStats})
+	if err != nil || resp.ServerStats == nil || *resp.ServerStats != (ServerStats{}) {
+		t.Fatalf("serverstats: %+v %v", resp, err)
+	}
 	resp, err = Call(ctx, path, Request{Command: CmdWaitSync, Timeout: 0.3})
 	if err != nil || resp.Synced == nil || *resp.Synced {
 		t.Fatalf("waitsync on an unsynced engine must report false: %+v %v", resp, err)
@@ -77,7 +81,7 @@ func TestServerRoundTrip(t *testing.T) {
 	}
 
 	// A second daemon must not be able to take the socket while it is live.
-	if _, err := Listen(path, eng, "v-test", nil); err == nil {
+	if _, err := Listen(path, eng, nil, "v-test", nil); err == nil {
 		t.Fatal("live socket must be refused")
 	}
 
@@ -95,7 +99,7 @@ func TestListenRemovesStaleSocket(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := Listen(path, newEngine(t), "v", nil)
+	srv, err := Listen(path, newEngine(t), nil, "v", nil)
 	if err != nil {
 		t.Fatalf("stale socket must be replaced: %v", err)
 	}

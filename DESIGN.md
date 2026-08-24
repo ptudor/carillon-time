@@ -796,7 +796,7 @@ Full example, **home** (stratum 1):
 # /usr/local/etc/carillon/carillon.toml
 [daemon]
 drift_file = "/var/db/carillon/drift"
-control    = "/var/run/carillon.sock"
+control    = "/var/run/carillon/carillon.sock"
 leapfile   = "/var/db/carillon/leap-seconds.list"
 keys       = "/usr/local/etc/carillon/keys"
 log_level  = "info"
@@ -835,7 +835,7 @@ listen = "127.0.0.1:9123"
 ```toml
 [daemon]
 drift_file = "/var/db/carillon/drift"
-control    = "/var/run/carillon.sock"
+control    = "/var/run/carillon/carillon.sock"
 keys       = "/usr/local/etc/carillon/keys"
 
 [[server]]
@@ -1092,7 +1092,7 @@ by attackers (rate-limit table is bounded and LRU).
 |---|---|---|
 | M0 ✅ 2026-08-23 | Repo skeleton, config, `internal/ntp` wire format + CMAC, `clock.Fake`, discipline package with simulation tests | `go test -race ./...` green on the Mac |
 | M1 ✅ 2026-08-23 (code) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | a plain client host tracks upstream as well as chrony does — **not yet verified on real hardware** |
-| M2 | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | home → colo topology runs end to end without a refclock |
+| M2 ✅ 2026-08-23 (code) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | home → colo topology runs end to end without a refclock — **not yet verified on real hosts** |
 | M3 | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | home host is stratum 1 from a bare PPS numbered by NTP |
 | M4 | `gps` refclock (NMEA), leapfile, stats files, metrics, `-check` | home host is stratum 1 with GPS alone |
 | M5 | OpenWrt build + procd, hardening (Capsicum socket pool, systemd sandbox), `deploy/ACCEPTANCE.md` | runs on the router |

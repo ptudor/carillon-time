@@ -174,6 +174,24 @@ func TestAuthentication(t *testing.T) {
 	}
 }
 
+func TestMostSpecificAuthenticationRuleWins(t *testing.T) {
+	key2 := auth.Key{ID: 2, Secret: []byte("fedcba9876543210")}
+	h, _ := newTestHandler(t, func(c *Config) {
+		c.Keys[2] = key2
+		c.RequireKey = map[netip.Prefix]uint32{
+			netip.MustParsePrefix("192.0.2.0/24"): 1,
+			netip.MustParsePrefix("192.0.2.0/25"): 2,
+		}
+	})
+	client := netip.MustParseAddr("192.0.2.10")
+	if got := h.Handle(testKey.Append(request(4)), client, testWall, testMono); got != nil {
+		t.Fatal("less-specific key authenticated the client")
+	}
+	if got := h.Handle(key2.Append(request(4)), client, testWall, testMono.Add(time.Second)); len(got) != ntp.HeaderSize+ntp.MACSizeCMAC {
+		t.Fatalf("most-specific key reply length %d", len(got))
+	}
+}
+
 func TestRateLimitAndKoDThrottle(t *testing.T) {
 	h, stats := newTestHandler(t, func(c *Config) {
 		c.RateLimitPPS = 1

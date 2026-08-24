@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,7 @@ import (
 const coloExample = `
 [daemon]
 drift_file = "/var/db/carillon/drift"
-control    = "/var/run/carillon.sock"
+control    = "/var/run/carillon/carillon.sock"
 keys       = "/usr/local/etc/carillon/keys"
 
 [[server]]
@@ -32,6 +33,15 @@ address = "1.pool.ntp.org"
 [[server]]
 name    = "pool-c"
 address = "2.pool.ntp.org"
+
+[serve]
+listen         = ["0.0.0.0:123", "[::]:123"]
+allow          = ["0.0.0.0/0", "::/0"]
+deny           = ["192.0.2.0/24"]
+require_key    = { "203.0.113.7/32" = 1 }
+rate_limit_pps = 4
+rate_burst     = 8
+kod            = false
 
 [discipline]
 min_survivors = 1
@@ -64,6 +74,16 @@ func TestParseFull(t *testing.T) {
 	if cfg.Servers[1].PollMin != DefaultPollMin || cfg.Servers[1].PollMax != DefaultPollMax {
 		t.Fatalf("pool-a defaults: %+v", cfg.Servers[1])
 	}
+	if !cfg.Serve.Enabled() || len(cfg.Serve.Listen) != 2 || cfg.Serve.RateLimitPPS != 4 || cfg.Serve.RateBurst != 8 || cfg.Serve.KoD {
+		t.Fatalf("serve: %+v", cfg.Serve)
+	}
+	allow, deny, require := cfg.ServePrefixes()
+	if len(allow) != 2 || len(deny) != 1 || require[netip.MustParsePrefix("203.0.113.7/32")] != 1 {
+		t.Fatalf("parsed ACL: allow=%v deny=%v require=%v", allow, deny, require)
+	}
+	if got := cfg.ServeListenAddrs(); len(got) != 2 || got[0] != netip.MustParseAddrPort("0.0.0.0:123") {
+		t.Fatalf("listen addrs: %v", got)
+	}
 	// Scalar tables keep defaults the document omitted.
 	if cfg.Step.Panic != 1000 || cfg.Step.PanicAtStartup {
 		t.Fatalf("step defaults not preserved: %+v", cfg.Step)
@@ -81,10 +101,9 @@ func TestParseUnknownKey(t *testing.T) {
 	if !strings.Contains(err.Error(), "log_levle") {
 		t.Fatalf("error does not name the key: %v", err)
 	}
-	// Tables from later milestones are unknown for now, by design.
-	_, err = Parse([]byte("[serve]\nallow = [\"0.0.0.0/0\"]\n"))
-	if err == nil || !strings.Contains(err.Error(), "serve") {
-		t.Fatalf("[serve] must be rejected in this milestone: %v", err)
+	_, err = Parse([]byte("[serve]\nrate_burts = 4\n"))
+	if err == nil || !strings.Contains(err.Error(), "rate_burts") {
+		t.Fatalf("unknown [serve] key must be rejected: %v", err)
 	}
 }
 
@@ -112,6 +131,9 @@ func TestServerDefaults(t *testing.T) {
 	}
 	if s.Key != 0 || s.Prefer || s.IBurst || s.NoSelect {
 		t.Fatalf("flags should default off: %+v", s)
+	}
+	if cfg.Serve.Enabled() || cfg.Serve.RateLimitPPS != 8 || cfg.Serve.RateBurst != 16 || !cfg.Serve.KoD {
+		t.Fatalf("serve defaults: %+v", cfg.Serve)
 	}
 	if s.String() != "time.invalid" {
 		t.Fatalf("String: %q", s.String())
@@ -175,6 +197,11 @@ func validConfig() *Config {
 	return cfg
 }
 
+func enableServe(c *Config) {
+	c.Serve.Listen = []string{"127.0.0.1:123"}
+	c.Serve.Allow = []string{"127.0.0.0/8"}
+}
+
 func TestValidateRules(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -192,6 +219,19 @@ func TestValidateRules(t *testing.T) {
 		{"two prefer", func(c *Config) { c.Servers[0].Prefer, c.Servers[1].Prefer = true, true }, "at most one server may be preferred"},
 		{"prefer+noselect", func(c *Config) { c.Servers[0].Prefer, c.Servers[0].NoSelect = true, true }, "mutually exclusive"},
 		{"key without keys file", func(c *Config) { c.Servers[0].Key = 1 }, "keys must be set"},
+		{"serve no listen", func(c *Config) { c.Serve.Allow = []string{"127.0.0.0/8"} }, "listen must contain"},
+		{"serve bad listen", func(c *Config) { enableServe(c); c.Serve.Listen[0] = "localhost:123" }, "numeric IP:port"},
+		{"serve zero port", func(c *Config) { enableServe(c); c.Serve.Listen[0] = "127.0.0.1:0" }, "nonzero port"},
+		{"serve duplicate listen", func(c *Config) { enableServe(c); c.Serve.Listen = append(c.Serve.Listen, c.Serve.Listen[0]) }, "duplicate listen"},
+		{"serve bad allow", func(c *Config) { enableServe(c); c.Serve.Allow[0] = "127.0.0.1" }, "allow prefix"},
+		{"serve bad deny", func(c *Config) { enableServe(c); c.Serve.Deny = []string{"bad"} }, "deny prefix"},
+		{"serve duplicate allow", func(c *Config) { enableServe(c); c.Serve.Allow = []string{"127.0.0.0/8", "127.0.0.1/8"} }, "duplicate allow"},
+		{"serve require disabled", func(c *Config) { c.Serve.RequireKey = map[string]uint32{"127.0.0.1/32": 1} }, "server is disabled"},
+		{"serve bad require prefix", func(c *Config) { enableServe(c); c.Serve.RequireKey = map[string]uint32{"bad": 1} }, "require_key prefix"},
+		{"serve bad require id", func(c *Config) { enableServe(c); c.Serve.RequireKey = map[string]uint32{"127.0.0.1/32": 0} }, "outside 1..65535"},
+		{"serve key without keys file", func(c *Config) { enableServe(c); c.Serve.RequireKey = map[string]uint32{"127.0.0.1/32": 1} }, "keys must be set"},
+		{"serve zero rate", func(c *Config) { enableServe(c); c.Serve.RateLimitPPS = 0 }, "rate_limit_pps"},
+		{"serve low burst", func(c *Config) { enableServe(c); c.Serve.RateBurst = 0.5 }, "rate_burst"},
 		{"bad log level", func(c *Config) { c.Daemon.LogLevel = "verbose" }, "log_level"},
 		{"empty drift", func(c *Config) { c.Daemon.DriftFile = "" }, "drift_file must be set"},
 		{"empty control", func(c *Config) { c.Daemon.Control = "" }, "control must be set"},
