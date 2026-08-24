@@ -191,6 +191,17 @@ func (s *System) RemoveSource(name string, now float64) Result {
 	return s.reselect(now)
 }
 
+// InvalidateSources discards every pre-boundary estimate while retaining
+// reach and loop frequency. The engine uses it after a leap transition, just
+// as source-local Reset discards each producer's sample window.
+func (s *System) InvalidateSources(now float64) Result {
+	for _, src := range s.all() {
+		src.invalidate()
+	}
+	s.lastUsedAt = 0
+	return s.reselect(now)
+}
+
 // State returns the current synchronization state.
 func (s *System) State() State { return s.state }
 

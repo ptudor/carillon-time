@@ -20,6 +20,8 @@ type collector struct {
 	steps          *prometheus.Desc
 	updates        *prometheus.Desc
 	leapPending    *prometheus.Desc
+	leapfileExpiry *prometheus.Desc
+	leapfileValid  *prometheus.Desc
 	buildInfo      *prometheus.Desc
 
 	sourceOffset     *prometheus.Desc
@@ -68,6 +70,8 @@ func newCollector(snapshot func() Snapshot) *collector {
 		steps:          desc("carillon_steps_total", "Clock steps since this daemon process started."),
 		updates:        desc("carillon_updates_total", "Discipline updates since this daemon process started."),
 		leapPending:    desc("carillon_leap_pending", "Whether an insertion or deletion leap second is pending."),
+		leapfileExpiry: desc("carillon_leapfile_expiry_timestamp_seconds", "Unix timestamp at which the configured leap file expires; zero when absent."),
+		leapfileValid:  desc("carillon_leapfile_valid", "Whether the configured leap file is unexpired; zero when absent or expired."),
 		buildInfo:      desc("carillon_build_info", "Build information for this carillon process.", "version"),
 
 		sourceOffset:     desc("carillon_source_offset_seconds", "Filtered source offset estimate in seconds.", "source"),
@@ -98,7 +102,7 @@ func newCollector(snapshot func() Snapshot) *collector {
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		c.state, c.offset, c.frequency, c.jitter, c.rootDispersion, c.stratum,
-		c.steps, c.updates, c.leapPending, c.buildInfo,
+		c.steps, c.updates, c.leapPending, c.leapfileExpiry, c.leapfileValid, c.buildInfo,
 		c.sourceOffset, c.sourceDelay, c.sourceJitter, c.sourceDistance,
 		c.sourceReach, c.sourceSelected, c.sourceLastRx, c.sourceNoKernelTS, c.sourceEvents,
 		c.ppsSamples, c.ppsJitter, c.ppsLocked, c.gpsFix, c.gpsSats, c.gpsLag,
@@ -139,6 +143,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.steps, uint64(t.Steps))
 	counter(c.updates, uint64(t.Updates))
 	gauge(c.leapPending, boolValue(t.Leap == "insert" || t.Leap == "delete"))
+	gauge(c.leapfileExpiry, timestamp(t.LeapExpiry))
+	gauge(c.leapfileValid, boolValue(!t.LeapExpiry.IsZero() && t.LeapExpiry.After(t.Now)))
 	gauge(c.buildInfo, 1, t.Version)
 
 	for _, src := range s.Sources {

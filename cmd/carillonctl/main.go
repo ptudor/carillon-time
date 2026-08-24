@@ -166,6 +166,10 @@ func printTracking(t *control.Tracking) {
 	fmt.Fprintf(w, "Root delay\t%s\n", seconds(t.RootDelay, false))
 	fmt.Fprintf(w, "Root dispersion\t%s\n", seconds(t.RootDisp, false))
 	fmt.Fprintf(w, "Leap\t%s\n", t.Leap)
+	fmt.Fprintf(w, "Leap source\t%s\n", t.LeapSource)
+	if !t.LeapExpiry.IsZero() {
+		fmt.Fprintf(w, "Leap file expires\t%s\n", t.LeapExpiry.UTC().Format(time.RFC3339))
+	}
 	fmt.Fprintf(w, "Updates / steps\t%d / %d\n", t.Updates, t.Steps)
 	fmt.Fprintf(w, "Uptime\t%s\n", (time.Duration(t.Uptime * float64(time.Second))).Round(time.Second))
 	fmt.Fprintf(w, "Version\t%s\n", t.Version)

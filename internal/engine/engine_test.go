@@ -14,6 +14,7 @@ import (
 
 	"carillon/internal/clock"
 	"carillon/internal/discipline"
+	"carillon/internal/leap"
 	"carillon/internal/ntp"
 	"carillon/internal/source"
 )
@@ -159,6 +160,50 @@ func TestEngineUsesKernelFrequencyWithoutDriftFile(t *testing.T) {
 	}
 	if st := e.Status(); st.Frequency != -7.25 || !st.FreqKnown {
 		t.Fatalf("%+v", st.Status)
+	}
+}
+
+func TestEngineLeapfileOverridesAndResetsAtTransition(t *testing.T) {
+	transition := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(transition.Add(-24 * time.Hour))
+	src := &scripted{name: "gps", clk: clk}
+	cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	cfg.LeapTable = &leap.Table{
+		Expiry:      time.Date(2026, 12, 28, 0, 0, 0, 0, time.UTC),
+		Transitions: []leap.Transition{{At: transition, Leap: ntp.LeapInsert}},
+	}
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		clk.Advance(time.Second)
+		m := good(0.001)
+		m.Source, m.Now, m.At = "gps", clk.Monotonic(), clk.Monotonic()
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st := e.Status(); st.State != discipline.StateSynced || st.Leap != ntp.LeapInsert || st.LeapSource != "file" || !st.LeapExpiry.Equal(cfg.LeapTable.Expiry) {
+		t.Fatalf("pre-transition status: %+v", st)
+	}
+	if ks := clk.Status(); !ks.Synced || ks.Leap != ntp.LeapInsert {
+		t.Fatalf("pre-transition kernel status: %+v", ks)
+	}
+
+	clk.Advance(transition.Sub(clk.TrueTime()) + time.Second)
+	now := clk.Monotonic()
+	if err := e.handle(e.sys.Tick(now), now); err != nil {
+		t.Fatal(err)
+	}
+	if st := e.Status(); st.State != discipline.StateHoldover || st.Leap != ntp.LeapNone {
+		t.Fatalf("post-transition status: %+v", st)
+	}
+	if src.resets.Load() != 1 {
+		t.Fatalf("source reset count = %d", src.resets.Load())
+	}
+	if ks := clk.Status(); !ks.Synced || ks.Leap != ntp.LeapNone {
+		t.Fatalf("post-transition kernel status: %+v", ks)
 	}
 }
 
