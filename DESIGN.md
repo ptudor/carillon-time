@@ -1,6 +1,6 @@
 # carillon design
 
-An NTPv4-compatible time daemon, in Go, for FreeBSD and Linux (OpenWrt later),
+An NTPv4-compatible time daemon, in Go, for FreeBSD and Linux,
 built around one precise input — a PPS pulse on a serial-port modem-control
 line — and one deployment: a GPS-disciplined home machine that is the trusted
 upstream for a colocated server which serves time to the rest of the world.
@@ -38,7 +38,7 @@ Contents
   RFC 2783 PPS API on FreeBSD (`uart(4)`/`ucom(4)` capture) and Linux
   (`pps_ldisc` or any `/dev/ppsN`), to the accuracy the hardware allows —
   single-digit microseconds on a real UART.
-- Number the PPS seconds from either an **NMEA** stream on the same port
+- Number the PPS seconds from either an **NMEA** stream from the same receiver
   (GPS receiver) or from ordinary **NTP servers** (bare PPS from a GPSDO,
   rubidium, or a receiver with no data line).
 - Act as an **NTP client** to upstream servers with the standard RFC 5905
@@ -49,8 +49,8 @@ Contents
   public internet (no amplification, rate limited, ACL'd).
 - Authenticate the home → colo association with **AES-128-CMAC** message
   authentication (RFC 8573) so the colo trusts only its own upstream.
-- One static binary per OS/arch, cross-compiled from macOS. Same code, same
-  behaviour, on FreeBSD, Linux, and OpenWrt.
+- One static binary per OS/arch, cross-compiled from macOS. Same code and
+  behaviour on FreeBSD and Linux.
 
 ### Non-goals (v1)
 
@@ -64,6 +64,8 @@ Contents
   and `gps`; that is the whole zoo.
 - Running on macOS. The Mac is a build/test host; the clock and PPS backends
   are compile-time stubs there.
+- OpenWrt. The static Go footprint is too large for the intended routers;
+  router PPS/time support is deferred to a separate C project (§16, D13).
 
 ---
 
@@ -104,9 +106,6 @@ Contents
   negligible, symmetric delay; (b) a UDP/123 port-forward on the home router
   restricted to the colo's source address. Symmetric-active "push" mode was
   considered and rejected (§16, D3).
-- **OpenWrt later.** If the home router itself runs `carillon` with a GPS on its
-  serial header or a GPIO PPS, it is directly reachable and the NAT question
-  disappears. The daemon runs as root under procd there.
 
 ---
 
@@ -123,8 +122,8 @@ Contents
 
 Other requirements:
 
-- **Platforms:** FreeBSD 14+ amd64/arm64; Linux 5.10+ amd64/arm64; OpenWrt
-  (Linux, `mipsle`/`arm`/`arm64`) later. Build-only on darwin.
+- **Platforms:** FreeBSD 14+ amd64/arm64 and Linux 5.10+ amd64/arm64.
+  Build/test-only on darwin.
 - **Startup:** with `iburst` on a reachable server, first correction within
   ~10 s; PPS lock (see §6.5) within one averaging window after a numbering
   source is available.
@@ -134,8 +133,8 @@ Other requirements:
 - **Compatibility:** interoperates as client and server with ntpd, chrony,
   systemd-timesyncd, Windows Time, and each other; responds to NTP versions
   1–4 with the request's version number.
-- **Footprint:** OpenWrt binary ≤ ~7 MB stripped; no cgo; no runtime files
-  other than config, keys, drift, control socket.
+- **Footprint:** static, no cgo; no runtime files other than config, keys,
+  optional leap/statistics files, drift, and the control socket.
 
 ---
 
@@ -329,8 +328,8 @@ the loop's residual offset is under 4σ, down when σ grows.
 
 ### 5.3 GPS refclock (`type = "gps"`)
 
-One serial device that provides both an NMEA data stream and a PPS edge.
-Internally it is a PPS source (as above, same fd) plus an NMEA source, and
+One receiver that provides both an NMEA data stream and a PPS edge. Internally
+it is a PPS source plus an NMEA source, and
 produces two logical sources `<name>/pps` and `<name>/nmea` so they can be
 selected and displayed independently.
 
@@ -348,9 +347,16 @@ sentences   = ["RMC", "ZDA"]  # accepted talkers: GP, GN, GL, GA, BD
 prefer      = true
 ```
 
+On FreeBSD, native UART PPS and NMEA use independent opens of the same callout
+tty. On Linux, `N_PPS` replaces normal tty input, so a combined receiver must
+provide PPS through a separate `/dev/ppsN`, GPIO PPS device, or PPS-only tty;
+`carillon -check` rejects an attempt to share the NMEA tty. `pps = "none"`
+creates only `<name>/nmea` on either platform.
+
 **Serial setup:** raw mode, 8N1, `CLOCAL`, `CREAD`, no flow control, no echo,
-`VMIN=1, VTIME=0`; opened `O_RDWR|O_NOCTTY|O_NONBLOCK`, `O_NONBLOCK` cleared
-after configuration. Reads use a buffered line scanner; the timestamp of a
+`VMIN=1, VTIME=0`; opened `O_RDWR|O_NOCTTY|O_NONBLOCK`. Reads use `poll(2)`
+with a bounded timeout and a buffered line framer, so shutdown never waits for
+another serial byte. The timestamp of a
 sentence is the `CLOCK_REALTIME` read taken when the read that delivered its
 `$` returned (at 9600 baud a 70-byte RMC takes ~73 ms to arrive; the start
 character is the anchor).
@@ -604,7 +610,7 @@ limit            = 3      # ... but only within the first N loop updates after s
                           # 0 = never step, -1 = always allowed (not recommended on a server)
 panic            = 1000   # seconds; refuse to correct more than this ...
 panic_at_startup = false  # ... unless set, in which case it is allowed for the very first correction
-                          # (OpenWrt default: true — no RTC, the clock starts in 1970/build time)
+                          # (set true on hosts with no RTC that start at 1970/build time)
 ```
 
 Semantics match chrony's `makestep 0.5 3` plus ntpd's panic gate. A refused
@@ -658,6 +664,11 @@ its expiry is a WARN 30 days out and an ERROR when past), then the majority
 LI of the survivors. NMEA carries no leap warning, so a stratum-1 host with no
 upstream servers **must** configure `leapfile` to announce leaps; this is
 called out by `carillon -check`.
+
+The HTTP health model reports an expiring file as degraded and an expired file
+as unhealthy; JSON and metrics expose the expiry and leap provenance. An
+expired file remains loaded so the failure is observable rather than turning
+silently into a different authority policy.
 
 `leap_mode = "kernel"` (v1 only): on the last day of June or December with a
 pending leap, set `STA_INS`/`STA_DEL` at 00:00 UTC; the kernel performs the
@@ -990,8 +1001,11 @@ The `/metrics` endpoint exports:
 `carillon_server_last_served_timestamp_seconds`, `carillon_server_enabled`,
 `carillon_source_receive_timestamp_seconds{source}`,
 `carillon_source_kernel_timestamp_missing_total{source}`,
-`carillon_server_kernel_timestamp_missing_total`, `carillon_leap_pending`, and
-`carillon_build_info{version}`. Labels come only from configured source names
+`carillon_server_kernel_timestamp_missing_total`, `carillon_leap_pending`,
+`carillon_leapfile_expiry_timestamp_seconds`, `carillon_leapfile_valid`,
+`carillon_gps_fix_valid{source}`, `carillon_gps_satellites{source}`,
+`carillon_gps_nmea_lag_seconds{source}`, and `carillon_build_info{version}`.
+Labels come only from configured source names
 or fixed finite enums; operator roles are deliberately not metric labels.
 
 ### 10.5 Files
@@ -1051,10 +1065,6 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 plus `pps_ldisc` in `/etc/modules-load.d/carillon.conf`. `TIOCSETD` needs write
 access to the tty, nothing more, once the module is loaded.
 
-**OpenWrt** (`deploy/openwrt/carillon.init`, procd): runs as root; `respawn`;
-config at `/etc/carillon/carillon.toml`; depends on `kmod-pps` and `kmod-pps-ldisc`
-or `kmod-pps-gpio`; `[step] panic_at_startup = true` by default.
-
 **All:** `carillon` refuses to start if UDP 123 cannot be bound and says which
 daemon is probably holding it. Two disciplining daemons on one host is the
 classic "why does my clock wobble" and it must fail loudly, not coexist.
@@ -1074,8 +1084,8 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
 - **Source goroutines:** one per configured server and per refclock. PPS uses
   a bounded 1.5 s `PPS_FETCH`, which shifts reach on a missing pulse and also
   bounds shutdown latency; a vanished device is reopened with backoff. NMEA
-  readers block in `read` and close their fd on shutdown. A `gps` refclock
-  uses two threads, which is fine.
+  reads use `poll(2)` with a 500 ms bound; a `gps` refclock uses one source
+  goroutine for NMEA and, when enabled, one for PPS.
 - **Server goroutines:** one per listen socket; read `Status` via the atomic
   pointer; never touch engine state. Rate limiter is per socket goroutine
   (no sharing needed: one client hits one socket).
@@ -1176,8 +1186,9 @@ by attackers (rate-limit table is bounded and LRU).
 | M1 ✅ 2026-08-23 (initial host acceptance) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | Fedora and FreeBSD hosts both track and restart from drift; long-duration chrony comparison is now running |
 | M2 ✅ 2026-08-23 (real hosts) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | `gummi` → authenticated `twocom` topology runs end to end without a refclock; see `deploy/ACCEPTANCE.md` |
 | M3 ✅ 2026-08-23 (code) | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | kernel API/capability/fetch paths pass on both real hosts; stratum-1 acceptance awaits a live pulse on one of their serial inputs |
-| M4 | `gps` refclock (NMEA), leapfile, stats files, read-only JSON/health/Prometheus monitoring, `-check` | home host is stratum 1 with GPS alone and every role is remotely observable |
-| M5 | OpenWrt build + procd, hardening (Capsicum socket pool, systemd sandbox), `deploy/ACCEPTANCE.md` | runs on the router |
+| M4 ✅ 2026-08-23 (code) | `gps` refclock (NMEA), leapfile, stats files, read-only JSON/health/Prometheus monitoring, `-check` | race suite and Linux/FreeBSD cross-builds pass; live GPS stratum-1 acceptance remains |
+| deferred | OpenWrt | moved to a separate C project because the static Go footprint is too large for the intended routers |
+| later | Capsicum socket pool; further systemd sandboxing | deployment hardening after source/client socket ownership is redesigned |
 | later | NTS (RFC 8915) server+client; interleaved mode; `SO_TIMESTAMPING` TX timestamps; slew leap mode; auto `nmea_offset`; regression estimator; FLL branch | as wanted |
 
 ---
@@ -1185,15 +1196,14 @@ by attackers (rate-limit table is bounded and LRU).
 ## 16. Decision log
 
 **D1 — Go, not C or Rust.** Matches every other daemon in `~/Git/daemons`
-(TOML config, Prometheus, rc.d via `daemon(8)`), cross-compiles to all three
+(TOML config, Prometheus, rc.d via `daemon(8)`), cross-compiles to both
 targets with `CGO_ENABLED=0`, and the accuracy-critical timestamps are taken
 in the kernel so the runtime's scheduling jitter is not in the error budget.
-Cost: hand-declared ioctl structs (mitigated by `hwtest` cgo checks) and a
-~6 MB binary on OpenWrt.
+Cost: hand-declared ioctl structs (mitigated by `hwtest` cgo checks).
 
 **D2 — User-space discipline; kernel is only an actuator.** Kernel PPS
 discipline needs `options PPS_SYNC` (not in FreeBSD GENERIC) or
-`CONFIG_NTP_PPS` (not guaranteed on OpenWrt), behaves differently per kernel,
+`CONFIG_NTP_PPS`, behaves differently per kernel,
 and is opaque to test. Doing filter/select/loop in user space makes behaviour
 identical everywhere and lets the whole loop run in a simulation under
 `go test`. Slewing via a temporary frequency offset (chrony's "generic"
@@ -1223,7 +1233,7 @@ daemon that answers the internet by accident is worse than one that needs a
 line of config.
 
 **D7 — Two refclock types.** `pps` (the core interest) and `gps` (PPS + NMEA
-on one port). Everything else — SHM, PTP, other receivers' binary protocols —
+from one receiver). Everything else — SHM, PTP, other receivers' binary protocols —
 is out of scope. A future refclock would be a third type, not a framework.
 
 **D8 — ntpd's loop structure, critically damped gains.** The filter →
@@ -1255,6 +1265,12 @@ showed why: periodic re-resolution of a pool name is a server change every
 interval, which turns the per-source clock filter into a blend of unrelated
 servers. Failure-only re-resolution (8 consecutive timeouts) still follows a
 server that moves, and a changed address resets the filter (§5.4).
+
+**D13 — OpenWrt is a separate C project.** The Go implementation is a good
+fit for Linux and FreeBSD servers but its static binary and runtime footprint
+are too large for the intended routers. Keeping the router implementation in
+C also lets its packaging, privilege model, and hardware acceptance remain
+specific to constrained OpenWrt targets instead of distorting this daemon.
 
 ---
 

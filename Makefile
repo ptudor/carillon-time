@@ -14,7 +14,7 @@ CMDS        := carillon carillonctl
 
 export CGO_ENABLED = 0
 
-.PHONY: all build test vet fmt tidy clean freebsd linux openwrt dist
+.PHONY: all build test vet fmt tidy clean freebsd linux dist
 
 all: build
 
@@ -50,12 +50,7 @@ linux:
 	$(call cross,linux,amd64,)
 	$(call cross,linux,arm64,)
 
-openwrt:
-	$(call cross,linux,mipsle,GOMIPS=softfloat)
-	$(call cross,linux,arm,GOARM=7)
-	$(call cross,linux,arm64,)
-
-dist: freebsd linux openwrt
+dist: freebsd linux
 
 clean:
 	rm -rf $(BIN) $(DIST)
