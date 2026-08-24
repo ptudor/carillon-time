@@ -398,8 +398,18 @@ noselect = false
 
 - A fresh UDP socket per request, bound to an ephemeral port (RFC 9109 port
   randomisation), connected to the server address, closed after the reply or
-  timeout. Addresses are re-resolved every 1024 s or on 8 consecutive
-  timeouts.
+  timeout.
+- A hostname is resolved once, when the source starts, and re-resolved only
+  after 8 consecutive timeouts (the server may have moved). There is no
+  periodic re-resolution. A pool name such as `2.fedora.pool.ntp.org` answers
+  with a different server on every lookup, and the first soak (2026-08-23)
+  showed the earlier 1024 s re-resolution silently changing every source's
+  server about every 17 minutes while its clock filter blended samples from
+  unrelated servers: 20 ms jitter, a system source that changed every few
+  minutes, and 30–40 ms root dispersion. When a re-resolution yields a
+  different address the source's clock filter is reset, since its samples
+  describe the previous server; the same address keeps the filter, and stale
+  samples age out through dispersion.
 - Client packets: LI=0, VN=4, mode 3, poll = current poll exponent, precision
   from the clock, root delay/dispersion = 0, refid 0, receive/origin = 0,
   **transmit = 64 random bits** used purely as a nonce; the real T1 is kept
@@ -1164,6 +1174,13 @@ knows, shareable with chrony/ntpd hosts on the LAN if ever needed.
 **D11 — No `SIGHUP` reload.** Restart costs one drift-file read; a reload
 path that has to tear down serial devices and line disciplines correctly is
 code that would rarely run and rarely be tested.
+
+**D12 — Hostnames are re-resolved only on failure.** ntpd and chrony both
+keep a resolved address until the server stops answering, and the first soak
+showed why: periodic re-resolution of a pool name is a server change every
+interval, which turns the per-source clock filter into a blend of unrelated
+servers. Failure-only re-resolution (8 consecutive timeouts) still follows a
+server that moves, and a changed address resets the filter (§5.4).
 
 ---
 

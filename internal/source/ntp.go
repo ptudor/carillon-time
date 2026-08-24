@@ -23,11 +23,11 @@ const (
 	// defaultTimeout is how long a poll waits for a reply.
 	defaultTimeout = 2 * time.Second
 
-	// resolveInterval is how often (seconds) a hostname is re-resolved.
-	resolveInterval = 1024.0
-
-	// resolveAfterTimeouts forces re-resolution after this many consecutive
-	// unanswered polls: the server may have moved.
+	// resolveAfterTimeouts re-resolves a hostname after this many consecutive
+	// unanswered polls: the server may have moved. There is deliberately no
+	// periodic re-resolution: a pool name answers with a different server on
+	// every lookup, and changing servers under a running clock filter blends
+	// unrelated measurements (DESIGN.md §5.4).
 	resolveAfterTimeouts = 8
 
 	// burstCount and burstSpacing describe an iburst: packets sent while the
@@ -103,10 +103,13 @@ type NTP struct {
 	// case. Tests replace it to run without real delays.
 	sleep func(ctx context.Context, d time.Duration) bool
 
+	// lookup turns host:port into an address. Tests replace it to steer the
+	// poller between servers.
+	lookup func(ctx context.Context, host string, port uint16) (netip.AddrPort, error)
+
 	// Poller state, touched only by the Run goroutine.
 	addr                netip.AddrPort
 	haveAddr            bool
-	resolvedAt          float64
 	resolveFailing      bool
 	reach               uint8
 	poll                int8
@@ -156,6 +159,7 @@ func NewNTP(cfg NTPConfig, clk clock.Clock, log *slog.Logger) (*NTP, error) {
 		log:    log.With("source", cfg.Name),
 		filter: discipline.NewFilter(ntp.Log2Seconds(clk.Precision())),
 		sleep:  realSleep,
+		lookup: resolve,
 		poll:   cfg.PollMin,
 	}
 	n.info.Store(&Info{Name: cfg.Name, Address: cfg.Address, Poll: cfg.PollMin})
@@ -210,16 +214,16 @@ func (n *NTP) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 	}
 }
 
-// ensureResolved makes sure n.addr is current, resolving the hostname when
-// it has never been resolved, when the resolution is old, or when the
-// server has stopped answering. It returns false when no address is
-// available for this poll.
+// ensureResolved makes sure n.addr is usable, resolving the hostname when
+// it has never been resolved or when the server has stopped answering. A
+// name that resolves to a different server than before discards the clock
+// filter, because its samples describe the previous server. It returns
+// false when no address is available for this poll.
 func (n *NTP) ensureResolved(ctx context.Context) bool {
-	now := n.clk.Monotonic()
-	if n.haveAddr && now-n.resolvedAt < resolveInterval && n.consecutiveTimeouts < resolveAfterTimeouts {
+	if n.haveAddr && n.consecutiveTimeouts < resolveAfterTimeouts {
 		return true
 	}
-	addr, err := resolve(ctx, n.host, n.port)
+	addr, err := n.lookup(ctx, n.host, n.port)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false
@@ -236,12 +240,15 @@ func (n *NTP) ensureResolved(ctx context.Context) bool {
 		n.log.Info("server resolves again", "address", n.cfg.Address, "resolved", addr)
 		n.resolveFailing = false
 	}
-	if !n.haveAddr || addr != n.addr {
+	switch {
+	case !n.haveAddr:
 		n.log.Info("resolved server", "address", n.cfg.Address, "resolved", addr)
+	case addr != n.addr:
+		n.filter.Reset()
+		n.log.Info("resolved server", "address", n.cfg.Address, "resolved", addr, "previous", n.addr)
 	}
 	n.addr = addr
 	n.haveAddr = true
-	n.resolvedAt = now
 	n.consecutiveTimeouts = 0
 	n.updateInfo(func(i *Info) { i.Resolved = addr })
 	return true
