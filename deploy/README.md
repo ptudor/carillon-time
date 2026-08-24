@@ -68,6 +68,28 @@ udevadm trigger --subsystem-match=pps
 Before enabling it, confirm that the sequence after `#` increases once per
 second in `/sys/class/pps/pps0/assert` (or `clear` for the selected edge).
 
+A Linux GPS receiver that carries NMEA on a tty cannot use serial `N_PPS` on
+that same tty: the PPS line discipline replaces normal serial input. Keep
+NMEA on the receiver tty and configure a separate kernel PPS device (commonly
+`pps-gpio`) or a second PPS-only tty:
+
+```toml
+[[refclock]]
+name = "gps"
+type = "gps"
+device = "/dev/ttyS0"
+baud = 9600
+pps = "/dev/pps0"
+pps_edge = "assert"
+nmea_offset = 0.150
+sentences = ["RMC", "ZDA"]
+prefer = true
+```
+
+Set `pps = "none"` for an NMEA-only receiver. This still provides an
+independent stratum-1 source, but with serial sentence-arrival accuracy rather
+than kernel PPS accuracy.
+
 Then disable every installed competitor and enable carillon:
 
 ```sh
@@ -140,6 +162,13 @@ dir = "/var/lib/carillon/stats"
 Use `/var/db/carillon/stats` on FreeBSD. Files are named `loop.YYYY-MM-DD.tsv`,
 `sources.YYYY-MM-DD.tsv`, and `pps.YYYY-MM-DD.tsv` in UTC.
 
+For a GPS-led stratum-1 host, install a current NIST/IERS
+`leap-seconds.list` and set `daemon.leapfile`. `carillon -check` parses the
+file, warns 30 days before expiry, and warns when it is expired. Monitoring
+reports an expiring file as degraded and an expired file as unhealthy. The
+file overrides survivor leap bits and drives the kernel insertion/deletion
+flag only during the final UTC day.
+
 ## FreeBSD with rc.d
 
 Create the daemon account and directories, then install the binaries, rc.d
@@ -182,6 +211,25 @@ printf 'dev.uart.0.pps_mode=2\n' > /etc/sysctl.conf.d/carillon-pps.conf
 
 Set `device = "/dev/cuau0"` in the `[[refclock]]`. `carillon -check` rejects
 a disabled `pps_mode`, and the `dialer` group grants device access.
+
+For a combined GPS receiver, use the same callout tty for NMEA and native
+UART PPS, and make the configured pin agree with `pps_mode`:
+
+```toml
+[[refclock]]
+name = "gps"
+type = "gps"
+device = "/dev/cuau0"
+baud = 9600
+pps = "dcd"
+pps_edge = "assert"
+nmea_offset = 0.150
+sentences = ["RMC", "ZDA"]
+prefer = true
+```
+
+`pps = "cts"` requires the low two `pps_mode` bits to select CTS (`1`);
+`pps = "dcd"` requires DCD (`2`).
 
 The rc.d prestart also recreates `/var/run/carillon` after every boot. Adding
 operators to the `carillon` group lets them use the mode-`0660` control socket;

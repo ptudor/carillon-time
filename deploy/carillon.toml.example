@@ -3,7 +3,6 @@
 # Install as:
 #   /usr/local/etc/carillon/carillon.toml   (FreeBSD)
 #   /etc/carillon/carillon.toml             (Linux)
-#   /etc/carillon.toml                      (OpenWrt)
 # or pass -config /path/to/carillon.toml.
 #
 # Unknown keys are errors: a typo will stop the daemon from starting rather
@@ -50,6 +49,35 @@ log_level = "info"
 #poll_max    = 7              # up to 128 s
 #
 # Inspect the pulse window with: carillonctl refclock
+
+# --- GPS reference clock ---------------------------------------------------
+# A GPS receiver always creates <name>/nmea. With PPS enabled it also creates
+# <name>/pps; prefer applies to the precise PPS source, while NMEA remains the
+# normal source that identifies each second. NMEA-only defaults to pps="none".
+#
+# FreeBSD can take NMEA and native UART PPS from the same callout tty; set pps
+# to the pin selected by dev.uart.N.pps_mode. Linux N_PPS replaces the tty's
+# serial line discipline, so NMEA must stay on device while pps names a
+# separate /dev/ppsN, GPIO PPS device, or PPS-only tty.
+
+#[[refclock]]
+#name        = "gps"
+#type        = "gps"
+#device      = "/dev/cuau0" # Linux example: /dev/ttyS0
+#baud        = 9600          # 4800, 9600, 19200, 38400, 57600, or 115200
+#pps         = "dcd"        # FreeBSD: dcd/cts; Linux: separate /dev/ppsN; or none
+#pps_edge    = "assert"
+#pps_offset  = 0.0
+#nmea_offset = 0.150         # fixed sentence-arrival correction, seconds
+#sentences   = ["RMC", "ZDA"]
+#prefer      = true
+#noselect    = false
+#lock_jitter = 0.000020
+#poll_min    = 4
+#poll_max    = 7
+#
+# carillonctl refclock reports fix, satellites, sentence freshness, and the
+# measured median NMEA lag behind PPS as a calibration suggestion.
 
 # --- Upstream servers -------------------------------------------------------
 # Each [[server]] is polled independently. Three or more independent servers
@@ -153,5 +181,5 @@ limit = 3
 # Refuse to correct an offset larger than this (seconds) ...
 panic = 1000
 # ... except for the very first correction when this is true. Set it on
-# hosts without a battery-backed clock (OpenWrt routers, some SBCs).
+# hosts without a battery-backed clock (some SBCs).
 panic_at_startup = false

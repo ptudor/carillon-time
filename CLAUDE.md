@@ -2,12 +2,12 @@
 
 `carillon` is a single-binary NTPv4 (RFC 5905) client + server whose reason for
 existing is **disciplining the system clock from a PPS signal on a serial port**
-(RFC 2783 PPS API) on FreeBSD and Linux, with OpenWrt as a later target. The
+(RFC 2783 PPS API) on FreeBSD and Linux. The
 second job is the two-host topology: the **home** box (GPS + PPS, stratum 1)
 is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
-**Status (2026-08-23):** milestones M0–M3 of `DESIGN.md` §15 are implemented
+**Status (2026-08-23):** milestones M0–M4 of `DESIGN.md` §15 are implemented
 in code.
 The authenticated two-host topology is deployed on `gummi` (Fedora 43) and
 `twocom` (FreeBSD 15): both clock backends, init systems, drift persistence,
@@ -15,9 +15,11 @@ IPv4/IPv6 listeners, ACLs, CMAC, and client/server paths have passed an initial
 real-host acceptance run (`deploy/ACCEPTANCE.md`). They are now the long-term
 in-house test hosts. Linux and FreeBSD PPS API/capability/fetch paths have
 also run on them, but none of their configured serial inputs currently has a
-live pulse, so stratum-1 acceptance remains pending. Not yet built: the GPS
-refclock, leapfile/stats/metrics (M4), and OpenWrt packaging (M5). A live PPS
-test and the long-duration accuracy comparison remain ahead.
+live pulse, so GPS/PPS stratum-1 acceptance remains pending. M4 adds GPS/NMEA,
+leapfile authority, daily statistics, and read-only JSON/health/Prometheus
+monitoring. OpenWrt is explicitly deferred to a separate, smaller C project;
+this Go daemon targets Linux and FreeBSD. A live PPS/GPS test and the
+long-duration accuracy comparison remain ahead.
 
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
@@ -35,7 +37,7 @@ future rename stays a mechanical search-and-replace.
 - **Go**, pure Go, `CGO_ENABLED=0` always. Everything the daemon needs from the
   kernel (ioctls, `ntp_adjtime`, socket timestamps) is done with
   `golang.org/x/sys/unix` and hand-declared structs — no C toolchain, so
-  cross-compiling for FreeBSD/Linux/OpenWrt from this Mac is one command.
+  cross-compiling for FreeBSD/Linux from this Mac is one command.
 - Local toolchain: `/opt/local/bin/go` (MacPorts). `go.mod` sets `go 1.25.0`
   as the floor — `golang.org/x/sys` v0.47 requires it; bump deliberately, not
   as a side effect of a `go mod tidy`. Run `go` with `GOMODCACHE`/`GOCACHE`
@@ -59,7 +61,8 @@ internal/ntp/         wire format, timestamps/eras, MAC (auth/), KoD codes — p
 internal/source/      Source interface + NTP client source (poller, clock filter, Query)
 internal/sockts/      kernel receive timestamps on UDP sockets, per OS
 internal/buildinfo/   version and build time stamped by the Makefile
-internal/refclock/    PPS refclock (M3); GPS(NMEA+PPS) refclock in M4
+internal/refclock/    PPS and GPS (NMEA plus optional PPS) refclocks
+internal/leap/        NIST/IERS leap-seconds.list parser and authority
 internal/pps/         RFC 2783 bindings: pps_linux.go, pps_freebsd.go, pps_other.go
 internal/serial/      termios open/configure; Linux N_PPS line-discipline attach
 internal/clock/       actuator: Clock interface, sysclock_linux.go, sysclock_freebsd.go,
@@ -68,8 +71,9 @@ internal/discipline/  filter → select → combine → loop; pure functions, no
 internal/engine/      the single owning goroutine: wires sources, discipline, actuator, status
 internal/server/      UDP listener(s), responder, ACL, rate limiter, KoD
 internal/control/     unix-socket JSON protocol used by carillonctl
-internal/metrics/     (M4) Prometheus collectors
-deploy/               freebsd/ (rc.d), systemd/, openwrt/ (procd), carillon.toml.example
+internal/monitor/     read-only JSON/health HTTP server and Prometheus collector
+internal/stats/       bounded asynchronous daily UTC TSV writer
+deploy/               freebsd/ (rc.d), systemd/, apache/, carillon.toml.example
 DESIGN.md             the spec
 ```
 
@@ -85,7 +89,6 @@ make build                 # host build of carillon + carillonctl into ./bin
 make test                  # go vet ./... && go test -race ./...
 make freebsd               # GOOS=freebsd GOARCH=amd64
 make linux                 # GOOS=linux GOARCH=amd64 (+ arm64 target)
-make openwrt               # GOOS=linux GOARCH=mipsle GOMIPS=softfloat, -ldflags "-s -w"
 go test -fuzz=FuzzDecode ./internal/ntp/   # wire-format fuzzing
 ```
 
@@ -150,9 +153,6 @@ dependency.
   `pps-gpio`) can be configured directly instead.
 - **Both:** set `CLOCAL` immediately after opening a tty that carries PPS on
   DCD, otherwise the carrier toggling at 1 Hz hangs up the port.
-- **OpenWrt:** most routers have no RTC, so the first correction is a step of
-  decades — `[step] panic_at_startup = true` is the OpenWrt default. Kernel
-  modules: `kmod-pps`, `kmod-pps-ldisc` (serial) or `kmod-pps-gpio`.
 - **Privileges:** FreeBSD runs `carillon` as its own user with the `mac_ntpd(4)`
   policy (`security.mac.ntpd.uid=<carillon uid>`) granting `PRIV_ADJTIME`,
   `PRIV_CLOCK_SETTIME`, `PRIV_NTP_ADJTIME`, `PRIV_NETINET_RESERVEDPORT`, plus
@@ -162,8 +162,8 @@ dependency.
 
 ## Deployment conventions
 
-- Config: `/usr/local/etc/carillon/carillon.toml` (FreeBSD), `/etc/carillon/carillon.toml`
-  (Linux/OpenWrt); keys file alongside as `keys` (mode `0600`).
+- Config: `/usr/local/etc/carillon/carillon.toml` (FreeBSD) or
+  `/etc/carillon/carillon.toml` (Linux); keys file alongside as `keys` (mode `0600`).
 - State: `/var/db/carillon/` (FreeBSD) or `/var/lib/carillon/` (Linux) — drift file.
 - Control socket: `/var/run/carillon/carillon.sock`; init creates the
   daemon-owned `/var/run/carillon` directory.
