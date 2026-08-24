@@ -41,6 +41,7 @@ type Config struct {
 	Servers    []Server   `toml:"server"`
 	Refclocks  []Refclock `toml:"refclock"`
 	Serve      Serve      `toml:"serve"`
+	Monitor    Monitor    `toml:"monitor"`
 	Discipline Discipline `toml:"discipline"`
 	Step       Step       `toml:"step"`
 }
@@ -141,6 +142,23 @@ type Serve struct {
 // Enabled reports whether the NTP server should be started.
 func (s *Serve) Enabled() bool { return len(s.Allow) != 0 }
 
+// Monitor configures the read-only HTTP observability listener. It is
+// disabled unless Listen is set. Allow always applies to the immediate TCP
+// peer; proxy headers are deliberately outside this trust boundary.
+type Monitor struct {
+	Listen string   `toml:"listen"`
+	Allow  []string `toml:"allow"`
+
+	// ID, Name and Roles are operator-provided display metadata. They do not
+	// affect daemon behavior or Prometheus labels.
+	ID    string   `toml:"id"`
+	Name  string   `toml:"name"`
+	Roles []string `toml:"roles"`
+}
+
+// Enabled reports whether the monitoring HTTP server should be started.
+func (m *Monitor) Enabled() bool { return m.Listen != "" }
+
 // Discipline tunes the selection and loop.
 type Discipline struct {
 	// MinSurvivors is the smallest number of sources the cluster algorithm
@@ -200,6 +218,9 @@ func Default() *Config {
 			RateLimitPPS: 8,
 			RateBurst:    16,
 			KoD:          true,
+		},
+		Monitor: Monitor{
+			Allow: []string{"127.0.0.0/8", "::1/128"},
 		},
 		Discipline: Discipline{
 			MinSurvivors: 1,
@@ -476,6 +497,7 @@ func Validate(cfg *Config) error {
 		fail("prefer is set on %d sources; at most one source may be preferred", preferred)
 	}
 	validateServe(&cfg.Serve, &needKeys, fail)
+	validateMonitor(&cfg.Monitor, fail)
 	if needKeys && cfg.Daemon.Keys == "" {
 		fail("daemon: keys must be set when an upstream server or serve.require_key uses a key id")
 	}
@@ -501,6 +523,65 @@ func Validate(cfg *Config) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func validateMonitor(m *Monitor, fail func(string, ...any)) {
+	if !m.Enabled() {
+		if m.ID != "" || m.Name != "" || len(m.Roles) != 0 {
+			fail("monitor: listen must be set when identity metadata is configured")
+		}
+		return
+	}
+	addr, err := netip.ParseAddrPort(m.Listen)
+	if err != nil || !addr.Addr().IsValid() || addr.Addr().Is4In6() || addr.Port() == 0 {
+		fail("monitor: listen address %q must be a numeric IP:port with a nonzero port", m.Listen)
+	}
+	if len(m.Allow) == 0 {
+		fail("monitor: allow must contain at least one prefix")
+	}
+	seenAllow := make(map[netip.Prefix]bool, len(m.Allow))
+	for _, raw := range m.Allow {
+		p, err := netip.ParsePrefix(raw)
+		if err != nil || p.Addr().Zone() != "" || p.Addr().Is4In6() {
+			fail("monitor: allow prefix %q is invalid", raw)
+			continue
+		}
+		p = p.Masked()
+		if seenAllow[p] {
+			fail("monitor: duplicate allow prefix %q", raw)
+		}
+		seenAllow[p] = true
+	}
+	if m.ID != "" && !validMonitorTag(m.ID) {
+		fail("monitor: id %q must contain only letters, digits, '.', '_' or '-'", m.ID)
+	}
+	if len(m.Name) > 128 || strings.TrimSpace(m.Name) != m.Name {
+		fail("monitor: name must be at most 128 bytes with no leading or trailing whitespace")
+	}
+	seenRole := make(map[string]bool, len(m.Roles))
+	for _, role := range m.Roles {
+		if !validMonitorTag(role) {
+			fail("monitor: role %q must contain only letters, digits, '.', '_' or '-'", role)
+			continue
+		}
+		if seenRole[role] {
+			fail("monitor: duplicate role %q", role)
+		}
+		seenRole[role] = true
+	}
+}
+
+func validMonitorTag(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateServe(s *Serve, needKeys *bool, fail func(string, ...any)) {
@@ -585,6 +666,20 @@ func (c *Config) ServeListenAddrs() []netip.AddrPort {
 	out := make([]netip.AddrPort, 0, len(c.Serve.Listen))
 	for _, raw := range c.Serve.Listen {
 		out = append(out, netip.MustParseAddrPort(raw))
+	}
+	return out
+}
+
+// MonitorListenAddr parses the already-validated HTTP listener address.
+func (c *Config) MonitorListenAddr() netip.AddrPort {
+	return netip.MustParseAddrPort(c.Monitor.Listen)
+}
+
+// MonitorPrefixes parses the already-validated monitoring request ACL.
+func (c *Config) MonitorPrefixes() []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(c.Monitor.Allow))
+	for _, raw := range c.Monitor.Allow {
+		out = append(out, netip.MustParsePrefix(raw).Masked())
 	}
 	return out
 }

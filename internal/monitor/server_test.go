@@ -1,0 +1,113 @@
+package monitor
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/netip"
+	"strings"
+	"testing"
+	"time"
+
+	"carillon/internal/discipline"
+	"carillon/internal/engine"
+)
+
+func startTestServer(t *testing.T, allow []netip.Prefix, state discipline.State) (*Server, string) {
+	t.Helper()
+	now := time.Now().UTC()
+	s, err := Listen(Config{
+		Listen:   netip.MustParseAddrPort("127.0.0.1:0"),
+		Allow:    allow,
+		Metadata: Metadata{ID: "test"},
+		Status:   func() *engine.Status { return testEngineStatus(now, state) },
+		Now:      func() time.Time { return now.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("monitor server did not stop")
+		}
+	})
+	return s, "http://" + s.Addr().String()
+}
+
+func TestStatusAndHealthHandlers(t *testing.T) {
+	_, base := startTestServer(t, []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, discipline.StateSynced)
+
+	resp, err := http.Get(base + "/api/v1/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("status response: %s %q", resp.Status, resp.Header.Get("Content-Type"))
+	}
+	if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("security headers missing: %v", resp.Header)
+	}
+	var snapshot Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Schema != schemaV1 || snapshot.Health.Status != "healthy" || snapshot.Instance.ID != "test" {
+		t.Fatalf("snapshot: %+v", snapshot)
+	}
+
+	health, err := http.Get(base + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Fatalf("health: %s", health.Status)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, base+"/api/v1/status", strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	methodResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	methodResp.Body.Close()
+	if methodResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, want 405", methodResp.StatusCode)
+	}
+}
+
+func TestUnhealthyAndDenied(t *testing.T) {
+	_, unhealthyBase := startTestServer(t, []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, discipline.StateUnsynced)
+	resp, err := http.Get(unhealthyBase + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("unhealthy status = %d", resp.StatusCode)
+	}
+
+	_, deniedBase := startTestServer(t, []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, discipline.StateSynced)
+	denied, err := http.Get(deniedBase + "/api/v1/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(denied.Body)
+	denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "Forbidden") {
+		t.Fatalf("denied: %s %q", denied.Status, body)
+	}
+}

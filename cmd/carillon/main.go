@@ -26,6 +26,7 @@ import (
 	"carillon/internal/control"
 	"carillon/internal/discipline"
 	"carillon/internal/engine"
+	"carillon/internal/monitor"
 	"carillon/internal/ntp"
 	"carillon/internal/ntp/auth"
 	"carillon/internal/pps"
@@ -86,7 +87,11 @@ func runDaemon(args []string) int {
 		if cfg.Serve.Enabled() {
 			listeners = len(cfg.Serve.Listen)
 		}
-		fmt.Printf("%s: configuration OK (%d upstreams, %d refclocks, %d listeners)\n", *cfgPath, len(cfg.Servers), len(cfg.Refclocks), listeners)
+		monitors := 0
+		if cfg.Monitor.Enabled() {
+			monitors = 1
+		}
+		fmt.Printf("%s: configuration OK (%d upstreams, %d refclocks, %d NTP listeners, %d monitor listeners)\n", *cfgPath, len(cfg.Servers), len(cfg.Refclocks), listeners, monitors)
 		return 0
 	}
 
@@ -233,6 +238,26 @@ func runDaemon(args []string) int {
 		}
 	}
 
+	var monitorServer *monitor.Server
+	if cfg.Monitor.Enabled() {
+		monitorServer, err = monitor.Listen(monitor.Config{
+			Listen:        cfg.MonitorListenAddr(),
+			Allow:         cfg.MonitorPrefixes(),
+			Metadata:      monitor.Metadata{ID: cfg.Monitor.ID, Name: cfg.Monitor.Name, Roles: cfg.Monitor.Roles},
+			ServerEnabled: cfg.Serve.Enabled(),
+			Status:        eng.Status,
+			Stats:         serverStats,
+			Now:           clk.Now,
+			Log:           log,
+		})
+		if err != nil {
+			log.Error("monitor", "error", err)
+			return exitRuntime
+		}
+		defer monitorServer.Close()
+		log.Info("monitor listening", "address", monitorServer.Addr())
+	}
+
 	ctl, err := control.Listen(cfg.Daemon.Control, eng, serverStats, buildinfo.Version, log)
 	if err != nil {
 		log.Error("control socket", "error", err)
@@ -241,7 +266,7 @@ func runDaemon(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	auxErr := make(chan error, 2)
+	auxErr := make(chan error, 3)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -258,6 +283,17 @@ func runDaemon(args []string) int {
 			defer wg.Done()
 			if err := timeServer.Serve(ctx); err != nil {
 				log.Error("NTP server", "error", err)
+				auxErr <- err
+				stop()
+			}
+		}()
+	}
+	if monitorServer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := monitorServer.Serve(ctx); err != nil {
+				log.Error("monitor", "error", err)
 				auxErr <- err
 				stop()
 			}

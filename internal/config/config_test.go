@@ -43,6 +43,12 @@ rate_limit_pps = 4
 rate_burst     = 8
 kod            = false
 
+[monitor]
+listen = "127.0.0.1:9123"
+id = "twocom"
+name = "Twocom"
+roles = ["colo", "ntp-pool"]
+
 [discipline]
 min_survivors = 1
 holdover_max  = 3600
@@ -76,6 +82,15 @@ func TestParseFull(t *testing.T) {
 	}
 	if !cfg.Serve.Enabled() || len(cfg.Serve.Listen) != 2 || cfg.Serve.RateLimitPPS != 4 || cfg.Serve.RateBurst != 8 || cfg.Serve.KoD {
 		t.Fatalf("serve: %+v", cfg.Serve)
+	}
+	if !cfg.Monitor.Enabled() || cfg.Monitor.ID != "twocom" || len(cfg.Monitor.Roles) != 2 {
+		t.Fatalf("monitor: %+v", cfg.Monitor)
+	}
+	if got := cfg.MonitorListenAddr(); got != netip.MustParseAddrPort("127.0.0.1:9123") {
+		t.Fatalf("monitor listen: %v", got)
+	}
+	if got := cfg.MonitorPrefixes(); len(got) != 2 || got[0] != netip.MustParsePrefix("127.0.0.0/8") {
+		t.Fatalf("monitor allow: %v", got)
 	}
 	allow, deny, require := cfg.ServePrefixes()
 	if len(allow) != 2 || len(deny) != 1 || require[netip.MustParsePrefix("203.0.113.7/32")] != 1 {
@@ -129,6 +144,10 @@ func TestParseUnknownKey(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "rate_burts") {
 		t.Fatalf("unknown [serve] key must be rejected: %v", err)
 	}
+	_, err = Parse([]byte("[monitor]\nlistne = \"127.0.0.1:9123\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "listne") {
+		t.Fatalf("unknown [monitor] key must be rejected: %v", err)
+	}
 }
 
 func TestParseSyntaxError(t *testing.T) {
@@ -158,6 +177,9 @@ func TestServerDefaults(t *testing.T) {
 	}
 	if cfg.Serve.Enabled() || cfg.Serve.RateLimitPPS != 8 || cfg.Serve.RateBurst != 16 || !cfg.Serve.KoD {
 		t.Fatalf("serve defaults: %+v", cfg.Serve)
+	}
+	if cfg.Monitor.Enabled() || len(cfg.Monitor.Allow) != 2 {
+		t.Fatalf("monitor defaults: %+v", cfg.Monitor)
 	}
 	if s.String() != "time.invalid" {
 		t.Fatalf("String: %q", s.String())
@@ -256,6 +278,19 @@ func TestValidateRules(t *testing.T) {
 		{"serve key without keys file", func(c *Config) { enableServe(c); c.Serve.RequireKey = map[string]uint32{"127.0.0.1/32": 1} }, "keys must be set"},
 		{"serve zero rate", func(c *Config) { enableServe(c); c.Serve.RateLimitPPS = 0 }, "rate_limit_pps"},
 		{"serve low burst", func(c *Config) { enableServe(c); c.Serve.RateBurst = 0.5 }, "rate_burst"},
+		{"monitor bad listen", func(c *Config) { c.Monitor.Listen = "localhost:9123" }, "numeric IP:port"},
+		{"monitor zero port", func(c *Config) { c.Monitor.Listen = "127.0.0.1:0" }, "nonzero port"},
+		{"monitor empty allow", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Allow = nil }, "allow must contain"},
+		{"monitor bad allow", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Allow = []string{"bad"} }, "allow prefix"},
+		{"monitor duplicate allow", func(c *Config) {
+			c.Monitor.Listen = "127.0.0.1:9123"
+			c.Monitor.Allow = []string{"127.0.0.0/8", "127.0.0.1/8"}
+		}, "duplicate allow"},
+		{"monitor metadata disabled", func(c *Config) { c.Monitor.ID = "host" }, "listen must be set"},
+		{"monitor bad id", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.ID = "bad id" }, "monitor: id"},
+		{"monitor bad name", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Name = " trailing " }, "monitor: name"},
+		{"monitor bad role", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Roles = []string{"bad role"} }, "monitor: role"},
+		{"monitor duplicate role", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Roles = []string{"pool", "pool"} }, "duplicate role"},
 		{"bad log level", func(c *Config) { c.Daemon.LogLevel = "verbose" }, "log_level"},
 		{"empty drift", func(c *Config) { c.Daemon.DriftFile = "" }, "drift_file must be set"},
 		{"empty control", func(c *Config) { c.Daemon.Control = "" }, "control must be set"},

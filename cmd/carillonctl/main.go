@@ -122,6 +122,13 @@ func printServerStats(s *control.ServerStats) {
 	fmt.Fprintf(w, "Rate limited\t%d\n", s.RateLimited)
 	fmt.Fprintf(w, "Bad authentication\t%d\n", s.BadAuth)
 	fmt.Fprintf(w, "Unsynchronized replies\t%d\n", s.Unsynced)
+	fmt.Fprintf(w, "Missing kernel timestamps\t%d\n", s.NoKernelTS)
+	if !s.LastRequest.IsZero() {
+		fmt.Fprintf(w, "Last request\t%s\n", s.LastRequest.UTC().Format(time.RFC3339Nano))
+	}
+	if !s.LastServed.IsZero() {
+		fmt.Fprintf(w, "Last served\t%s\n", s.LastServed.UTC().Format(time.RFC3339Nano))
+	}
 }
 
 func printTracking(t *control.Tracking) {
