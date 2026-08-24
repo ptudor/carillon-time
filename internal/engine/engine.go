@@ -45,6 +45,11 @@ type Config struct {
 
 	// Version is reported in status snapshots.
 	Version string
+
+	// Observe receives each immutable status snapshot after publication. It
+	// must return promptly; optional statistics use a bounded non-blocking
+	// queue so disk I/O never enters the clock-discipline path.
+	Observe func(*Status)
 }
 
 // Status is the engine's immutable snapshot.
@@ -413,6 +418,9 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 		s.Infos[name] = spec.Source.Info()
 	}
 	e.status.Store(s)
+	if e.cfg.Observe != nil {
+		e.cfg.Observe(s)
+	}
 }
 
 // maybeWriteDrift writes the drift file when the frequency is trustworthy

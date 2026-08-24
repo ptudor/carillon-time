@@ -85,6 +85,7 @@ type RefclockInfo struct {
 	IntervalJitter float64
 	Stable         bool
 	LastPulse      time.Time
+	LastOffset     float64
 	LastInterval   float64
 
 	Samples  uint64

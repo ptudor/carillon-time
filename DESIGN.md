@@ -981,10 +981,13 @@ The `/metrics` endpoint exports:
 `carillon_state`, `carillon_offset_seconds`, `carillon_frequency_ppm`,
 `carillon_jitter_seconds`, `carillon_root_dispersion_seconds`, `carillon_stratum`,
 `carillon_steps_total`, `carillon_source_offset_seconds{source}`,
-`carillon_source_reach{source}`, `carillon_source_selected{source}`,
-`carillon_pps_samples_total{source,result=ok|spike|gap|glitch|unqualified}`,
+`carillon_source_delay_seconds{source}`, `carillon_source_jitter_seconds{source}`,
+`carillon_source_root_distance_seconds{source}`, `carillon_source_reach{source}`,
+`carillon_source_selected{source}`, `carillon_source_events_total{source,result}`,
+`carillon_pps_samples_total{source,result=ok|timeout|spike|gap|glitch}`,
 `carillon_pps_jitter_seconds{source}`, `carillon_pps_locked{source}`,
 `carillon_server_requests_total{result}`, `carillon_server_last_request_timestamp_seconds`,
+`carillon_server_last_served_timestamp_seconds`, `carillon_server_enabled`,
 `carillon_source_receive_timestamp_seconds{source}`,
 `carillon_source_kernel_timestamp_missing_total{source}`,
 `carillon_server_kernel_timestamp_missing_total`, `carillon_leap_pending`, and
@@ -998,7 +1001,10 @@ or fixed finite enums; operator roles are deliberately not metric labels.
 - **Statistics** (optional, `[stats] dir`): `loop.tsv` (per update: time, θ,
   freq, ψ, poll, state), `pps.tsv` (per accepted pulse: time, θ), `sources.tsv`.
   A new file per UTC day (`loop.2026-08-23.tsv`); buffered, flushed each
-  minute and on exit. This is what gets plotted when tuning.
+  minute and on exit. Snapshot delivery to the writer is bounded and
+  non-blocking: a stalled disk drops and counts statistics snapshots rather
+  than delaying the engine. Output errors are rate-limited WARNs and retried;
+  they never stop clock discipline. This is what gets plotted when tuning.
 
 ---
 
@@ -1076,6 +1082,9 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
 - **Control/monitoring:** a small unix-socket accept loop and standard
   `net/http`; both only read immutable snapshots. Only `waitsync` sends a
   request into the engine and waits on a reply channel.
+- **Statistics writer:** receives immutable snapshots through a bounded
+  non-blocking queue, owns its buffered daily files, flushes each minute, and
+  drains queued snapshots on shutdown. It never calls into the engine.
 - **Shutdown:** `SIGTERM`/`SIGINT` cancel the root context; engine writes the
   drift file, leaves the frequency word alone, closes sockets; `main` waits
   with a 5 s deadline.

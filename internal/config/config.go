@@ -42,6 +42,7 @@ type Config struct {
 	Refclocks  []Refclock `toml:"refclock"`
 	Serve      Serve      `toml:"serve"`
 	Monitor    Monitor    `toml:"monitor"`
+	Stats      Stats      `toml:"stats"`
 	Discipline Discipline `toml:"discipline"`
 	Step       Step       `toml:"step"`
 }
@@ -158,6 +159,14 @@ type Monitor struct {
 
 // Enabled reports whether the monitoring HTTP server should be started.
 func (m *Monitor) Enabled() bool { return m.Listen != "" }
+
+// Stats configures optional daily UTC TSV statistics files.
+type Stats struct {
+	Dir string `toml:"dir"`
+}
+
+// Enabled reports whether daily statistics should be recorded.
+func (s *Stats) Enabled() bool { return s.Dir != "" }
 
 // Discipline tunes the selection and loop.
 type Discipline struct {
@@ -518,6 +527,9 @@ func Validate(cfg *Config) error {
 	if cfg.Step.Limit < -1 {
 		fail("step: limit %d must be -1 (always), 0 (never), or a positive count", cfg.Step.Limit)
 	}
+	if cfg.Stats.Enabled() && filepath.Clean(cfg.Stats.Dir) == "." {
+		fail("stats: dir must name a directory")
+	}
 	if !(cfg.Step.Panic > cfg.Step.Threshold) {
 		fail("step: panic %v must be greater than threshold %v", cfg.Step.Panic, cfg.Step.Threshold)
 	}
@@ -715,6 +727,16 @@ func Check(cfg *Config) error {
 			errs = append(errs, fmt.Errorf("daemon: leapfile: %w", err))
 		} else {
 			f.Close()
+		}
+	}
+	if cfg.Stats.Enabled() {
+		st, err := os.Stat(cfg.Stats.Dir)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("stats: dir %s: %w", cfg.Stats.Dir, err))
+		} else if !st.IsDir() {
+			errs = append(errs, fmt.Errorf("stats: dir %s is not a directory", cfg.Stats.Dir))
+		} else if err := unix.Access(cfg.Stats.Dir, unix.W_OK); err != nil {
+			errs = append(errs, fmt.Errorf("stats: dir %s is not writable: %w", cfg.Stats.Dir, err))
 		}
 	}
 	for i := range cfg.Refclocks {

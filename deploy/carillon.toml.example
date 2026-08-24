@@ -107,6 +107,31 @@ iburst  = true
 #
 # Inspect counters with: carillonctl serverstats
 
+# --- Read-only HTTP monitoring ---------------------------------------------
+# Disabled unless listen is set. The request ACL defaults to loopback even if
+# listen is changed. Keep this on loopback when Apache proxies the status API
+# over authenticated HTTPS; bind a private address and explicitly allow the
+# LAN for direct access from an iPhone.
+
+#[monitor]
+#listen = "127.0.0.1:9123"
+#allow  = ["127.0.0.0/8", "::1/128"]
+#id     = "twocom"
+#name   = "Twocom"
+#roles  = ["colo", "ntp-pool"]
+#
+# GET /api/v1/status  complete JSON snapshot (always 200 when readable)
+# GET /healthz        200 healthy, 503 degraded/unhealthy
+# GET /metrics        Prometheus exposition
+
+# --- Daily statistics ------------------------------------------------------
+# Optional daily UTC TSV files for tuning. Create this directory writable by
+# the carillon user before enabling it. Files are buffered and flushed each
+# minute and at shutdown.
+
+#[stats]
+#dir = "/var/db/carillon/stats"  # Linux: /var/lib/carillon/stats
+
 # --- Discipline -------------------------------------------------------------
 [discipline]
 # Smallest number of sources the cluster algorithm keeps.
