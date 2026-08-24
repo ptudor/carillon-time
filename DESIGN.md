@@ -1091,8 +1091,8 @@ by attackers (rate-limit table is bounded and LRU).
 | | Deliverable | Done when |
 |---|---|---|
 | M0 ✅ 2026-08-23 | Repo skeleton, config, `internal/ntp` wire format + CMAC, `clock.Fake`, discipline package with simulation tests | `go test -race ./...` green on the Mac |
-| M1 ✅ 2026-08-23 (code) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | a plain client host tracks upstream as well as chrony does — **not yet verified on real hardware** |
-| M2 ✅ 2026-08-23 (code) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | home → colo topology runs end to end without a refclock — **not yet verified on real hosts** |
+| M1 ✅ 2026-08-23 (initial host acceptance) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | Fedora and FreeBSD hosts both track and restart from drift; long-duration chrony comparison is now running |
+| M2 ✅ 2026-08-23 (real hosts) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | `gummi` → authenticated `twocom` topology runs end to end without a refclock; see `deploy/ACCEPTANCE.md` |
 | M3 | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | home host is stratum 1 from a bare PPS numbered by NTP |
 | M4 | `gps` refclock (NMEA), leapfile, stats files, metrics, `-check` | home host is stratum 1 with GPS alone |
 | M5 | OpenWrt build + procd, hardening (Capsicum socket pool, systemd sandbox), `deploy/ACCEPTANCE.md` | runs on the router |

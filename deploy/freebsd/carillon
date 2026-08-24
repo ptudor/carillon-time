@@ -12,8 +12,8 @@
 # Optional settings (defaults shown):
 #
 # carillon_config="/usr/local/etc/carillon/carillon.toml"
-# carillon_user="carillon"
-# carillon_group="carillon"
+# carillon_run_user="carillon"
+# carillon_run_group="carillon"
 #
 # One-time setup
 # --------------
@@ -58,14 +58,14 @@ rcvar="${name}_enable"
 load_rc_config $name
 
 : ${carillon_enable:="NO"}
-: ${carillon_user:="carillon"}
-: ${carillon_group:="carillon"}
+: ${carillon_run_user:="carillon"}
+: ${carillon_run_group:="carillon"}
 : ${carillon_config:="/usr/local/etc/carillon/carillon.toml"}
 
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
 procname="/usr/local/sbin/carillon"
-command_args="-f -p ${pidfile} -u ${carillon_user} ${procname} -config ${carillon_config}"
+command_args="-f -S -T ${name} -p ${pidfile} -u ${carillon_run_user} ${procname} -config ${carillon_config}"
 
 start_precmd="${name}_prestart"
 
@@ -74,17 +74,17 @@ carillon_prestart()
 	if checkyesno ntpd_enable; then
 		err 1 "ntpd_enable is YES in rc.conf; two time daemons must not discipline one clock"
 	fi
-	if checkyesno chronyd_enable; then
+	if [ -n "${chronyd_enable}" ] && checkyesno chronyd_enable; then
 		err 1 "chronyd_enable is YES in rc.conf; two time daemons must not discipline one clock"
 	fi
 	if [ ! -f "${carillon_config}" ]; then
 		err 1 "config not found: ${carillon_config}"
 	fi
-	install -d -o ${carillon_user} -g ${carillon_group} -m 750 /var/run/carillon
+	install -d -o ${carillon_run_user} -g ${carillon_run_group} -m 750 /var/run/carillon
 	if ! ${procname} -check -config "${carillon_config}"; then
 		err 1 "config check failed: ${carillon_config}"
 	fi
-	install -o ${carillon_user} -g ${carillon_group} -m 644 /dev/null ${pidfile}
+	install -o ${carillon_run_user} -g ${carillon_run_group} -m 644 /dev/null ${pidfile}
 }
 
 run_rc_command "$1"
