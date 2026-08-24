@@ -5,6 +5,7 @@
 //
 //	carillonctl [-socket path] [-json] tracking
 //	carillonctl [-socket path] [-json] sources
+//	carillonctl [-socket path] [-json] serverstats
 //	carillonctl [-socket path] waitsync [seconds]
 //	carillonctl [-socket path] version
 package main
@@ -33,7 +34,7 @@ func run(args []string) int {
 	sock := fs.String("socket", config.Default().Daemon.Control, "control socket path")
 	asJSON := fs.Bool("json", false, "print the raw JSON response")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "usage: carillonctl [-socket path] [-json] tracking|sources|version\n       carillonctl [-socket path] waitsync [seconds]\n")
+		fmt.Fprintf(fs.Output(), "usage: carillonctl [-socket path] [-json] tracking|sources|serverstats|version\n       carillonctl [-socket path] waitsync [seconds]\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -77,6 +78,8 @@ func run(args []string) int {
 		printTracking(resp.Tracking)
 	case control.CmdSources:
 		printSources(resp.Sources)
+	case control.CmdServerStats:
+		printServerStats(resp.ServerStats)
 	case control.CmdWaitSync:
 		if resp.Synced == nil || !*resp.Synced {
 			fmt.Println("not synchronized")
@@ -85,6 +88,16 @@ func run(args []string) int {
 		fmt.Println("synchronized")
 	}
 	return 0
+}
+
+func printServerStats(s *control.ServerStats) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer w.Flush()
+	fmt.Fprintf(w, "Served\t%d\n", s.Served)
+	fmt.Fprintf(w, "Denied\t%d\n", s.Denied)
+	fmt.Fprintf(w, "Rate limited\t%d\n", s.RateLimited)
+	fmt.Fprintf(w, "Bad authentication\t%d\n", s.BadAuth)
+	fmt.Fprintf(w, "Unsynchronized replies\t%d\n", s.Unsynced)
 }
 
 func printTracking(t *control.Tracking) {

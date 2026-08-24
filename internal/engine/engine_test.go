@@ -132,7 +132,7 @@ func TestEngineStepsSettlesAndPersistsDrift(t *testing.T) {
 		t.Fatalf("kernel status %+v", ks)
 	}
 	st := e.Status()
-	if st.Stratum != 3 || st.RefID != ntp.RefIDFromString("TEST") || st.SystemSource != "a" || st.RefTime.IsZero() {
+	if st.Stratum != 3 || st.RefID != ntp.RefIDFromString("TEST") || st.SystemSource != "a" || st.RefTime.IsZero() || st.Precision != clk.Precision() {
 		t.Fatalf("status %+v", st)
 	}
 	if _, ok := st.Infos["a"]; !ok {

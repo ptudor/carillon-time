@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,6 +38,7 @@ const (
 type Config struct {
 	Daemon     Daemon     `toml:"daemon"`
 	Servers    []Server   `toml:"server"`
+	Serve      Serve      `toml:"serve"`
 	Discipline Discipline `toml:"discipline"`
 	Step       Step       `toml:"step"`
 }
@@ -94,6 +96,30 @@ type Server struct {
 	PollMax int `toml:"poll_max"`
 }
 
+// Serve configures the NTP listener. It is disabled unless Allow contains at
+// least one prefix; there is deliberately no implicit serve-everyone mode.
+type Serve struct {
+	// Listen is the numeric address and port for each UDP socket.
+	Listen []string `toml:"listen"`
+
+	// Deny is checked before Allow. A client not matched by Allow is denied.
+	Allow []string `toml:"allow"`
+	Deny  []string `toml:"deny"`
+
+	// RequireKey maps client prefixes to mandatory AES-CMAC key ids.
+	RequireKey map[string]uint32 `toml:"require_key"`
+
+	// RateLimitPPS and RateBurst configure the per-client token bucket.
+	RateLimitPPS float64 `toml:"rate_limit_pps"`
+	RateBurst    float64 `toml:"rate_burst"`
+
+	// KoD enables throttled RATE kiss replies for over-limit clients.
+	KoD bool `toml:"kod"`
+}
+
+// Enabled reports whether the NTP server should be started.
+func (s *Serve) Enabled() bool { return len(s.Allow) != 0 }
+
 // Discipline tunes the selection and loop.
 type Discipline struct {
 	// MinSurvivors is the smallest number of sources the cluster algorithm
@@ -146,8 +172,13 @@ func Default() *Config {
 	return &Config{
 		Daemon: Daemon{
 			DriftFile: drift,
-			Control:   "/var/run/carillon.sock",
+			Control:   "/var/run/carillon/carillon.sock",
 			LogLevel:  "info",
+		},
+		Serve: Serve{
+			RateLimitPPS: 8,
+			RateBurst:    16,
+			KoD:          true,
 		},
 		Discipline: Discipline{
 			MinSurvivors: 1,
@@ -362,8 +393,9 @@ func Validate(cfg *Config) error {
 	if preferred > 1 {
 		fail("prefer is set on %d servers; at most one server may be preferred", preferred)
 	}
+	validateServe(&cfg.Serve, &needKeys, fail)
 	if needKeys && cfg.Daemon.Keys == "" {
-		fail("daemon: keys must be set when a server has a key id")
+		fail("daemon: keys must be set when an upstream server or serve.require_key uses a key id")
 	}
 
 	if cfg.Discipline.MinSurvivors < 1 {
@@ -387,6 +419,92 @@ func Validate(cfg *Config) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func validateServe(s *Serve, needKeys *bool, fail func(string, ...any)) {
+	if !s.Enabled() {
+		if len(s.RequireKey) != 0 {
+			fail("serve: require_key has entries but allow is empty, so the server is disabled")
+		}
+		return
+	}
+	if len(s.Listen) == 0 {
+		fail("serve: listen must contain at least one address when allow is set")
+	}
+	seenListen := make(map[netip.AddrPort]bool, len(s.Listen))
+	for _, raw := range s.Listen {
+		a, err := netip.ParseAddrPort(raw)
+		if err != nil || !a.Addr().IsValid() || a.Addr().Is4In6() || a.Port() == 0 {
+			fail("serve: listen address %q must be a numeric IP:port with a nonzero port", raw)
+			continue
+		}
+		if seenListen[a] {
+			fail("serve: duplicate listen address %q", raw)
+		}
+		seenListen[a] = true
+	}
+	validatePrefixes := func(field string, values []string) {
+		seen := make(map[netip.Prefix]bool, len(values))
+		for _, raw := range values {
+			p, err := netip.ParsePrefix(raw)
+			if err != nil || p.Addr().Zone() != "" || p.Addr().Is4In6() {
+				fail("serve: %s prefix %q is invalid", field, raw)
+				continue
+			}
+			p = p.Masked()
+			if seen[p] {
+				fail("serve: duplicate %s prefix %q", field, raw)
+			}
+			seen[p] = true
+		}
+	}
+	validatePrefixes("allow", s.Allow)
+	validatePrefixes("deny", s.Deny)
+	requirePrefixes := make([]string, 0, len(s.RequireKey))
+	for raw := range s.RequireKey {
+		requirePrefixes = append(requirePrefixes, raw)
+	}
+	slices.Sort(requirePrefixes)
+	validatePrefixes("require_key", requirePrefixes)
+	for _, raw := range requirePrefixes {
+		id := s.RequireKey[raw]
+		if id == 0 || id > 65535 {
+			fail("serve: require_key prefix %q has key id %d outside 1..65535", raw, id)
+		} else {
+			*needKeys = true
+		}
+	}
+	if !(s.RateLimitPPS > 0) {
+		fail("serve: rate_limit_pps %v must be greater than zero", s.RateLimitPPS)
+	}
+	if !(s.RateBurst >= 1) {
+		fail("serve: rate_burst %v must be at least 1", s.RateBurst)
+	}
+}
+
+// ServePrefixes parses the already-validated ACL configuration for the
+// server package.
+func (c *Config) ServePrefixes() (allow, deny []netip.Prefix, require map[netip.Prefix]uint32) {
+	for _, raw := range c.Serve.Allow {
+		allow = append(allow, netip.MustParsePrefix(raw).Masked())
+	}
+	for _, raw := range c.Serve.Deny {
+		deny = append(deny, netip.MustParsePrefix(raw).Masked())
+	}
+	require = make(map[netip.Prefix]uint32, len(c.Serve.RequireKey))
+	for raw, id := range c.Serve.RequireKey {
+		require[netip.MustParsePrefix(raw).Masked()] = id
+	}
+	return allow, deny, require
+}
+
+// ServeListenAddrs parses the already-validated listener addresses.
+func (c *Config) ServeListenAddrs() []netip.AddrPort {
+	out := make([]netip.AddrPort, 0, len(c.Serve.Listen))
+	for _, raw := range c.Serve.Listen {
+		out = append(out, netip.MustParseAddrPort(raw))
+	}
+	return out
 }
 
 // Check performs the filesystem checks that a valid configuration needs at

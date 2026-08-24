@@ -27,7 +27,7 @@
 #      install -d -o root -g wheel -m 755 /usr/local/etc/carillon
 #
 # 2. Clock privileges. carillon adjusts the clock with ntp_adjtime(2) and
-#    clock_settime(2) and binds UDP port 123 (later milestone); the
+#    clock_settime(2) and binds UDP port 123; the
 #    mac_ntpd(4) policy grants exactly those privileges (PRIV_ADJTIME,
 #    PRIV_CLOCK_SETTIME, PRIV_NTP_ADJTIME, PRIV_NETINET_RESERVEDPORT,
 #    PRIV_NETINET_REUSEPORT) to one uid. Add to /boot/loader.conf:
@@ -80,6 +80,7 @@ carillon_prestart()
 	if [ ! -f "${carillon_config}" ]; then
 		err 1 "config not found: ${carillon_config}"
 	fi
+	install -d -o ${carillon_user} -g ${carillon_group} -m 750 /var/run/carillon
 	if ! ${procname} -check -config "${carillon_config}"; then
 		err 1 "config check failed: ${carillon_config}"
 	fi

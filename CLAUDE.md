@@ -7,14 +7,14 @@ second job is the two-host topology: the **home** box (GPS + PPS, stratum 1)
 is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
-**Status (2026-08-23):** milestones M0 and M1 of `DESIGN.md` §15 are
-implemented — wire format, CMAC auth, config, Linux/FreeBSD clock actuators,
-the discipline pipeline with simulation tests, the NTP client source, the
-engine, the control socket, `carillon` (with `-check` and `query`) and
-`carillonctl`. Not yet built: the NTP server (M2), the PPS and GPS refclocks
-(M3), leapfile/stats/metrics (M4), OpenWrt packaging (M5). Nothing has run on
-real hardware yet; the `hwtest`-tagged tests and `deploy/` scripts are the
-next thing to exercise on the FreeBSD box.
+**Status (2026-08-23):** milestones M0–M2 of `DESIGN.md` §15 are implemented
+in code — wire format, CMAC auth, config, Linux/FreeBSD clock actuators, the
+discipline pipeline with simulation tests, the NTP client source, engine,
+safe NTP server, control socket, `carillon` (with `-check` and `query`) and
+`carillonctl`. Not yet built: the PPS and GPS refclocks (M3),
+leapfile/stats/metrics (M4), OpenWrt packaging (M5). Nothing has run on real
+hardware yet; the home → colo topology, `hwtest`-tagged tests, and `deploy/`
+scripts are the next things to exercise on the FreeBSD/Linux boxes.
 
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
@@ -63,7 +63,7 @@ internal/clock/       actuator: Clock interface, sysclock_linux.go, sysclock_fre
                       sysclock_other.go (stub), fake.go (deterministic, for tests)
 internal/discipline/  filter → select → combine → loop; pure functions, no wall clock
 internal/engine/      the single owning goroutine: wires sources, discipline, actuator, status
-internal/server/      (M2) UDP listener(s), responder, ACL, rate limiter, KoD
+internal/server/      UDP listener(s), responder, ACL, rate limiter, KoD
 internal/control/     unix-socket JSON protocol used by carillonctl
 internal/metrics/     (M4) Prometheus collectors
 deploy/               freebsd/ (rc.d), systemd/, openwrt/ (procd), carillon.toml.example
@@ -162,7 +162,8 @@ dependency.
 - Config: `/usr/local/etc/carillon/carillon.toml` (FreeBSD), `/etc/carillon/carillon.toml`
   (Linux/OpenWrt); keys file alongside as `keys` (mode `0600`).
 - State: `/var/db/carillon/` (FreeBSD) or `/var/lib/carillon/` (Linux) — drift file.
-- Control socket: `/var/run/carillon.sock`.
+- Control socket: `/var/run/carillon/carillon.sock`; init creates the
+  daemon-owned `/var/run/carillon` directory.
 - rc.d script uses `/usr/sbin/daemon -f -p <pidfile> -u carillon`, matching the
   other daemons in `~/Git/daemons/`.
 - `carillon` must refuse to start if UDP 123 is already bound, with a message that

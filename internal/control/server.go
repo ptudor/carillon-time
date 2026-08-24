@@ -15,6 +15,7 @@ import (
 
 	"carillon/internal/discipline"
 	"carillon/internal/engine"
+	ntpserver "carillon/internal/server"
 )
 
 // maxRequest bounds a request line; anything larger is not a request.
@@ -28,6 +29,7 @@ type Server struct {
 	path    string
 	ln      net.Listener
 	eng     *engine.Engine
+	stats   *ntpserver.Stats
 	version string
 	log     *slog.Logger
 	wg      sync.WaitGroup
@@ -35,7 +37,7 @@ type Server struct {
 
 // Listen creates the unix socket at path (mode 0660). A stale socket file
 // left by a crashed daemon is removed; one that still answers is an error.
-func Listen(path string, eng *engine.Engine, version string, log *slog.Logger) (*Server, error) {
+func Listen(path string, eng *engine.Engine, stats *ntpserver.Stats, version string, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -58,7 +60,7 @@ func Listen(path string, eng *engine.Engine, version string, log *slog.Logger) (
 		_ = os.Remove(path)
 		return nil, fmt.Errorf("control: chmod %s: %w", path, err)
 	}
-	return &Server{path: path, ln: ln, eng: eng, version: version, log: log}, nil
+	return &Server{path: path, ln: ln, eng: eng, stats: stats, version: version, log: log}, nil
 }
 
 // Path returns the socket path.
@@ -120,6 +122,8 @@ func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Respo
 		return Response{Tracking: TrackingOf(s.eng.Status())}
 	case CmdSources:
 		return Response{Sources: SourcesOf(s.eng.Status())}
+	case CmdServerStats:
+		return Response{ServerStats: ServerStatsOf(s.stats.Snapshot())}
 	case CmdWaitSync:
 		wctx := ctx
 		var cancel context.CancelFunc

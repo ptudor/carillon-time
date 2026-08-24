@@ -1,4 +1,4 @@
-# carillon configuration — NTP client (milestone M1: no server, no refclock).
+# carillon configuration — NTP client/server (milestone M2: no refclock yet).
 #
 # Install as:
 #   /usr/local/etc/carillon/carillon.toml   (FreeBSD)
@@ -16,14 +16,14 @@
 #drift_file = "/var/db/carillon/drift"
 
 # Unix socket used by carillonctl.
-#control = "/var/run/carillon.sock"
+#control = "/var/run/carillon/carillon.sock"
 
 # IERS/NIST leap-seconds.list. Optional for a client; required to announce
 # leap seconds on a host that has no upstream servers.
 #leapfile = "/var/db/carillon/leap-seconds.list"
 
-# AES-128-CMAC keys in ntp.keys syntax, mode 0600. Required if any server
-# below has a key id. Generate a key with:  openssl rand -hex 16
+# AES-128-CMAC keys in ntp.keys syntax, mode 0600. Required if any upstream
+# below has a key id or a serve.require_key rule uses one. Generate with:
 #   1  AES128CMAC  <32 hex digits>
 #keys = "/usr/local/etc/carillon/keys"
 
@@ -69,6 +69,22 @@ iburst  = true
 #   noselect = false  monitor only, never synchronize to it
 #   poll_min = 6      log2 seconds (64 s); allowed 2..17
 #   poll_max = 10     log2 seconds (1024 s); allowed 2..17
+
+# --- NTP server -------------------------------------------------------------
+# Serving is disabled unless `allow` contains at least one prefix. Deny rules
+# take precedence. Replies are rate-limited per client address and are never
+# longer than their requests. Uncomment the whole block to enable it.
+
+#[serve]
+#listen         = ["0.0.0.0:123", "[::]:123"]
+#allow          = ["192.168.1.0/24", "2001:db8::/32"]
+#deny           = []
+#require_key    = { "203.0.113.7/32" = 1 }
+#rate_limit_pps = 8
+#rate_burst     = 16
+#kod            = true
+#
+# Inspect counters with: carillonctl serverstats
 
 # --- Discipline -------------------------------------------------------------
 [discipline]

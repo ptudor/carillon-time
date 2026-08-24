@@ -53,10 +53,11 @@ type Status struct {
 
 	// Now is the clock reading when the snapshot was taken; RefTime is the
 	// clock reading at the last loop update (zero if none).
-	Now     time.Time
-	RefTime time.Time
-	Uptime  time.Duration
-	Version string
+	Now       time.Time
+	RefTime   time.Time
+	Uptime    time.Duration
+	Precision int8
+	Version   string
 
 	// Infos carries each source's own view, keyed by name.
 	Infos map[string]source.Info
@@ -396,12 +397,13 @@ func (e *Engine) publish(now float64) {
 
 func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 	s := &Status{
-		Status:  *st,
-		Now:     e.clk.Now(),
-		RefTime: e.refWall,
-		Uptime:  time.Duration((now - e.startedMono) * float64(time.Second)),
-		Version: e.cfg.Version,
-		Infos:   make(map[string]source.Info, len(e.sources)),
+		Status:    *st,
+		Now:       e.clk.Now(),
+		RefTime:   e.refWall,
+		Uptime:    time.Duration((now - e.startedMono) * float64(time.Second)),
+		Precision: e.clk.Precision(),
+		Version:   e.cfg.Version,
+		Infos:     make(map[string]source.Info, len(e.sources)),
 	}
 	for name, spec := range e.sources {
 		s.Infos[name] = spec.Source.Info()
