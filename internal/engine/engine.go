@@ -20,6 +20,7 @@ import (
 
 	"carillon/internal/clock"
 	"carillon/internal/discipline"
+	"carillon/internal/leap"
 	"carillon/internal/ntp"
 	"carillon/internal/source"
 )
@@ -43,6 +44,9 @@ type Config struct {
 
 	Sources []SourceSpec
 
+	// LeapTable, when non-nil, is authoritative over survivor LI bits.
+	LeapTable *leap.Table
+
 	// Version is reported in status snapshots.
 	Version string
 
@@ -58,11 +62,13 @@ type Status struct {
 
 	// Now is the clock reading when the snapshot was taken; RefTime is the
 	// clock reading at the last loop update (zero if none).
-	Now       time.Time
-	RefTime   time.Time
-	Uptime    time.Duration
-	Precision int8
-	Version   string
+	Now        time.Time
+	RefTime    time.Time
+	Uptime     time.Duration
+	Precision  int8
+	Version    string
+	LeapSource string
+	LeapExpiry time.Time
 
 	// Infos carries each source's own view, keyed by name.
 	Infos map[string]source.Info
@@ -90,6 +96,8 @@ type Engine struct {
 	haveKernel     bool
 	lastDriftWrite float64
 	driftErrShown  bool
+	lastLeapWall   time.Time
+	lastFileLeap   ntp.Leap
 }
 
 // New builds an engine. It loads the initial frequency (drift file, then the
@@ -124,6 +132,7 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 		e.sys.AddSource(name, s.Options)
 	}
 	e.started = clk.Now()
+	e.lastLeapWall = e.started
 	e.startedMono = clk.Monotonic()
 	e.publish(e.startedMono)
 	return e, nil
@@ -325,6 +334,33 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 		e.logEvent(ev)
 	}
 	st := e.sys.Status(now)
+	wall := e.clk.Now()
+	if e.cfg.LeapTable != nil {
+		if e.cfg.LeapTable.Crossed(e.lastLeapWall, wall) {
+			for _, src := range e.sources {
+				src.Source.Reset()
+			}
+			reset := e.sys.InvalidateSources(now)
+			for _, ev := range reset.Events {
+				e.logEvent(ev)
+			}
+			st = e.sys.Status(now)
+			e.log.Warn("leap transition crossed; source filters reset", "at", wall.UTC().Format(time.RFC3339Nano))
+		}
+		e.lastLeapWall = wall
+		indicator := e.cfg.LeapTable.Indicator(wall)
+		if indicator != e.lastFileLeap {
+			if indicator == ntp.LeapNone {
+				e.log.Info("leap warning cleared")
+			} else {
+				e.log.Warn("leap warning active", "leap", indicator.String())
+			}
+			e.lastFileLeap = indicator
+		}
+		if st.State == discipline.StateSynced || st.State == discipline.StateHoldover {
+			st.Leap = indicator
+		}
+	}
 	if st.LastUpdate != e.lastLoopUpdate {
 		e.lastLoopUpdate = st.LastUpdate
 		e.refWall = e.clk.Now()
@@ -401,6 +437,9 @@ func (e *Engine) setKernel(ks clock.Status) error {
 
 func (e *Engine) publish(now float64) {
 	st := e.sys.Status(now)
+	if e.cfg.LeapTable != nil && (st.State == discipline.StateSynced || st.State == discipline.StateHoldover) {
+		st.Leap = e.cfg.LeapTable.Indicator(e.clk.Now())
+	}
 	e.publishStatus(&st, now)
 }
 
@@ -413,6 +452,12 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 		Precision: e.clk.Precision(),
 		Version:   e.cfg.Version,
 		Infos:     make(map[string]source.Info, len(e.sources)),
+	}
+	if e.cfg.LeapTable != nil {
+		s.LeapSource = "file"
+		s.LeapExpiry = e.cfg.LeapTable.Expiry
+	} else {
+		s.LeapSource = "sources"
 	}
 	for name, spec := range e.sources {
 		s.Infos[name] = spec.Source.Info()

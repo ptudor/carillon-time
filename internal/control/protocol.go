@@ -106,6 +106,8 @@ type Tracking struct {
 	Stratum      uint8     `json:"stratum"`
 	RefID        string    `json:"refid"`
 	Leap         string    `json:"leap"`
+	LeapSource   string    `json:"leap_source"`
+	LeapExpiry   time.Time `json:"leapfile_expires,omitempty"`
 	RefTime      time.Time `json:"reftime"`
 	Now          time.Time `json:"now"`
 	Uptime       float64   `json:"uptime_seconds"`
@@ -162,6 +164,8 @@ func TrackingOf(st *engine.Status) *Tracking {
 		Stratum:      st.Stratum,
 		RefID:        st.RefID.String(),
 		Leap:         st.Leap.String(),
+		LeapSource:   st.LeapSource,
+		LeapExpiry:   st.LeapExpiry,
 		RefTime:      st.RefTime,
 		Now:          st.Now,
 		Uptime:       st.Uptime.Seconds(),

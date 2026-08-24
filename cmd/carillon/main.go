@@ -26,6 +26,7 @@ import (
 	"carillon/internal/control"
 	"carillon/internal/discipline"
 	"carillon/internal/engine"
+	"carillon/internal/leap"
 	"carillon/internal/monitor"
 	"carillon/internal/ntp"
 	"carillon/internal/ntp/auth"
@@ -84,6 +85,14 @@ func runDaemon(args []string) int {
 			fmt.Fprintf(os.Stderr, "carillon: %v\n", err)
 			return exitUsage
 		}
+		leapTable, err := loadLeapTable(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "carillon: %v\n", err)
+			return exitUsage
+		}
+		for _, warning := range configurationWarnings(cfg, leapTable, time.Now()) {
+			fmt.Fprintf(os.Stderr, "carillon: warning: %s\n", warning.message)
+		}
 		listeners := 0
 		if cfg.Serve.Enabled() {
 			listeners = len(cfg.Serve.Listen)
@@ -108,6 +117,12 @@ func runDaemon(args []string) int {
 		log.Error("keys", "error", err)
 		return exitUsage
 	}
+	leapTable, err := loadLeapTable(cfg)
+	if err != nil {
+		log.Error("leap file", "error", err)
+		return exitUsage
+	}
+	reportConfigurationWarnings(log, cfg, leapTable, time.Now())
 
 	clk, err := clock.New()
 	if err != nil {
@@ -244,6 +259,7 @@ func runDaemon(args []string) int {
 		},
 		DriftFile: cfg.Daemon.DriftFile,
 		Sources:   specs,
+		LeapTable: leapTable,
 		Version:   buildinfo.Version,
 		Observe:   observe,
 	}, clk, log)
@@ -408,6 +424,58 @@ func loadKeys(cfg *config.Config) (auth.Keys, error) {
 		}
 	}
 	return keys, nil
+}
+
+func loadLeapTable(cfg *config.Config) (*leap.Table, error) {
+	if cfg.Daemon.LeapFile == "" {
+		return nil, nil
+	}
+	return leap.Load(cfg.Daemon.LeapFile)
+}
+
+type configurationWarning struct {
+	message string
+	error   bool
+}
+
+func configurationWarnings(cfg *config.Config, table *leap.Table, now time.Time) []configurationWarning {
+	var warnings []configurationWarning
+	if table == nil {
+		for i := range cfg.Refclocks {
+			if cfg.Refclocks[i].Type == "gps" {
+				warnings = append(warnings, configurationWarning{message: "GPS refclock has no leapfile; a stratum-1 server cannot announce leap seconds from NMEA alone"})
+				break
+			}
+		}
+		return warnings
+	}
+	remaining := table.Expiry.Sub(now.UTC())
+	switch {
+	case remaining <= 0:
+		warnings = append(warnings, configurationWarning{
+			message: fmt.Sprintf("leapfile expired at %s", table.Expiry.Format(time.RFC3339)), error: true,
+		})
+	case remaining <= 30*24*time.Hour:
+		warnings = append(warnings, configurationWarning{
+			message: fmt.Sprintf("leapfile expires in %s at %s", remaining.Round(time.Hour), table.Expiry.Format(time.RFC3339)),
+		})
+	}
+	return warnings
+}
+
+func reportConfigurationWarnings(log *slog.Logger, cfg *config.Config, table *leap.Table, now time.Time) {
+	for _, warning := range configurationWarnings(cfg, table, now) {
+		if warning.error {
+			log.Error(warning.message)
+		} else {
+			log.Warn(warning.message)
+		}
+	}
+	if table != nil {
+		if next, ok := table.Next(now.UTC()); ok {
+			log.Info("next leap transition", "at", next.At.Format(time.RFC3339), "leap", next.Leap.String())
+		}
+	}
 }
 
 // probeNTPPort refuses to run alongside another time daemon: two

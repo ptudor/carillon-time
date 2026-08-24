@@ -108,5 +108,18 @@ func healthOf(st *engine.Status, servedAt time.Time) Health {
 		h.Status = "unhealthy"
 		h.Reasons = append(h.Reasons, "snapshot_stale")
 	}
+	if !st.LeapExpiry.IsZero() {
+		remaining := st.LeapExpiry.Sub(st.Now)
+		switch {
+		case remaining <= 0:
+			h.Status = "unhealthy"
+			h.Reasons = append(h.Reasons, "leapfile_expired")
+		case remaining <= 30*24*time.Hour:
+			if h.Status == "healthy" {
+				h.Status = "degraded"
+			}
+			h.Reasons = append(h.Reasons, "leapfile_expiring")
+		}
+	}
 	return h
 }
