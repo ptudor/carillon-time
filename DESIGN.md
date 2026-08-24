@@ -993,10 +993,11 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   notifications, and `ctx.Done()`. It is the only caller of the clock actuator and
   the only writer of discipline state. It publishes `Status` by storing a new
   immutable struct into an `atomic.Pointer`.
-- **Source goroutines:** one per configured server and per refclock. PPS and
-  NMEA readers block in `ioctl`/`read`; Go's runtime parks a thread per
-  blocked syscall, which is two threads for a `gps` refclock. That is fine.
-  Shutdown closes the fd from the engine's side to unblock them.
+- **Source goroutines:** one per configured server and per refclock. PPS uses
+  a bounded 1.5 s `PPS_FETCH`, which shifts reach on a missing pulse and also
+  bounds shutdown latency; a vanished device is reopened with backoff. NMEA
+  readers block in `read` and close their fd on shutdown. A `gps` refclock
+  uses two threads, which is fine.
 - **Server goroutines:** one per listen socket; read `Status` via the atomic
   pointer; never touch engine state. Rate limiter is per socket goroutine
   (no sharing needed: one client hits one socket).
@@ -1093,7 +1094,7 @@ by attackers (rate-limit table is bounded and LRU).
 | M0 ✅ 2026-08-23 | Repo skeleton, config, `internal/ntp` wire format + CMAC, `clock.Fake`, discipline package with simulation tests | `go test -race ./...` green on the Mac |
 | M1 ✅ 2026-08-23 (initial host acceptance) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | Fedora and FreeBSD hosts both track and restart from drift; long-duration chrony comparison is now running |
 | M2 ✅ 2026-08-23 (real hosts) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | `gummi` → authenticated `twocom` topology runs end to end without a refclock; see `deploy/ACCEPTANCE.md` |
-| M3 | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | home host is stratum 1 from a bare PPS numbered by NTP |
+| M3 ✅ 2026-08-23 (code) | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | kernel API/capability/fetch paths pass on both real hosts; stratum-1 acceptance awaits a live pulse on one of their serial inputs |
 | M4 | `gps` refclock (NMEA), leapfile, stats files, metrics, `-check` | home host is stratum 1 with GPS alone |
 | M5 | OpenWrt build + procd, hardening (Capsicum socket pool, systemd sandbox), `deploy/ACCEPTANCE.md` | runs on the router |
 | later | NTS (RFC 8915) server+client; interleaved mode; `SO_TIMESTAMPING` TX timestamps; slew leap mode; auto `nmea_offset`; regression estimator; FLL branch | as wanted |

@@ -217,6 +217,10 @@ func TestMajorityLeap(t *testing.T) {
 	if l := majorityLeap([]*SourceState{a}); l != ntp.LeapInsert {
 		t.Fatalf("got %v", l)
 	}
+	pps := &SourceState{Options: Options{PPS: true}, Leap: ntp.LeapNone}
+	if l := majorityLeap([]*SourceState{a, pps}); l != ntp.LeapInsert {
+		t.Fatalf("PPS without calendar data must not outvote numbering source: %v", l)
+	}
 }
 
 func TestRootDistanceAges(t *testing.T) {

@@ -43,6 +43,24 @@ These hosts intentionally remain on carillon for long-term observation. This
 is an initial functional acceptance, not the later PPS/GPS or 24-hour accuracy
 acceptance described in `DESIGN.md` §13.
 
+## PPS kernel-path probe — 2026-08-23
+
+Revision: `88de18c` (`Integrate PPS reference clock`)
+
+- `gummi` has `/dev/pps0` backed by `/dev/ttyS0`; `pps_ldisc` is loaded.
+- `twocom` has `/dev/cuau0` and `/dev/cuau1`, with DCD capture enabled by
+  `dev.uart.0.pps_mode=2` and `dev.uart.1.pps_mode=2`.
+- The gated `internal/pps` hardware test opened each interface, validated its
+  capabilities, configured `assert` timestamps, and entered `PPS_FETCH`.
+- All three fetches ended with the expected three-second timeout because no
+  input had an active pulse (`gummi` remained at sequence 0). No PPS
+  `[[refclock]]` was enabled, and the NTP-only production configs were left
+  unchanged.
+
+This verifies both real kernel ABI paths through the no-pulse failure case.
+M3 stratum-1 acceptance remains pending until a serial input is wired to a
+live 1 Hz source.
+
 ## Repeatable checklist
 
 On each host:
@@ -52,6 +70,7 @@ carillon -check -config /path/to/carillon.toml
 carillonctl waitsync 300
 carillonctl tracking
 carillonctl sources
+carillonctl refclock
 carillonctl serverstats
 ```
 
