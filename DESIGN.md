@@ -151,8 +151,8 @@ Other requirements:
             └───────────────┬────────────────────────────┬───────────────┘
                             │ atomic.Pointer[Status]     │ control requests
                             ▼                            ▼
-                     server goroutines             control socket / metrics
-                     (one per listen socket)       (carillonctl, Prometheus)
+                     server goroutines             control / monitoring
+                     (one per listen socket)       (carillonctl, JSON, Prometheus)
 
   source goroutines:  ntp poller ×N   |   pps fetch loop   |   nmea reader
 ```
@@ -170,7 +170,8 @@ Packages (see `CLAUDE.md` for the tree):
   Pure functions over values; the simulation tests live here.
 - `internal/engine` — owns state; single goroutine; wires everything.
 - `internal/server` — listeners, responder, ACL, rate limiter.
-- `internal/control`, `internal/metrics` — observability.
+- `internal/control` — local unix-socket status and `carillonctl` protocol.
+- `internal/monitor` — read-only HTTP status, health and Prometheus endpoints.
 
 Data types shared across packages:
 
@@ -836,8 +837,11 @@ require_key = { "203.0.113.7/32" = 1 }
 threshold = 0.5
 limit     = 3
 
-[metrics]
+[monitor]
 listen = "127.0.0.1:9123"
+id     = "home"
+name   = "Home GPS"
+roles  = ["reference", "internal-server"]
 ```
 
 **Colo** (stratum 2):
@@ -918,18 +922,76 @@ Unix socket, newline-delimited JSON request/response, `0660`. Commands:
 
 `carillonctl` prints these as aligned tables; `-json` passes the raw reply through.
 
-### 10.3 Metrics
+### 10.3 HTTP monitoring
 
-Optional Prometheus endpoint (`[metrics] listen`, loopback by default):
+The optional `[monitor]` listener is a read-only network observability surface.
+It never changes daemon state and is not a remote form of the control socket.
+It is disabled when `listen` is empty. Its request ACL defaults to loopback,
+even when an operator explicitly binds a non-loopback address:
+
+```toml
+[monitor]
+listen = "127.0.0.1:9123"
+allow  = ["127.0.0.0/8", "::1/128"]
+id     = "twocom"
+name   = "Twocom"
+roles  = ["colo", "ntp-pool"]
+```
+
+`listen` is one numeric TCP address and non-zero port. `allow` is checked
+against the immediate TCP peer only; forwarded-address headers are ignored.
+For a LAN-direct iPhone client, bind a private address and explicitly allow
+the LAN prefix. An Internet-facing host keeps the default loopback listener
+and has Apache proxy only the desired path over authenticated HTTPS.
+
+Endpoints, all GET/HEAD only:
+
+- `/api/v1/status` — one versioned JSON snapshot containing instance metadata,
+  health, tracking, sources, refclocks and NTP listener statistics. It returns
+  HTTP 200 whenever the snapshot can be encoded, including when carillon is
+  unsynchronised, so a client can display the cause.
+- `/healthz` — a small JSON probe. Healthy is HTTP 200; degraded or unhealthy
+  is HTTP 503. `synced` is healthy; `holdover` or loss of the preferred source
+  is degraded; other discipline states are unhealthy. A snapshot more than
+  five seconds old is unhealthy.
+- `/metrics` — Prometheus exposition of the same snapshot and counters.
+
+The JSON schema identifier is `carillon.status.v1`. `snapshot_at` is the time
+at which the engine published the immutable snapshot; `served_at` is when the
+HTTP response was built. Existing control-protocol field names are retained
+inside `tracking`, `sources`, `refclocks` and `server`, and durations in those
+objects are seconds unless a field name says otherwise. Additive fields are
+permitted within v1; incompatible changes require `/api/v2` and a new schema
+identifier. Responses use `Cache-Control: no-store` and standard defensive
+content headers.
+
+Instance `id`, display `name`, and `roles` are opaque operator metadata for
+grouping hosts in clients. They do not affect selection, serving, or daemon
+health policy. Role-specific expectations — for example, that a GPS reference
+is stratum 1 and PPS-locked, or that a pool host recently served a request —
+belong in the monitoring client.
+
+The status and health endpoint proving reachable does not prove that UDP/123
+is externally reachable. A client that needs that assertion must make an NTP
+query from the observation point as a separate check.
+
+### 10.4 Metrics
+
+The `/metrics` endpoint exports:
 `carillon_state`, `carillon_offset_seconds`, `carillon_frequency_ppm`,
 `carillon_jitter_seconds`, `carillon_root_dispersion_seconds`, `carillon_stratum`,
 `carillon_steps_total`, `carillon_source_offset_seconds{source}`,
 `carillon_source_reach{source}`, `carillon_source_selected{source}`,
 `carillon_pps_samples_total{source,result=ok|spike|gap|glitch|unqualified}`,
 `carillon_pps_jitter_seconds{source}`, `carillon_pps_locked{source}`,
-`carillon_server_requests_total{result}`, `carillon_leap_pending`.
+`carillon_server_requests_total{result}`, `carillon_server_last_request_timestamp_seconds`,
+`carillon_source_receive_timestamp_seconds{source}`,
+`carillon_source_kernel_timestamp_missing_total{source}`,
+`carillon_server_kernel_timestamp_missing_total`, `carillon_leap_pending`, and
+`carillon_build_info{version}`. Labels come only from configured source names
+or fixed finite enums; operator roles are deliberately not metric labels.
 
-### 10.4 Files
+### 10.5 Files
 
 - **Drift file:** one line, frequency in ppm, written atomically (temp +
   rename) every hour and at shutdown, read at start. Same format as chrony's.
@@ -1011,9 +1073,9 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
 - **Server goroutines:** one per listen socket; read `Status` via the atomic
   pointer; never touch engine state. Rate limiter is per socket goroutine
   (no sharing needed: one client hits one socket).
-- **Control/metrics:** standard `net/http` and a small unix-socket accept
-  loop; both only read snapshots or send a request into the engine and wait
-  on a reply channel.
+- **Control/monitoring:** a small unix-socket accept loop and standard
+  `net/http`; both only read immutable snapshots. Only `waitsync` sends a
+  request into the engine and waits on a reply channel.
 - **Shutdown:** `SIGTERM`/`SIGINT` cancel the root context; engine writes the
   drift file, leaves the frequency word alone, closes sockets; `main` waits
   with a 5 s deadline.
@@ -1105,7 +1167,7 @@ by attackers (rate-limit table is bounded and LRU).
 | M1 ✅ 2026-08-23 (initial host acceptance) | NTP client source, engine, Linux + FreeBSD actuators, drift file, `carillonctl tracking/sources` | Fedora and FreeBSD hosts both track and restart from drift; long-duration chrony comparison is now running |
 | M2 ✅ 2026-08-23 (real hosts) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | `gummi` → authenticated `twocom` topology runs end to end without a refclock; see `deploy/ACCEPTANCE.md` |
 | M3 ✅ 2026-08-23 (code) | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | kernel API/capability/fetch paths pass on both real hosts; stratum-1 acceptance awaits a live pulse on one of their serial inputs |
-| M4 | `gps` refclock (NMEA), leapfile, stats files, metrics, `-check` | home host is stratum 1 with GPS alone |
+| M4 | `gps` refclock (NMEA), leapfile, stats files, read-only JSON/health/Prometheus monitoring, `-check` | home host is stratum 1 with GPS alone and every role is remotely observable |
 | M5 | OpenWrt build + procd, hardening (Capsicum socket pool, systemd sandbox), `deploy/ACCEPTANCE.md` | runs on the router |
 | later | NTS (RFC 8915) server+client; interleaved mode; `SO_TIMESTAMPING` TX timestamps; slew leap mode; auto `nmea_offset`; regression estimator; FLL branch | as wanted |
 
@@ -1142,7 +1204,10 @@ right answer for authenticating public clients and is a self-contained later
 milestone.
 
 **D5 — Modes 6/7 never.** Every NTP amplification attack has gone through
-them. Status is a local unix socket; remote observability is Prometheus.
+them. Control is a local unix socket. Remote observability is a separately
+configured read-only HTTP listener offering versioned JSON, health and
+Prometheus endpoints; it has no mutation handlers and defaults to a loopback
+ACL.
 
 **D6 — Server disabled unless `allow` is set.** chrony's default; a time
 daemon that answers the internet by accident is worse than one that needs a
