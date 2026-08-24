@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -96,6 +98,58 @@ func TestServerRoundTrip(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("socket file must be removed on shutdown")
+	}
+}
+
+// TestWaitSyncFollowsRestart checks that WaitSync keeps trying while the
+// daemon is not yet listening, connects once it is, and reports the last
+// connection error when it never appears.
+func TestWaitSyncFollowsRestart(t *testing.T) {
+	path := socketPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// No daemon at all: retry until the deadline, then surface why.
+	start := time.Now()
+	synced, err := WaitSync(ctx, path, 600*time.Millisecond)
+	if synced || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("WaitSync without a daemon = %v, %v; want false, not-exist", synced, err)
+	}
+	if elapsed := time.Since(start); elapsed < 600*time.Millisecond {
+		t.Fatalf("WaitSync gave up after %v, before its %v deadline", elapsed, 600*time.Millisecond)
+	}
+
+	// The daemon appears while WaitSync is already waiting: it must connect
+	// and get the daemon's verdict (an unsynced engine reports false)
+	// instead of a connection error.
+	type result struct {
+		synced bool
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, e := WaitSync(ctx, path, 3*time.Second)
+		done <- result{s, e}
+	}()
+	time.Sleep(2 * connectRetry)
+	srv, err := Listen(path, newEngine(t), nil, "v-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ctx) }()
+
+	select {
+	case r := <-done:
+		if r.synced || r.err != nil {
+			t.Fatalf("WaitSync after daemon start = %v, %v; want false, nil", r.synced, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("WaitSync did not return")
+	}
+	cancel()
+	if err := <-serveDone; err != nil {
+		t.Fatalf("serve: %v", err)
 	}
 }
 

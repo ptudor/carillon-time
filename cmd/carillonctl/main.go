@@ -58,7 +58,16 @@ func run(args []string) int {
 		return 2
 	}
 
-	resp, err := control.Call(context.Background(), *sock, req)
+	var resp *control.Response
+	var err error
+	if req.Command == control.CmdWaitSync {
+		// waitsync usually follows a service restart, so it waits for the
+		// socket to appear rather than failing on the first dial.
+		synced, werr := control.WaitSync(context.Background(), *sock, time.Duration(req.Timeout*float64(time.Second)))
+		resp, err = &control.Response{Synced: &synced}, werr
+	} else {
+		resp, err = control.Call(context.Background(), *sock, req)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "carillonctl: %v\n", err)
 		return 2
