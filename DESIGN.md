@@ -901,7 +901,7 @@ threshold = 0.5
 limit     = 3
 
 [monitor]
-listen = "127.0.0.1:9123"
+listen = "127.0.0.1:9124"
 id     = "home"
 name   = "Home GPS"
 roles  = ["reference", "internal-server"]
@@ -1004,14 +1004,19 @@ even when an operator explicitly binds a non-loopback address:
 
 ```toml
 [monitor]
-listen = "127.0.0.1:9123"
+listen = "127.0.0.1:9124"
 allow  = ["127.0.0.0/8", "::1/128"]
 id     = "twocom"
 name   = "Twocom"
 roles  = ["colo", "ntp-pool"]
 ```
 
-`listen` is one numeric TCP address and non-zero port. `allow` is checked
+`listen` is one numeric TCP address and non-zero port. Avoid 9123: Fedora and
+RHEL label it `jboss_management_port_t`, and a confined scraper such as a
+Zabbix agent (`zabbix_agent_t`) is refused `name_connect` to it. The rule is
+`dontaudit`'d, so the symptom is a bare ECONNREFUSED with nothing in
+`audit.log`, while `curl` from a login shell works — which sends you looking
+at the wrong layer for a long time. `allow` is checked
 against the immediate TCP peer only; forwarded-address headers are ignored.
 For a LAN-direct iPhone client, bind a private address and explicitly allow
 the LAN prefix. An Internet-facing host keeps the default loopback listener

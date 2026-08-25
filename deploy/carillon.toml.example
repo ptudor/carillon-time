@@ -186,8 +186,14 @@ iburst  = true
 # over authenticated HTTPS; bind a private address and explicitly allow the
 # LAN for direct access from an iPhone.
 
+# Avoid 9123: Fedora and RHEL label that port jboss_management_port_t in the
+# SELinux policy, and a confined process such as a Zabbix agent is refused
+# name_connect to it. The denial is dontaudit'd, so the connection simply
+# fails with ECONNREFUSED and audit.log stays empty while curl from a shell
+# works fine.
+
 #[monitor]
-#listen = "127.0.0.1:9123"
+#listen = "127.0.0.1:9124"
 #allow  = ["127.0.0.0/8", "::1/128"]
 #id     = "twocom"
 #name   = "Twocom"
