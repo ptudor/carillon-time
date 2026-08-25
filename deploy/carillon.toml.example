@@ -122,7 +122,11 @@ iburst  = true
 # --- NTP server -------------------------------------------------------------
 # Serving is disabled unless `allow` contains at least one prefix. Deny rules
 # take precedence. Replies are rate-limited per client address and are never
-# longer than their requests. Uncomment the whole block to enable it.
+# longer than their requests. Modes 6 and 7 are never answered, and datagrams
+# from unroutable source addresses are dropped whatever the ACL says.
+# Uncomment the whole block to enable it.
+#
+# These settings are sized for a LAN. For a public server, see below.
 
 #[serve]
 #listen         = ["0.0.0.0:123", "[::]:123"]
@@ -131,9 +135,49 @@ iburst  = true
 #require_key    = { "203.0.113.7/32" = 1 }
 #rate_limit_pps = 8
 #rate_burst     = 16
+#max_clients    = 65536
 #kod            = true
 #
 # Inspect counters with: carillonctl serverstats
+
+# --- NTP server, public internet (NTP pool) ---------------------------------
+# Replace the block above with this one to serve the internet. carillon says
+# so at startup when `allow` reaches beyond private address space, and repeats
+# the warning for any setting below that is still at its LAN value.
+#
+#   allow          ::/0 would work for IPv6, but 2000::/3 is the global
+#                  unicast range and is the narrower way to say the same
+#                  thing. Both entries still let every unroutable source
+#                  address through the ACL; the martian check behind it is
+#                  what drops those. Add 127.0.0.0/8 and ::1/128 if this host
+#                  also queries its own server.
+#   rate_limit_pps A real client polls once every 64 seconds or slower, and an
+#                  iburst is 4-8 packets 2 seconds apart. 0.25/s with a burst
+#                  of 8 serves every legitimate client while cutting what one
+#                  forged source address can draw out of this server by 32x.
+#                  chrony and ntpd both default to about one packet every
+#                  eight seconds.
+#   max_clients    The rate-limit table is bounded and evicts the least
+#                  recently used entry, so a flood of forged addresses costs
+#                  fixed memory. Roughly 100 bytes an entry.
+#   recv_buffer    The kernel default is a few hundred packets of headroom
+#                  (208 KB on Linux, 42 KB on FreeBSD). A busy pool server
+#                  outruns that in a burst, and the loss is invisible except
+#                  as clients that never got an answer. The kernel clamps the
+#                  request to net.core.rmem_max (Linux) or kern.ipc.maxsockbuf
+#                  (FreeBSD); the size actually granted is logged at startup,
+#                  and carillon_server_kernel_drops_total counts what was
+#                  lost anyway.
+#
+#[serve]
+#listen         = ["0.0.0.0:123", "[::]:123"]
+#allow          = ["0.0.0.0/0", "2000::/3", "127.0.0.0/8", "::1/128"]
+#deny           = []
+#rate_limit_pps = 0.25
+#rate_burst     = 8
+#max_clients    = 262144
+#recv_buffer    = 4194304
+#kod            = true
 
 # --- Read-only HTTP monitoring ---------------------------------------------
 # Disabled unless listen is set. The request ACL defaults to loopback even if

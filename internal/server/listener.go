@@ -22,6 +22,13 @@ type ServiceConfig struct {
 	Listen  []netip.AddrPort
 	Handler Config
 	Log     *slog.Logger
+
+	// RecvBuffer is the SO_RCVBUF size in bytes requested for each socket.
+	// Zero leaves the kernel default. The effective size is logged, because
+	// the kernel clamps the request to its own maximum and a busy public
+	// server that silently gets the default drops bursts with no other
+	// evidence than clients that were never answered.
+	RecvBuffer int
 }
 
 // Service owns all configured UDP sockets. They are opened by Listen before
@@ -32,11 +39,12 @@ type Service struct {
 }
 
 type udpListener struct {
-	addr    netip.AddrPort
-	network string
-	conn    *net.UDPConn
-	handler *Handler
-	log     *slog.Logger
+	addr       netip.AddrPort
+	network    string
+	conn       *net.UDPConn
+	handler    *Handler
+	log        *slog.Logger
+	recvBuffer int
 }
 
 // Listen opens every configured socket and prepares its receive timestamp and
@@ -50,7 +58,7 @@ func Listen(cfg ServiceConfig) (*Service, error) {
 	}
 	s := &Service{}
 	for _, addr := range cfg.Listen {
-		l, err := listenOne(addr, cfg.Handler, cfg.Log)
+		l, err := listenOne(addr, cfg.Handler, cfg.RecvBuffer, cfg.Log)
 		if err != nil {
 			s.Close()
 			return nil, err
@@ -60,7 +68,7 @@ func Listen(cfg ServiceConfig) (*Service, error) {
 	return s, nil
 }
 
-func listenOne(addr netip.AddrPort, hcfg Config, log *slog.Logger) (*udpListener, error) {
+func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logger) (*udpListener, error) {
 	network := "udp6"
 	if addr.Addr().Unmap().Is4() {
 		network = "udp4"
@@ -87,12 +95,33 @@ func listenOne(addr netip.AddrPort, hcfg Config, log *slog.Logger) (*udpListener
 	if err := enablePacketInfo(raw, network); err != nil {
 		return fail("server: listen %s: destination address capture: %w", addr, err)
 	}
+	if recvBuffer > 0 {
+		if err := conn.SetReadBuffer(recvBuffer); err != nil {
+			return fail("server: listen %s: receive buffer of %d bytes: %w", addr, recvBuffer, err)
+		}
+	}
+	effective, err := receiveBufferSize(raw)
+	if err != nil {
+		return fail("server: listen %s: %w", addr, err)
+	}
 	h, err := NewHandler(hcfg)
 	if err != nil {
 		return fail("server: listen %s: %w", addr, err)
 	}
 	actual := conn.LocalAddr().(*net.UDPAddr).AddrPort()
-	return &udpListener{addr: actual, network: network, conn: conn, handler: h, log: log.With("listen", actual)}, nil
+	l := &udpListener{addr: actual, network: network, conn: conn, handler: h, log: log.With("listen", actual)}
+	l.recvBuffer = effective
+	return l, nil
+}
+
+// ReceiveBuffers returns each listener's effective SO_RCVBUF in bytes, in the
+// same order as Addrs.
+func (s *Service) ReceiveBuffers() []int {
+	out := make([]int, 0, len(s.listeners))
+	for _, l := range s.listeners {
+		out = append(out, l.recvBuffer)
+	}
+	return out
 }
 
 // Addrs returns the bound addresses. It exposes kernel-selected ephemeral
