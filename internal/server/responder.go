@@ -101,7 +101,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		cfg.MinPoll = defaultMinPoll
 	}
 	if cfg.MaxClients == 0 {
-		cfg.MaxClients = defaultMaxClients
+		cfg.MaxClients = DefaultMaxClients
 	}
 	if cfg.Stats == nil {
 		cfg.Stats = &Stats{}

@@ -8,7 +8,9 @@ is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
 **Status (2026-08-23):** milestones M0–M4 of `DESIGN.md` §15 are implemented
-in code.
+in code, plus a public-server hardening pass (2026-08-24) covering martian
+filtering, a counter for every dropped datagram, per-address-family statistics
+and the `[serve]` sizing knobs — see `DESIGN.md` §7 and §10.4.
 The authenticated two-host topology is deployed on `gummi` (Fedora 43) and
 `twocom` (FreeBSD 15): both clock backends, init systems, drift persistence,
 IPv4/IPv6 listeners, ACLs, CMAC, and client/server paths have passed an initial
