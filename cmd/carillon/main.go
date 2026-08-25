@@ -281,6 +281,7 @@ func runDaemon(args []string) int {
 				Keys:         keys,
 				RateLimitPPS: cfg.Serve.RateLimitPPS,
 				RateBurst:    cfg.Serve.RateBurst,
+				MaxClients:   cfg.Serve.MaxClients,
 				KoD:          cfg.Serve.KoD,
 				Status: func() ntpserver.SystemStatus {
 					st := eng.Status()
@@ -298,15 +299,17 @@ func runDaemon(args []string) int {
 				Now:   clk.Now,
 				Stats: serverStats,
 			},
-			Log: log,
+			RecvBuffer: cfg.Serve.RecvBuffer,
+			Log:        log,
 		})
 		if err != nil {
 			log.Error("NTP server", "error", err)
 			return exitRuntime
 		}
 		defer timeServer.Close()
-		for _, addr := range timeServer.Addrs() {
-			log.Info("NTP server listening", "address", addr)
+		buffers := timeServer.ReceiveBuffers()
+		for i, addr := range timeServer.Addrs() {
+			log.Info("NTP server listening", "address", addr, "recv_buffer", buffers[i])
 		}
 	}
 
@@ -439,6 +442,11 @@ type configurationWarning struct {
 }
 
 func configurationWarnings(cfg *config.Config, table *leap.Table, now time.Time) []configurationWarning {
+	warnings := leapWarnings(cfg, table, now)
+	return append(warnings, serveWarnings(cfg)...)
+}
+
+func leapWarnings(cfg *config.Config, table *leap.Table, now time.Time) []configurationWarning {
 	var warnings []configurationWarning
 	if table == nil {
 		for i := range cfg.Refclocks {
@@ -458,6 +466,40 @@ func configurationWarnings(cfg *config.Config, table *leap.Table, now time.Time)
 	case remaining <= 30*24*time.Hour:
 		warnings = append(warnings, configurationWarning{
 			message: fmt.Sprintf("leapfile expires in %s at %s", remaining.Round(time.Hour), table.Expiry.Format(time.RFC3339)),
+		})
+	}
+	return warnings
+}
+
+// publicRateLimitPPS is the highest sustained per-client rate that still
+// looks like a rate limit on a public server. chrony's default works out to
+// one packet every eight seconds and ntpd's to the same; a real client polls
+// once every 64 seconds or slower, so anything near one packet per second is
+// a limit in name only.
+const publicRateLimitPPS = 1
+
+// serveWarnings says out loud what an ACL that reaches the public internet
+// means, and flags the settings that were chosen for a LAN.
+func serveWarnings(cfg *config.Config) []configurationWarning {
+	if !cfg.Serve.Enabled() {
+		return nil
+	}
+	public := cfg.PublicAllowPrefixes()
+	if len(public) == 0 {
+		return nil
+	}
+	warnings := []configurationWarning{{
+		message: fmt.Sprintf("serving NTP to the public internet: allow includes %s", strings.Join(public, ", ")),
+	}}
+	if cfg.Serve.RateLimitPPS > publicRateLimitPPS {
+		warnings = append(warnings, configurationWarning{
+			message: fmt.Sprintf("rate_limit_pps %g lets one client draw %g replies a second from a public server; chrony and ntpd default to roughly one every eight seconds",
+				cfg.Serve.RateLimitPPS, cfg.Serve.RateLimitPPS),
+		})
+	}
+	if cfg.Serve.RecvBuffer == 0 {
+		warnings = append(warnings, configurationWarning{
+			message: "recv_buffer is unset, so each listening socket keeps the kernel default; a public server that outruns it drops requests with no other evidence",
 		})
 	}
 	return warnings

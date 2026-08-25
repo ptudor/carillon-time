@@ -30,3 +30,47 @@ func TestConfigurationWarnings(t *testing.T) {
 		t.Fatalf("expired leapfile warning: %+v", warnings)
 	}
 }
+
+func TestPublicServeWarnings(t *testing.T) {
+	public := func(mutate func(*config.Config)) []configurationWarning {
+		cfg := config.Default()
+		cfg.Serve.Listen = []string{"0.0.0.0:123", "[::]:123"}
+		cfg.Serve.Allow = []string{"0.0.0.0/0", "2000::/3"}
+		if mutate != nil {
+			mutate(cfg)
+		}
+		return serveWarnings(cfg)
+	}
+
+	// The defaults were chosen for a LAN, so an open ACL should say so and
+	// name both settings that need revisiting.
+	warnings := public(nil)
+	if len(warnings) != 3 {
+		t.Fatalf("warnings: %+v", warnings)
+	}
+	for i, want := range []string{"public internet", "rate_limit_pps", "recv_buffer"} {
+		if !strings.Contains(warnings[i].message, want) || warnings[i].error {
+			t.Fatalf("warning %d: %+v", i, warnings[i])
+		}
+	}
+	if !strings.Contains(warnings[0].message, "0.0.0.0/0, 2000::/3") {
+		t.Fatalf("the warning must quote the prefixes: %q", warnings[0].message)
+	}
+
+	// Tuned for a public server: still announced, but nothing left to fix.
+	warnings = public(func(c *config.Config) {
+		c.Serve.RateLimitPPS = 0.25
+		c.Serve.RecvBuffer = 4 << 20
+	})
+	if len(warnings) != 1 || !strings.Contains(warnings[0].message, "public internet") {
+		t.Fatalf("tuned public server: %+v", warnings)
+	}
+
+	// A LAN ACL says nothing at all, and neither does a disabled server.
+	if got := public(func(c *config.Config) { c.Serve.Allow = []string{"192.168.1.0/24", "fd00::/8"} }); got != nil {
+		t.Fatalf("private ACL warned: %+v", got)
+	}
+	if got := public(func(c *config.Config) { c.Serve.Allow = nil }); got != nil {
+		t.Fatalf("disabled server warned: %+v", got)
+	}
+}

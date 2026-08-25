@@ -28,6 +28,19 @@ const (
 	MaxPoll = 17
 )
 
+// Rate-limit table and socket buffer bounds for [serve].
+const (
+	DefaultMaxClients = 65536
+	MinMaxClients     = 256
+	MaxMaxClients     = 8 << 20
+
+	// MinRecvBuffer is low enough to be a deliberate choice and high enough
+	// that it cannot be a units mistake; MaxRecvBuffer is what a kernel will
+	// plausibly grant with a raised rmem_max.
+	MinRecvBuffer = 64 << 10
+	MaxRecvBuffer = 256 << 20
+)
+
 // Default field values for an upstream server.
 const (
 	DefaultPollMin = 6
@@ -159,6 +172,18 @@ type Serve struct {
 	RateLimitPPS float64 `toml:"rate_limit_pps"`
 	RateBurst    float64 `toml:"rate_burst"`
 
+	// MaxClients bounds the per-listener rate-limit table. Entries expire
+	// after a minute and the least recently used is evicted when the table
+	// is full, so a flood of forged source addresses costs bounded memory
+	// while the heavy hitters stay tracked.
+	MaxClients int `toml:"max_clients"`
+
+	// RecvBuffer is the SO_RCVBUF size in bytes for each listening socket.
+	// Zero leaves the kernel default, which is a few hundred packets of
+	// headroom and too little for a busy public server: an overflow is
+	// otherwise visible only as clients that never got an answer.
+	RecvBuffer int `toml:"recv_buffer"`
+
 	// KoD enables throttled RATE kiss replies for over-limit clients.
 	KoD bool `toml:"kod"`
 }
@@ -249,6 +274,7 @@ func Default() *Config {
 		Serve: Serve{
 			RateLimitPPS: 8,
 			RateBurst:    16,
+			MaxClients:   DefaultMaxClients,
 			KoD:          true,
 		},
 		Monitor: Monitor{
@@ -736,6 +762,58 @@ func validateServe(s *Serve, needKeys *bool, fail func(string, ...any)) {
 	if !(s.RateBurst >= 1) {
 		fail("serve: rate_burst %v must be at least 1", s.RateBurst)
 	}
+	if s.MaxClients < MinMaxClients || s.MaxClients > MaxMaxClients {
+		fail("serve: max_clients %d out of range %d..%d", s.MaxClients, MinMaxClients, MaxMaxClients)
+	}
+	if s.RecvBuffer != 0 && (s.RecvBuffer < MinRecvBuffer || s.RecvBuffer > MaxRecvBuffer) {
+		fail("serve: recv_buffer %d must be 0 (kernel default) or between %d and %d bytes",
+			s.RecvBuffer, MinRecvBuffer, MaxRecvBuffer)
+	}
+}
+
+// privatePrefixes are the address ranges a server can serve without being
+// reachable from the public internet.
+var privatePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+}
+
+// PublicAllowPrefixes returns the entries of [serve] allow that reach beyond
+// private address space, so startup can say out loud that this server answers
+// the internet. It reports the configured strings, not the masked forms, so
+// the message quotes what the operator wrote.
+func (c *Config) PublicAllowPrefixes() []string {
+	var public []string
+	for _, raw := range c.Serve.Allow {
+		p, err := netip.ParsePrefix(raw)
+		if err != nil {
+			continue
+		}
+		if isPublicPrefix(p.Masked()) {
+			public = append(public, raw)
+		}
+	}
+	return public
+}
+
+// isPublicPrefix reports whether p holds any address outside the private,
+// loopback and link-local ranges. p must already be masked.
+func isPublicPrefix(p netip.Prefix) bool {
+	for _, private := range privatePrefixes {
+		// p is entirely inside private when it starts inside it and is no
+		// broader than it.
+		if p.Bits() >= private.Bits() && private.Contains(p.Addr()) {
+			return false
+		}
+	}
+	return true
 }
 
 // ServePrefixes parses the already-validated ACL configuration for the

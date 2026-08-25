@@ -41,6 +41,8 @@ deny           = ["192.0.2.0/24"]
 require_key    = { "203.0.113.7/32" = 1 }
 rate_limit_pps = 4
 rate_burst     = 8
+max_clients    = 262144
+recv_buffer    = 4194304
 kod            = false
 
 [monitor]
@@ -331,6 +333,10 @@ func TestValidateRules(t *testing.T) {
 		{"serve key without keys file", func(c *Config) { enableServe(c); c.Serve.RequireKey = map[string]uint32{"127.0.0.1/32": 1} }, "keys must be set"},
 		{"serve zero rate", func(c *Config) { enableServe(c); c.Serve.RateLimitPPS = 0 }, "rate_limit_pps"},
 		{"serve low burst", func(c *Config) { enableServe(c); c.Serve.RateBurst = 0.5 }, "rate_burst"},
+		{"serve tiny table", func(c *Config) { enableServe(c); c.Serve.MaxClients = 8 }, "max_clients 8 out of range"},
+		{"serve huge table", func(c *Config) { enableServe(c); c.Serve.MaxClients = 1 << 30 }, "max_clients"},
+		{"serve tiny buffer", func(c *Config) { enableServe(c); c.Serve.RecvBuffer = 4096 }, "recv_buffer 4096 must be 0"},
+		{"serve huge buffer", func(c *Config) { enableServe(c); c.Serve.RecvBuffer = 1 << 30 }, "recv_buffer"},
 		{"monitor bad listen", func(c *Config) { c.Monitor.Listen = "localhost:9123" }, "numeric IP:port"},
 		{"monitor zero port", func(c *Config) { c.Monitor.Listen = "127.0.0.1:0" }, "nonzero port"},
 		{"monitor empty allow", func(c *Config) { c.Monitor.Listen = "127.0.0.1:9123"; c.Monitor.Allow = nil }, "allow must contain"},
@@ -525,5 +531,48 @@ func TestCheck(t *testing.T) {
 func TestDefaultPath(t *testing.T) {
 	if p := DefaultPath(); !strings.HasSuffix(p, "/carillon/carillon.toml") {
 		t.Fatalf("unexpected default path %q", p)
+	}
+}
+
+func TestPublicAllowPrefixes(t *testing.T) {
+	tests := []struct {
+		name  string
+		allow []string
+		want  []string
+	}{
+		{"lan only", []string{"192.168.1.0/24", "10.0.0.0/8", "fd00:1::/64", "127.0.0.0/8", "::1/128"}, nil},
+		{"default routes", []string{"0.0.0.0/0", "::/0"}, []string{"0.0.0.0/0", "::/0"}},
+		{"global unicast v6", []string{"2000::/3"}, []string{"2000::/3"}},
+		{"mixed", []string{"192.168.1.0/24", "203.0.113.0/24"}, []string{"203.0.113.0/24"}},
+		{"supernet of a private range", []string{"192.0.0.0/8"}, []string{"192.0.0.0/8"}},
+		{"link local only", []string{"169.254.0.0/16", "fe80::/10"}, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{Serve: Serve{Allow: tc.allow}}
+			got := cfg.PublicAllowPrefixes()
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("public prefixes %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServeTableAndBufferDefaults(t *testing.T) {
+	cfg, err := Parse([]byte(coloExample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Serve.MaxClients != 262144 || cfg.Serve.RecvBuffer != 4194304 {
+		t.Fatalf("serve %+v", cfg.Serve)
+	}
+	// An omitted [serve] table keeps the built-in bound and the kernel's
+	// own receive buffer.
+	bare, err := Parse([]byte("[[server]]\naddress = \"192.0.2.1\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Serve.MaxClients != DefaultMaxClients || bare.Serve.RecvBuffer != 0 {
+		t.Fatalf("defaults %+v", bare.Serve)
 	}
 }
