@@ -87,7 +87,8 @@ func TestStatusAndHealthHandlers(t *testing.T) {
 	for _, want := range []string{
 		`carillon_state{state="synced"} 1`,
 		`carillon_build_info{version="test-version"} 1`,
-		`carillon_server_requests_total{result="served"} 0`,
+		`carillon_server_requests_total{family="ipv4",result="served"} 0`,
+		`carillon_server_requests_total{family="ipv6",result="martian"} 0`,
 	} {
 		if !strings.Contains(string(metricsBody), want) {
 			t.Errorf("metrics missing %q:\n%s", want, metricsBody)
