@@ -2,10 +2,14 @@ package monitor
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"carillon/internal/control"
+	"carillon/internal/ntp"
 )
 
 type collector struct {
@@ -43,6 +47,12 @@ type collector struct {
 
 	serverEnabled     *prometheus.Desc
 	serverRequests    *prometheus.Desc
+	serverUnsynced    *prometheus.Desc
+	serverKoD         *prometheus.Desc
+	serverModes       *prometheus.Desc
+	serverVersions    *prometheus.Desc
+	serverClients     *prometheus.Desc
+	serverKernelDrops *prometheus.Desc
 	serverLastRequest *prometheus.Desc
 	serverLastServed  *prometheus.Desc
 	serverNoKernelTS  *prometheus.Desc
@@ -92,10 +102,16 @@ func newCollector(snapshot func() Snapshot) *collector {
 		gpsLag:     desc("carillon_gps_nmea_lag_seconds", "Measured lag from the latest PPS edge to NMEA sentence arrival.", "source"),
 
 		serverEnabled:     desc("carillon_server_enabled", "Whether the NTP listener is configured."),
-		serverRequests:    desc("carillon_server_requests_total", "NTP listener request counters.", "result"),
-		serverLastRequest: desc("carillon_server_last_request_timestamp_seconds", "Unix timestamp of the last valid NTP client request."),
-		serverLastServed:  desc("carillon_server_last_served_timestamp_seconds", "Unix timestamp of the last NTP response served."),
-		serverNoKernelTS:  desc("carillon_server_kernel_timestamp_missing_total", "NTP requests received without a kernel timestamp."),
+		serverRequests:    desc("carillon_server_requests_total", "Datagrams the NTP listener received, partitioned by outcome; summing over result gives all received traffic.", "family", "result"),
+		serverUnsynced:    desc("carillon_server_unsynced_replies_total", "Replies served while the clock was not synchronized; a subset of result=served.", "family"),
+		serverKoD:         desc("carillon_server_kod_replies_total", "Rate kiss-o'-death replies sent; a subset of result=rate_limited.", "family"),
+		serverModes:       desc("carillon_server_refused_mode_total", "Refused datagrams by NTP association mode; modes 6 and 7 are amplification probes.", "family", "mode"),
+		serverVersions:    desc("carillon_server_client_version_total", "Accepted client requests by NTP protocol version.", "family", "version"),
+		serverClients:     desc("carillon_server_clients", "Distinct clients in the rate-limit table, which expires entries after one minute.", "family"),
+		serverKernelDrops: desc("carillon_server_kernel_drops_total", "Datagrams the kernel dropped because the socket receive queue was full.", "family"),
+		serverLastRequest: desc("carillon_server_last_request_timestamp_seconds", "Unix timestamp of the last valid NTP client request.", "family"),
+		serverLastServed:  desc("carillon_server_last_served_timestamp_seconds", "Unix timestamp of the last NTP response served.", "family"),
+		serverNoKernelTS:  desc("carillon_server_kernel_timestamp_missing_total", "NTP requests received without a kernel timestamp.", "family"),
 	}
 }
 
@@ -106,7 +122,9 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 		c.sourceOffset, c.sourceDelay, c.sourceJitter, c.sourceDistance,
 		c.sourceReach, c.sourceSelected, c.sourceLastRx, c.sourceNoKernelTS, c.sourceEvents,
 		c.ppsSamples, c.ppsJitter, c.ppsLocked, c.gpsFix, c.gpsSats, c.gpsLag,
-		c.serverEnabled, c.serverRequests, c.serverLastRequest, c.serverLastServed, c.serverNoKernelTS,
+		c.serverEnabled, c.serverRequests, c.serverUnsynced, c.serverKoD,
+		c.serverModes, c.serverVersions, c.serverClients, c.serverKernelDrops,
+		c.serverLastRequest, c.serverLastServed, c.serverNoKernelTS,
 	} {
 		ch <- d
 	}
@@ -127,12 +145,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		return 0
 	}
-	timestamp := func(v time.Time) float64 {
-		if v.IsZero() {
-			return 0
-		}
-		return float64(v.UnixNano()) / 1e9
-	}
+	timestamp := timestampSeconds
 
 	gauge(c.state, 1, t.State)
 	gauge(c.offset, t.Offset)
@@ -183,14 +196,66 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	gauge(c.serverEnabled, boolValue(s.Server.Enabled))
-	for result, value := range map[string]uint64{
-		"served": s.Server.Served, "denied": s.Server.Denied,
-		"rate_limited": s.Server.RateLimited, "bad_auth": s.Server.BadAuth,
-		"unsynced": s.Server.Unsynced,
-	} {
-		counter(c.serverRequests, value, result)
+	// Families are reported separately rather than as a total: the NTP pool
+	// scores IPv4 and IPv6 as two monitors, and Prometheus sums the label
+	// away whenever the total is what is wanted.
+	c.collectFamily(ch, "ipv4", &s.Server.IPv4)
+	c.collectFamily(ch, "ipv6", &s.Server.IPv6)
+}
+
+// serverResults partitions received datagrams by outcome. Every datagram the
+// listener read increments exactly one of these, so summing over the result
+// label gives total received traffic without double counting.
+func serverResults(v *control.CounterStats) map[string]uint64 {
+	return map[string]uint64{
+		"served":       v.Served,
+		"denied":       v.Denied,
+		"martian":      v.Martian,
+		"rate_limited": v.RateLimited,
+		"bad_auth":     v.BadAuth,
+		"bad_version":  v.BadVersion,
+		"non_client":   v.NonClient,
+		"malformed":    v.Malformed,
+		"oversize":     v.Oversize,
 	}
-	gauge(c.serverLastRequest, timestamp(s.Server.LastRequest))
-	gauge(c.serverLastServed, timestamp(s.Server.LastServed))
-	counter(c.serverNoKernelTS, s.Server.NoKernelTS)
+}
+
+func (c *collector) collectFamily(ch chan<- prometheus.Metric, family string, v *control.CounterStats) {
+	counter := func(d *prometheus.Desc, value uint64, labels ...string) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.CounterValue, float64(value), labels...)
+	}
+	gauge := func(d *prometheus.Desc, value float64, labels ...string) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, value, labels...)
+	}
+	for result, value := range serverResults(v) {
+		counter(c.serverRequests, value, family, result)
+	}
+	counter(c.serverUnsynced, v.Unsynced, family)
+	counter(c.serverKoD, v.KoD, family)
+	for mode, value := range v.Modes {
+		if mode == int(ntp.ModeClient) {
+			// Client mode is never refused as a mode; it is the request.
+			continue
+		}
+		counter(c.serverModes, value, family, ntp.Mode(mode).String())
+	}
+	for version, value := range v.Versions {
+		if version == 0 {
+			// The decoder rejects version 0 before it can be counted here.
+			continue
+		}
+		counter(c.serverVersions, value, family, strconv.Itoa(version))
+	}
+	gauge(c.serverClients, float64(v.Clients), family)
+	counter(c.serverKernelDrops, v.KernelDrops, family)
+	counter(c.serverNoKernelTS, v.NoKernelTS, family)
+	gauge(c.serverLastRequest, timestampSeconds(v.LastRequest), family)
+	gauge(c.serverLastServed, timestampSeconds(v.LastServed), family)
+}
+
+func timestampSeconds(v time.Time) float64 {
+	if v.IsZero() {
+		return 0
+	}
+	return float64(v.UnixNano()) / 1e9
 }

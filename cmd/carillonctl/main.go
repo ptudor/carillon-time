@@ -19,11 +19,13 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"carillon/internal/config"
 	"carillon/internal/control"
+	"carillon/internal/ntp"
 )
 
 func main() {
@@ -123,20 +125,59 @@ func printRefclocks(rs []control.Refclock) {
 }
 
 func printServerStats(s *control.ServerStats) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	defer w.Flush()
-	fmt.Fprintf(w, "Served\t%d\n", s.Served)
-	fmt.Fprintf(w, "Denied\t%d\n", s.Denied)
-	fmt.Fprintf(w, "Rate limited\t%d\n", s.RateLimited)
-	fmt.Fprintf(w, "Bad authentication\t%d\n", s.BadAuth)
-	fmt.Fprintf(w, "Unsynchronized replies\t%d\n", s.Unsynced)
-	fmt.Fprintf(w, "Missing kernel timestamps\t%d\n", s.NoKernelTS)
+	counts := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	row := func(label string, pick func(*control.CounterStats) uint64) {
+		fmt.Fprintf(counts, "%s\t%d\t%d\t%d\n", label, pick(&s.CounterStats), pick(&s.IPv4), pick(&s.IPv6))
+	}
+	fmt.Fprint(counts, "\ttotal\tipv4\tipv6\n")
+	row("Served", func(c *control.CounterStats) uint64 { return c.Served })
+	row("  while unsynchronized", func(c *control.CounterStats) uint64 { return c.Unsynced })
+	row("Dropped", (*control.CounterStats).Dropped)
+	row("  outside the ACL", func(c *control.CounterStats) uint64 { return c.Denied })
+	row("  martian address", func(c *control.CounterStats) uint64 { return c.Martian })
+	row("  rate limited", func(c *control.CounterStats) uint64 { return c.RateLimited })
+	row("  bad authentication", func(c *control.CounterStats) uint64 { return c.BadAuth })
+	row("  bad version", func(c *control.CounterStats) uint64 { return c.BadVersion })
+	row("  non-client mode", func(c *control.CounterStats) uint64 { return c.NonClient })
+	row("  malformed", func(c *control.CounterStats) uint64 { return c.Malformed })
+	row("  oversize", func(c *control.CounterStats) uint64 { return c.Oversize })
+	row("Rate kiss replies sent", func(c *control.CounterStats) uint64 { return c.KoD })
+	row("Missing kernel timestamps", func(c *control.CounterStats) uint64 { return c.NoKernelTS })
+	row("Kernel receive drops", func(c *control.CounterStats) uint64 { return c.KernelDrops })
+	fmt.Fprintf(counts, "Clients tracked\t%d\t%d\t%d\n", s.Clients, s.IPv4.Clients, s.IPv6.Clients)
+	counts.Flush()
+
+	// The wide free-text rows get their own writer so a long histogram does
+	// not stretch the counter columns.
+	detail := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer detail.Flush()
+	fmt.Fprintf(detail, "Client versions\t%s\n", histogram(s.Versions, func(i int) string {
+		return "v" + strconv.Itoa(i)
+	}))
+	fmt.Fprintf(detail, "Refused modes\t%s\n", histogram(s.Modes, func(i int) string {
+		return ntp.Mode(i).String()
+	}))
 	if !s.LastRequest.IsZero() {
-		fmt.Fprintf(w, "Last request\t%s\n", s.LastRequest.UTC().Format(time.RFC3339Nano))
+		fmt.Fprintf(detail, "Last request\t%s\n", s.LastRequest.UTC().Format(time.RFC3339Nano))
 	}
 	if !s.LastServed.IsZero() {
-		fmt.Fprintf(w, "Last served\t%s\n", s.LastServed.UTC().Format(time.RFC3339Nano))
+		fmt.Fprintf(detail, "Last served\t%s\n", s.LastServed.UTC().Format(time.RFC3339Nano))
 	}
+}
+
+// histogram renders the non-zero buckets of a counter array, so a quiet
+// server shows a short line instead of a row of zeros.
+func histogram(values []uint64, name func(int) string) string {
+	var parts []string
+	for i, v := range values {
+		if v != 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", name(i), v))
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, " ")
 }
 
 func printTracking(t *control.Tracking) {

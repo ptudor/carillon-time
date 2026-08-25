@@ -33,7 +33,7 @@ type counters struct {
 	// Answered.
 	served   atomic.Uint64
 	unsynced atomic.Uint64 // subset of served: answered with leap=unsync
-	kod      atomic.Uint64 // subset of served: RATE kiss packets
+	kod      atomic.Uint64 // subset of rateLimited: RATE kiss packets sent
 
 	// Refused.
 	denied      atomic.Uint64 // source outside the [serve] ACL
