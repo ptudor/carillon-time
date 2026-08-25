@@ -6,14 +6,16 @@ import (
 	"time"
 )
 
+// DefaultMaxClients bounds the rate-limit table when [serve] max_clients is
+// unset. Eviction is least-recently-used, so under a flood of forged source
+// addresses the heavy hitters stay tracked and the one-shot tail is what gets
+// dropped from the table. It is exported so the configuration default and the
+// handler fallback cannot drift apart.
+const DefaultMaxClients = 65536
+
 const (
-	// defaultMaxClients bounds the rate-limit table when [serve] max_clients
-	// is unset. Eviction is least-recently-used, so under a flood of forged
-	// source addresses the heavy hitters stay tracked and the one-shot tail
-	// is what gets dropped from the table.
-	defaultMaxClients = 65536
-	clientIdleExpiry  = 60 * time.Second
-	kodInterval       = 4 * time.Second
+	clientIdleExpiry = 60 * time.Second
+	kodInterval      = 4 * time.Second
 )
 
 // rateLimiter is a bounded per-address token-bucket table. It is owned by
@@ -37,7 +39,7 @@ type clientBucket struct {
 
 func newRateLimiter(rate, burst float64, maxClients int) *rateLimiter {
 	if maxClients <= 0 {
-		maxClients = defaultMaxClients
+		maxClients = DefaultMaxClients
 	}
 	return &rateLimiter{
 		rate:       rate,

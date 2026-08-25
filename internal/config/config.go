@@ -20,6 +20,8 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"golang.org/x/sys/unix"
+
+	ntpserver "carillon/internal/server"
 )
 
 // Poll exponent bounds (log2 seconds) accepted for upstream servers.
@@ -30,7 +32,9 @@ const (
 
 // Rate-limit table and socket buffer bounds for [serve].
 const (
-	DefaultMaxClients = 65536
+	// DefaultMaxClients is the server package's own fallback, referenced
+	// rather than repeated so the two cannot drift apart.
+	DefaultMaxClients = ntpserver.DefaultMaxClients
 	MinMaxClients     = 256
 	MaxMaxClients     = 8 << 20
 
