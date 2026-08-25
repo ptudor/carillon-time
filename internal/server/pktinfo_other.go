@@ -2,8 +2,11 @@
 
 package server
 
-import "syscall"
+import (
+	"net/netip"
+	"syscall"
+)
 
 func enablePacketInfo(syscall.RawConn, string) error { return nil }
 
-func sourceControl([]byte, string) []byte { return nil }
+func destination([]byte, string) (netip.Addr, []byte) { return netip.Addr{}, nil }

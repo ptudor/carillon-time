@@ -30,7 +30,10 @@ func testEngineStatus(now time.Time, state discipline.State) *engine.Status {
 func TestSnapshotOf(t *testing.T) {
 	now := time.Date(2026, 8, 23, 20, 0, 0, 0, time.UTC)
 	st := testEngineStatus(now, discipline.StateSynced)
-	s := SnapshotOf(st, ntpserver.StatsSnapshot{Served: 12}, true,
+	s := SnapshotOf(st, ntpserver.StatsSnapshot{
+		Total: ntpserver.CounterSnapshot{Served: 12},
+		IPv4:  ntpserver.CounterSnapshot{Served: 12},
+	}, true,
 		Metadata{ID: "twocom", Name: "Twocom", Roles: []string{"colo", "ntp-pool"}}, now.Add(time.Second))
 	if s.Schema != schemaV1 || s.Health.Status != "healthy" || s.Health.SnapshotAgeSeconds != 1 {
 		t.Fatalf("snapshot health: %+v", s)

@@ -7,6 +7,10 @@ import (
 )
 
 const (
+	// defaultMaxClients bounds the rate-limit table when [serve] max_clients
+	// is unset. Eviction is least-recently-used, so under a flood of forged
+	// source addresses the heavy hitters stay tracked and the one-shot tail
+	// is what gets dropped from the table.
 	defaultMaxClients = 65536
 	clientIdleExpiry  = 60 * time.Second
 	kodInterval       = 4 * time.Second
@@ -31,14 +35,22 @@ type clientBucket struct {
 	elem     *list.Element
 }
 
-func newRateLimiter(rate, burst float64) *rateLimiter {
+func newRateLimiter(rate, burst float64, maxClients int) *rateLimiter {
+	if maxClients <= 0 {
+		maxClients = defaultMaxClients
+	}
 	return &rateLimiter{
 		rate:       rate,
 		burst:      burst,
-		maxClients: defaultMaxClients,
+		maxClients: maxClients,
 		clients:    make(map[netip.Addr]*clientBucket),
 	}
 }
+
+// size reports how many clients the table is tracking. Entries expire after
+// clientIdleExpiry, so this is roughly the number of distinct clients seen in
+// the last minute.
+func (l *rateLimiter) size() int { return len(l.clients) }
 
 // allow reports whether a packet may be served and, when it may not, whether
 // enough time has elapsed to send this client another RATE kiss packet.

@@ -79,24 +79,73 @@ type Refclock struct {
 	Spikes   uint64 `json:"spikes"`
 }
 
-// ServerStats is the NTP listener's request-counter snapshot.
-type ServerStats struct {
-	Served      uint64    `json:"served"`
-	Denied      uint64    `json:"denied"`
-	RateLimited uint64    `json:"ratelimited"`
-	BadAuth     uint64    `json:"badauth"`
-	Unsynced    uint64    `json:"unsynced"`
-	NoKernelTS  uint64    `json:"no_kernel_timestamp"`
+// CounterStats is one address family's NTP listener counters. Every datagram
+// the listener read increments exactly one outcome counter, so Served plus
+// every refusal reason accounts for all received traffic.
+type CounterStats struct {
+	Served   uint64 `json:"served"`
+	Unsynced uint64 `json:"unsynced"`
+	KoD      uint64 `json:"kod"`
+
+	Denied      uint64 `json:"denied"`
+	Martian     uint64 `json:"martian"`
+	RateLimited uint64 `json:"ratelimited"`
+	BadAuth     uint64 `json:"badauth"`
+	BadVersion  uint64 `json:"badversion"`
+	NonClient   uint64 `json:"nonclient"`
+	Malformed   uint64 `json:"malformed"`
+	Oversize    uint64 `json:"oversize"`
+
+	NoKernelTS  uint64 `json:"no_kernel_timestamp"`
+	KernelDrops uint64 `json:"kernel_drops"`
+	Clients     int64  `json:"clients"`
+
+	// Modes counts refused datagrams by NTP mode; Versions counts accepted
+	// requests by client protocol version. Both are indexed by the field's
+	// own value, so Modes[6] is the control mode and Versions[4] is NTPv4.
+	Modes    []uint64 `json:"modes"`
+	Versions []uint64 `json:"versions"`
+
 	LastRequest time.Time `json:"last_request,omitempty"`
 	LastServed  time.Time `json:"last_served,omitempty"`
+}
+
+// Requests returns every datagram accounted for by this snapshot.
+func (c *CounterStats) Requests() uint64 { return c.Served + c.Dropped() }
+
+// Dropped returns the datagrams that were refused for any reason.
+func (c *CounterStats) Dropped() uint64 {
+	return c.Denied + c.Martian + c.RateLimited + c.BadAuth +
+		c.BadVersion + c.NonClient + c.Malformed + c.Oversize
+}
+
+// ServerStats is the NTP listener's request-counter snapshot: the totals at
+// the top level, with the same counters broken out per address family so a
+// dual-stack server can be charted as the two monitors the NTP pool sees.
+type ServerStats struct {
+	CounterStats
+	IPv4 CounterStats `json:"ipv4"`
+	IPv6 CounterStats `json:"ipv6"`
 }
 
 // ServerStatsOf converts the server package's atomic counter snapshot.
 func ServerStatsOf(s ntpserver.StatsSnapshot) *ServerStats {
 	return &ServerStats{
-		Served: s.Served, Denied: s.Denied, RateLimited: s.RateLimited,
-		BadAuth: s.BadAuth, Unsynced: s.Unsynced, NoKernelTS: s.NoKernelTS,
-		LastRequest: s.LastRequest, LastServed: s.LastServed,
+		CounterStats: counterStatsOf(s.Total),
+		IPv4:         counterStatsOf(s.IPv4),
+		IPv6:         counterStatsOf(s.IPv6),
+	}
+}
+
+func counterStatsOf(c ntpserver.CounterSnapshot) CounterStats {
+	return CounterStats{
+		Served: c.Served, Unsynced: c.Unsynced, KoD: c.KoD,
+		Denied: c.Denied, Martian: c.Martian, RateLimited: c.RateLimited,
+		BadAuth: c.BadAuth, BadVersion: c.BadVersion, NonClient: c.NonClient,
+		Malformed: c.Malformed, Oversize: c.Oversize,
+		NoKernelTS: c.NoKernelTS, KernelDrops: c.KernelDrops, Clients: c.Clients,
+		Modes: c.Modes[:], Versions: c.Versions[:],
+		LastRequest: c.LastRequest, LastServed: c.LastServed,
 	}
 }
 

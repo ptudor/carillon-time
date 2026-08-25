@@ -65,7 +65,7 @@ func TestUDPListenerRoundTrip(t *testing.T) {
 	if rx.Before(before.Add(-time.Millisecond)) || rx.After(after.Add(time.Millisecond)) {
 		t.Fatalf("receive timestamp %v outside exchange %v..%v", rx, before, after)
 	}
-	if got := stats.Snapshot(); got.Served != 1 {
+	if got := stats.Snapshot().Total; got.Served != 1 {
 		t.Fatalf("stats %+v", got)
 	}
 

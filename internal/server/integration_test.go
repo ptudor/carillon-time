@@ -63,7 +63,7 @@ func TestClientServerEndToEnd(t *testing.T) {
 	if result.Delay < 0 || result.Delay > (50*time.Millisecond).Seconds() {
 		t.Fatalf("loopback delay %.6f", result.Delay)
 	}
-	if got := stats.Snapshot(); got.Served != 1 || got.BadAuth != 0 {
+	if got := stats.Snapshot().Total; got.Served != 1 || got.BadAuth != 0 {
 		t.Fatalf("stats %+v", got)
 	}
 }
