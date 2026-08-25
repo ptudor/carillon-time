@@ -158,21 +158,30 @@ func (l *udpListener) serve(ctx context.Context) error {
 			}
 			return fmt.Errorf("server: receive on %s: %w", l.addr, err)
 		}
+		c := l.handler.stats.family(from.Addr())
 		if flags&syscall.MSG_TRUNC != 0 || n > ntp.MaxPacketSize {
+			c.oversize.Add(1)
 			continue
 		}
 		received := l.handler.now()
 		if ts, ok := sockts.Parse(oob[:oobn]); ok {
 			received = ts
-		} else if !missingTimestampWarned {
-			l.handler.stats.missingKernelTS.Add(1)
-			l.log.Warn("kernel receive timestamp missing; using a user-space timestamp")
-			missingTimestampWarned = true
 		} else {
-			l.handler.stats.missingKernelTS.Add(1)
+			c.missingKernelTS.Add(1)
+			if !missingTimestampWarned {
+				l.log.Warn("kernel receive timestamp missing; using a user-space timestamp")
+				missingTimestampWarned = true
+			}
 		}
-		replyOOB := sourceControl(oob[:oobn], l.network)
-		response := l.handler.Handle(buf[:n], from.Addr(), received, time.Now())
+		// A request addressed to a broadcast or multicast group would need an
+		// illegal source address on the reply, and one such datagram would ask
+		// every host on the subnet to answer at once.
+		dst, replyOOB := destination(oob[:oobn], l.network)
+		if martianDestination(dst) {
+			c.martian.Add(1)
+			continue
+		}
+		response := l.handler.Handle(buf[:n], from, received, time.Now())
 		if response == nil {
 			continue
 		}

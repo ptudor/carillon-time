@@ -76,7 +76,7 @@ func TestServerRoundTrip(t *testing.T) {
 		t.Fatalf("refclock: %+v %v", resp, err)
 	}
 	resp, err = Call(ctx, path, Request{Command: CmdServerStats})
-	if err != nil || resp.ServerStats == nil || *resp.ServerStats != (ServerStats{}) {
+	if err != nil || resp.ServerStats == nil || resp.ServerStats.Requests() != 0 {
 		t.Fatalf("serverstats: %+v %v", resp, err)
 	}
 	resp, err = Call(ctx, path, Request{Command: CmdWaitSync, Timeout: 0.3})

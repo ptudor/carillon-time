@@ -52,6 +52,13 @@ func newTestHandler(t testing.TB, mutate func(*Config)) (*Handler, *Stats) {
 	return h, stats
 }
 
+// from builds a plausible client address and ephemeral source port. Handle
+// takes the whole AddrPort because a source port of zero is itself a reason
+// to drop a datagram.
+func from(addr string) netip.AddrPort {
+	return netip.AddrPortFrom(netip.MustParseAddr(addr), 45678)
+}
+
 func request(version uint8) []byte {
 	return (&ntp.Packet{
 		Version:      version,
@@ -75,7 +82,7 @@ func TestReplyFieldsAndVersionEcho(t *testing.T) {
 	h, stats := newTestHandler(t, nil)
 	for version := uint8(1); version <= 4; version++ {
 		req := request(version)
-		got := h.Handle(req, netip.MustParseAddr("192.0.2.10"), testWall, testMono.Add(time.Duration(version)*time.Second))
+		got := h.Handle(req, from("192.0.2.10"), testWall, testMono.Add(time.Duration(version)*time.Second))
 		if len(got) != ntp.HeaderSize {
 			t.Fatalf("version %d: reply length %d", version, len(got))
 		}
@@ -96,7 +103,7 @@ func TestReplyFieldsAndVersionEcho(t *testing.T) {
 			t.Fatalf("root delay %v", p.RootDelay.Seconds())
 		}
 	}
-	if got := stats.Snapshot(); got.Served != 4 || got.Unsynced != 0 || !got.LastRequest.Equal(testWall) || !got.LastServed.Equal(testWall) {
+	if got := stats.Snapshot().Total; got.Served != 4 || got.Unsynced != 0 || !got.LastRequest.Equal(testWall) || !got.LastServed.Equal(testWall) {
 		t.Fatalf("stats %+v", got)
 	}
 }
@@ -107,11 +114,11 @@ func TestUnsynchronizedReply(t *testing.T) {
 			return SystemStatus{Synced: false, Precision: -18, ReferenceID: ntp.KissSTEP}
 		}
 	})
-	p, _, _ := decodeReply(t, h.Handle(request(4), netip.MustParseAddr("192.0.2.1"), testWall, testMono))
+	p, _, _ := decodeReply(t, h.Handle(request(4), from("192.0.2.1"), testWall, testMono))
 	if p.Leap != ntp.LeapUnsync || p.Stratum != 16 || p.ReferenceID != ntp.KissSTEP || p.RootDispersion.Seconds() != 16 || !p.ReferenceTime.IsZero() {
 		t.Fatalf("unsynchronized reply %+v", p)
 	}
-	if got := stats.Snapshot(); got.Served != 1 || got.Unsynced != 1 {
+	if got := stats.Snapshot().Total; got.Served != 1 || got.Unsynced != 1 {
 		t.Fatalf("stats %+v", got)
 	}
 }
@@ -120,23 +127,23 @@ func TestModesLengthsAndACL(t *testing.T) {
 	h, stats := newTestHandler(t, func(c *Config) {
 		c.Deny = []netip.Prefix{netip.MustParsePrefix("192.0.2.64/26")}
 	})
-	if got := h.Handle(request(4)[:47], netip.MustParseAddr("192.0.2.1"), testWall, testMono); got != nil {
+	if got := h.Handle(request(4)[:47], from("192.0.2.1"), testWall, testMono); got != nil {
 		t.Fatal("short request received a reply")
 	}
 	for _, mode := range []ntp.Mode{ntp.ModeSymmetricActive, ntp.ModeSymmetricPassive, ntp.ModeServer, ntp.ModeBroadcast, ntp.ModeControl, ntp.ModePrivate} {
 		r := request(4)
 		r[0] = r[0]&^7 | byte(mode)
-		if got := h.Handle(r, netip.MustParseAddr("192.0.2.1"), testWall, testMono); got != nil {
+		if got := h.Handle(r, from("192.0.2.1"), testWall, testMono); got != nil {
 			t.Fatalf("mode %v received a reply", mode)
 		}
 	}
-	if got := h.Handle(request(4), netip.MustParseAddr("198.51.100.1"), testWall, testMono); got != nil {
+	if got := h.Handle(request(4), from("198.51.100.1"), testWall, testMono); got != nil {
 		t.Fatal("address outside allow received a reply")
 	}
-	if got := h.Handle(request(4), netip.MustParseAddr("192.0.2.70"), testWall, testMono); got != nil {
+	if got := h.Handle(request(4), from("192.0.2.70"), testWall, testMono); got != nil {
 		t.Fatal("deny did not override allow")
 	}
-	if got := stats.Snapshot(); got.Denied != 2 || got.Served != 0 {
+	if got := stats.Snapshot().Total; got.Denied != 2 || got.Served != 0 {
 		t.Fatalf("stats %+v", got)
 	}
 }
@@ -145,7 +152,7 @@ func TestAuthentication(t *testing.T) {
 	h, stats := newTestHandler(t, func(c *Config) {
 		c.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.0/25"): 1}
 	})
-	client := netip.MustParseAddr("192.0.2.10")
+	client := from("192.0.2.10")
 	if got := h.Handle(request(4), client, testWall, testMono); got != nil {
 		t.Fatal("missing required MAC received a reply")
 	}
@@ -166,10 +173,10 @@ func TestAuthentication(t *testing.T) {
 	// An unknown MAC does not make an otherwise-open association trusted,
 	// but it is ignored for clients that do not require a key.
 	unknown := auth.Key{ID: 2, Secret: []byte("fedcba9876543210")}.Append(request(4))
-	if got := h.Handle(unknown, netip.MustParseAddr("192.0.2.200"), testWall, testMono.Add(3*time.Second)); len(got) != ntp.HeaderSize {
+	if got := h.Handle(unknown, from("192.0.2.200"), testWall, testMono.Add(3*time.Second)); len(got) != ntp.HeaderSize {
 		t.Fatalf("unknown optional MAC reply length %d", len(got))
 	}
-	if got := stats.Snapshot(); got.BadAuth != 2 || got.Served != 2 {
+	if got := stats.Snapshot().Total; got.BadAuth != 2 || got.Served != 2 {
 		t.Fatalf("stats %+v", got)
 	}
 }
@@ -183,7 +190,7 @@ func TestMostSpecificAuthenticationRuleWins(t *testing.T) {
 			netip.MustParsePrefix("192.0.2.0/25"): 2,
 		}
 	})
-	client := netip.MustParseAddr("192.0.2.10")
+	client := from("192.0.2.10")
 	if got := h.Handle(testKey.Append(request(4)), client, testWall, testMono); got != nil {
 		t.Fatal("less-specific key authenticated the client")
 	}
@@ -198,7 +205,7 @@ func TestRateLimitAndKoDThrottle(t *testing.T) {
 		c.RateBurst = 1
 		c.MinPoll = 5
 	})
-	client := netip.MustParseAddr("192.0.2.1")
+	client := from("192.0.2.1")
 	if got := h.Handle(request(4), client, testWall, testMono); len(got) != ntp.HeaderSize {
 		t.Fatal("first request should pass")
 	}
@@ -213,14 +220,13 @@ func TestRateLimitAndKoDThrottle(t *testing.T) {
 	if got := h.Handle(request(4), client, testWall, testMono.Add(time.Second)); len(got) != ntp.HeaderSize {
 		t.Fatal("refilled bucket should pass")
 	}
-	if got := stats.Snapshot(); got.Served != 2 || got.RateLimited != 2 {
+	if got := stats.Snapshot().Total; got.Served != 2 || got.RateLimited != 2 {
 		t.Fatalf("stats %+v", got)
 	}
 }
 
 func TestRateLimiterExpiryAndBound(t *testing.T) {
-	l := newRateLimiter(1, 1)
-	l.maxClients = 2
+	l := newRateLimiter(1, 1, 2)
 	a := netip.MustParseAddr("192.0.2.1")
 	b := netip.MustParseAddr("192.0.2.2")
 	c := netip.MustParseAddr("192.0.2.3")
@@ -254,7 +260,7 @@ func FuzzReplyNeverAmplifies(f *testing.F) {
 		default:
 			return
 		}
-		got := h.Handle(req, addr, testWall, testMono)
+		got := h.Handle(req, netip.AddrPortFrom(addr, 123), testWall, testMono)
 		if len(got) > len(req) {
 			t.Fatalf("amplified %d-byte request to %d bytes", len(req), len(got))
 		}

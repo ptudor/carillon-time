@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
-	"sync/atomic"
 	"time"
 
 	"carillon/internal/ntp"
@@ -40,6 +39,7 @@ type Config struct {
 
 	RateLimitPPS float64
 	RateBurst    float64
+	MaxClients   int
 	KoD          bool
 	MinPoll      int8
 
@@ -66,6 +66,11 @@ type Handler struct {
 	status     func() SystemStatus
 	now        func() time.Time
 	stats      *Stats
+
+	// publishedClients is this handler's last contribution to the shared
+	// client-count gauge, so several listeners of the same address family
+	// each add their own delta instead of overwriting one another.
+	publishedClients int64
 }
 
 // NewHandler validates cfg and returns a handler ready to receive packets.
@@ -80,6 +85,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if !(cfg.RateBurst >= 1) {
 		errs = append(errs, fmt.Errorf("server: rate burst %v must be at least one", cfg.RateBurst))
 	}
+	if cfg.MaxClients < 0 {
+		errs = append(errs, fmt.Errorf("server: max clients %d must not be negative", cfg.MaxClients))
+	}
 	if cfg.Status == nil {
 		errs = append(errs, errors.New("server: nil status provider"))
 	}
@@ -92,6 +100,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if cfg.MinPoll == 0 {
 		cfg.MinPoll = defaultMinPoll
 	}
+	if cfg.MaxClients == 0 {
+		cfg.MaxClients = defaultMaxClients
+	}
 	if cfg.Stats == nil {
 		cfg.Stats = &Stats{}
 	}
@@ -100,7 +111,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		allow:   maskedPrefixes(cfg.Allow),
 		deny:    maskedPrefixes(cfg.Deny),
 		keys:    cfg.Keys,
-		limiter: newRateLimiter(cfg.RateLimitPPS, cfg.RateBurst),
+		limiter: newRateLimiter(cfg.RateLimitPPS, cfg.RateBurst, cfg.MaxClients),
 		kod:     cfg.KoD,
 		minPoll: cfg.MinPoll,
 		status:  cfg.Status,
@@ -126,29 +137,61 @@ func maskedPrefixes(in []netip.Prefix) []netip.Prefix {
 	return out
 }
 
+// isClientRequest reports whether a decoded packet asks us for the time.
+//
+// NTPv1 predates a meaningful mode field and such clients commonly send mode
+// 0; ntpd answers those as client requests and so do we. Every other mode is
+// refused — in particular modes 6 and 7, the control and private modes that
+// every NTP amplification attack has been built on.
+func isClientRequest(p *ntp.Packet) bool {
+	return p.Mode == ntp.ModeClient || (p.Mode == ntp.ModeReserved && p.Version == 1)
+}
+
 // Handle validates request from client and returns its response, or nil when
 // the datagram must be dropped. receive is the kernel's CLOCK_REALTIME receive
 // timestamp; monotonicNow is used only for rate limiting and expiry.
 //
 // Every non-nil response is no longer than request. Extension fields are not
 // echoed; a verified AES-CMAC request receives a 68-byte authenticated reply.
-func (h *Handler) Handle(request []byte, client netip.Addr, receive, monotonicNow time.Time) []byte {
+// Every drop increments exactly one counter, so an operator can chart what was
+// refused as well as what was served.
+func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monotonicNow time.Time) []byte {
+	addr := client.Addr().Unmap()
+	c := h.stats.family(addr)
+
 	pkt, mac, macOffset, err := ntp.Decode(request)
-	if err != nil || pkt.Mode != ntp.ModeClient {
+	if err != nil {
+		if errors.Is(err, ntp.ErrVersion) {
+			c.badVersion.Add(1)
+		} else {
+			c.malformed.Add(1)
+		}
 		return nil
 	}
-	storeLatest(&h.stats.lastRequest, receive)
-	client = client.Unmap()
-	if !h.permitted(client) {
-		h.stats.denied.Add(1)
+	if !isClientRequest(&pkt) {
+		c.nonClient.Add(1)
+		c.modes[pkt.Mode&7].Add(1)
 		return nil
 	}
-	allowed, sendKoD := h.limiter.allow(client, monotonicNow)
+	if martianSource(client) {
+		c.martian.Add(1)
+		return nil
+	}
+	if !h.permitted(addr) {
+		c.denied.Add(1)
+		return nil
+	}
+	c.versions[pkt.Version].Add(1)
+	storeLatest(&c.lastRequest, receive)
+
+	allowed, sendKoD := h.limiter.allow(addr, monotonicNow)
+	h.publishClients(c)
 	if !allowed {
-		h.stats.rateLimited.Add(1)
+		c.rateLimited.Add(1)
 		if !h.kod || !sendKoD {
 			return nil
 		}
+		c.kod.Add(1)
 		return h.reply(&pkt, receive, h.status(), ntp.KissRATE, nil, true)
 	}
 
@@ -156,15 +199,15 @@ func (h *Handler) Handle(request []byte, client netip.Addr, receive, monotonicNo
 	if mac != nil && !mac.IsCryptoNAK() {
 		if key, known := h.keys[mac.KeyID]; known {
 			if !key.Verify(request[:macOffset], mac) {
-				h.stats.badAuth.Add(1)
+				c.badAuth.Add(1)
 				return nil
 			}
 			replyKey = &key
 		}
 	}
-	if required := h.requiredKey(client); required != 0 {
+	if required := h.requiredKey(addr); required != 0 {
 		if replyKey == nil || replyKey.ID != required {
-			h.stats.badAuth.Add(1)
+			c.badAuth.Add(1)
 			return nil
 		}
 	}
@@ -176,13 +219,24 @@ func (h *Handler) Handle(request []byte, client netip.Addr, receive, monotonicNo
 	}
 	response := h.reply(&pkt, receive, st, refID, replyKey, !st.Synced)
 	if response != nil {
-		h.stats.served.Add(1)
-		storeLatest(&h.stats.lastServed, receive)
+		c.served.Add(1)
+		storeLatest(&c.lastServed, receive)
 		if !st.Synced {
-			h.stats.unsynced.Add(1)
+			c.unsynced.Add(1)
 		}
 	}
 	return response
+}
+
+// publishClients folds this handler's rate-limit table size into the shared
+// gauge. It runs on the listener goroutine, so publishedClients needs no
+// synchronization of its own.
+func (h *Handler) publishClients(c *counters) {
+	n := int64(h.limiter.size())
+	if delta := n - h.publishedClients; delta != 0 {
+		c.clients.Add(delta)
+		h.publishedClients = n
+	}
 }
 
 func (h *Handler) permitted(addr netip.Addr) bool {
@@ -246,62 +300,4 @@ func (h *Handler) reply(req *ntp.Packet, receive time.Time, st SystemStatus, ref
 		out = key.Append(out)
 	}
 	return out
-}
-
-// Stats contains lock-free counters shared by all listeners.
-type Stats struct {
-	served          atomic.Uint64
-	denied          atomic.Uint64
-	rateLimited     atomic.Uint64
-	badAuth         atomic.Uint64
-	unsynced        atomic.Uint64
-	missingKernelTS atomic.Uint64
-	lastRequest     atomic.Int64
-	lastServed      atomic.Int64
-}
-
-// StatsSnapshot is a consistent-enough operational view of the independent
-// monotonic counters. Exact cross-field simultaneity is not required.
-type StatsSnapshot struct {
-	Served      uint64    `json:"served"`
-	Denied      uint64    `json:"denied"`
-	RateLimited uint64    `json:"ratelimited"`
-	BadAuth     uint64    `json:"badauth"`
-	Unsynced    uint64    `json:"unsynced"`
-	NoKernelTS  uint64    `json:"no_kernel_timestamp"`
-	LastRequest time.Time `json:"last_request,omitempty"`
-	LastServed  time.Time `json:"last_served,omitempty"`
-}
-
-// Snapshot returns the current counters.
-func (s *Stats) Snapshot() StatsSnapshot {
-	if s == nil {
-		return StatsSnapshot{}
-	}
-	return StatsSnapshot{
-		Served:      s.served.Load(),
-		Denied:      s.denied.Load(),
-		RateLimited: s.rateLimited.Load(),
-		BadAuth:     s.badAuth.Load(),
-		Unsynced:    s.unsynced.Load(),
-		NoKernelTS:  s.missingKernelTS.Load(),
-		LastRequest: atomicTime(s.lastRequest.Load()),
-		LastServed:  atomicTime(s.lastServed.Load()),
-	}
-}
-
-func atomicTime(ns int64) time.Time {
-	if ns == 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, ns).UTC()
-}
-
-func storeLatest(dst *atomic.Int64, t time.Time) {
-	ns := t.UnixNano()
-	for old := dst.Load(); ns > old; old = dst.Load() {
-		if dst.CompareAndSwap(old, ns) {
-			return
-		}
-	}
 }

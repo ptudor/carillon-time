@@ -4,6 +4,7 @@ package server
 
 import (
 	"fmt"
+	"net/netip"
 	"syscall"
 	"unsafe"
 
@@ -28,20 +29,25 @@ func enablePacketInfo(raw syscall.RawConn, network string) error {
 	return nil
 }
 
-func sourceControl(oob []byte, network string) []byte {
+// destination returns the address the client addressed the request to and the
+// control message that sends the reply back from it, so a multi-homed host
+// answers on the address it was asked on. An invalid address means the kernel
+// reported none and must choose the reply's source itself.
+func destination(oob []byte, network string) (netip.Addr, []byte) {
 	msgs, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {
-		return nil
+		return netip.Addr{}, nil
 	}
 	for _, m := range msgs {
 		if network == "udp4" && m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_RECVDSTADDR && len(m.Data) >= 4 {
-			return marshalControl(unix.IPPROTO_IP, unix.IP_SENDSRCADDR, m.Data[:4])
+			return netip.AddrFrom4([4]byte(m.Data[:4])), marshalControl(unix.IPPROTO_IP, unix.IP_SENDSRCADDR, m.Data[:4])
 		}
 		if network == "udp6" && m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_PKTINFO && len(m.Data) >= unix.SizeofInet6Pktinfo {
-			return marshalControl(unix.IPPROTO_IPV6, unix.IPV6_PKTINFO, m.Data[:unix.SizeofInet6Pktinfo])
+			got := *(*unix.Inet6Pktinfo)(unsafe.Pointer(&m.Data[0]))
+			return netip.AddrFrom16(got.Addr), marshalControl(unix.IPPROTO_IPV6, unix.IPV6_PKTINFO, m.Data[:unix.SizeofInet6Pktinfo])
 		}
 	}
-	return nil
+	return netip.Addr{}, nil
 }
 
 func marshalControl(level, typ int, data []byte) []byte {
