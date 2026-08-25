@@ -204,6 +204,14 @@ iburst  = true
 
 #[stats]
 #dir = "/var/db/carillon/stats"  # Linux: /var/lib/carillon/stats
+#
+# loop.YYYY-MM-DD.tsv     one row per discipline update
+# sources.YYYY-MM-DD.tsv  one row per source per update
+# pps.YYYY-MM-DD.tsv      one row per accepted pulse
+# server.YYYY-MM-DD.tsv   one row per address family per minute, when the
+#                         listener is enabled. The counters are cumulative
+#                         since startup, so take differences between rows; a
+#                         value that drops is a restart, not negative traffic.
 
 # --- Discipline -------------------------------------------------------------
 [discipline]
