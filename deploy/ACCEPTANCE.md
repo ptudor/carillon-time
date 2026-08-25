@@ -145,6 +145,52 @@ Watch during the soak:
 Rollback: reinstall the `.prev` binaries, restore `carillon.toml.prev` on
 `twocom`, restart.
 
+## Public-server hardening and observability — 2026-08-25 (UTC)
+
+Deployed `1410eae` to both hosts, replacing `eb89ae4` (19 commits behind).
+Binaries installed by rename-over-in-place, since neither Linux nor FreeBSD
+will let a running executable be written; `.prev` copies kept on both.
+
+`[monitor]` and `[stats]` were enabled at the same time. Neither host had
+them, so none of the new per-family metrics or the daily `server.tsv` had
+anywhere to go — the hardening was deployed but unobservable. Both now bind
+the monitoring listener on `127.0.0.1:9123` with the default loopback ACL,
+and write statistics to `/var/lib/carillon/stats` (`gummi`) and
+`/var/db/carillon/stats` (`twocom`).
+
+Confirmed on both:
+
+- `carillon -check` passes; `gummi` reports no public-ACL warning (its allow
+  list is `172.19.0.0/16` plus a delegated `/64`), `twocom` reports all three
+  (`2000::/3`, `rate_limit_pps 8`, `recv_buffer` unset).
+- Effective `SO_RCVBUF` logged at startup: 212992 on Linux, 42080 on FreeBSD
+  — both the kernel default, matching what the example config documents.
+- `/healthz` 200 once synced, 503 while settling. `/metrics` carries the
+  per-family series. `server.YYYY-MM-DD.tsv` gets two rows a minute.
+- Topology restored: `gummi` synced at stratum 3 off the Fedora pool,
+  `twocom` at stratum 4 with `gummi` as system source, +129.8 us, no steps.
+
+Live counter proof, `gummi` to `twocom` over the LAN: six deliberately bad
+datagrams (modes 6, 7 and 4; versions 5 and 0; a 10-byte runt) produced
+exactly `non-client mode 3` (`server=1 control=1 private=1`), `bad version 2`
+and `malformed 1`, with `Served` untouched. Before this release all six were
+silent drops. `/metrics` agreed with `carillonctl serverstats` field for
+field.
+
+Note: `gummi` sat in `settling` for over eight minutes after the first
+restart with only two loop updates. That is the RFC 5905 clock filter holding
+an early low-delay sample, not a fault — the same host averaged one update
+per 18 minutes over its previous 20-hour run. The second restart cleared it
+in under two minutes.
+
+Outstanding, needs an operator decision: `twocom` serves `2000::/3` with
+`rate_limit_pps = 8` and no `recv_buffer`, which is 64x more permissive than
+chrony's default and the kernel's own 41 KB of headroom. See the public
+`[serve]` block in `carillon.toml.example`.
+
+Rollback: reinstall the `.prev` binaries, restore `carillon.toml.prev` on
+both hosts, restart.
+
 ## Repeatable checklist
 
 On each host:
