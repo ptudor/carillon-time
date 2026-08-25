@@ -16,9 +16,27 @@ import (
 	"time"
 
 	"carillon/internal/engine"
+	"carillon/internal/ntp"
+	ntpserver "carillon/internal/server"
 )
 
 const queueSize = 256
+
+// Config configures a Recorder.
+type Config struct {
+	// Dir is an already-validated directory for the daily files.
+	Dir string
+
+	// Server, when set, adds one server.YYYY-MM-DD.tsv row per address
+	// family per minute. It is nil when the NTP listener is disabled.
+	Server func() ntpserver.StatsSnapshot
+
+	// Now reads the wall clock for the server rows. The loop and source
+	// rows are timestamped from the engine snapshot instead.
+	Now func() time.Time
+
+	Log *slog.Logger
+}
 
 type dailyFile struct {
 	day string
@@ -30,9 +48,11 @@ type dailyFile struct {
 // caller. A full queue drops snapshots rather than delaying clock discipline;
 // the writer logs the cumulative drop count on its next flush tick.
 type Recorder struct {
-	dir string
-	log *slog.Logger
-	ch  chan *engine.Status
+	dir    string
+	log    *slog.Logger
+	server func() ntpserver.StatsSnapshot
+	now    func() time.Time
+	ch     chan *engine.Status
 
 	dropped atomic.Uint64
 	files   map[string]*dailyFile
@@ -43,12 +63,16 @@ type Recorder struct {
 }
 
 // New returns a recorder for an already-validated directory.
-func New(dir string, log *slog.Logger) *Recorder {
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
+func New(cfg Config) *Recorder {
+	if cfg.Log == nil {
+		cfg.Log = slog.New(slog.DiscardHandler)
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 	return &Recorder{
-		dir: dir, log: log, ch: make(chan *engine.Status, queueSize),
+		dir: cfg.Dir, log: cfg.Log, server: cfg.Server, now: cfg.Now,
+		ch:    make(chan *engine.Status, queueSize),
 		files: make(map[string]*dailyFile), lastPulse: make(map[string]time.Time),
 	}
 }
@@ -76,6 +100,7 @@ func (r *Recorder) Run(ctx context.Context) {
 		case st := <-r.ch:
 			r.processAndReport(st)
 		case <-flush.C:
+			r.recordServerAndReport()
 			r.flushAndReport()
 			r.reportDrops()
 		case <-ctx.Done():
@@ -84,6 +109,7 @@ func (r *Recorder) Run(ctx context.Context) {
 				case st := <-r.ch:
 					r.processAndReport(st)
 				default:
+					r.recordServerAndReport()
 					r.flushAndReport()
 					r.reportDrops()
 					_ = r.closeFiles()
@@ -127,6 +153,50 @@ func (r *Recorder) process(st *engine.Status) error {
 			return err
 		}
 		r.lastPulse[name] = ref.LastPulse
+	}
+	return nil
+}
+
+func (r *Recorder) recordServerAndReport() {
+	if err := r.recordServer(); err != nil {
+		r.reportError(err)
+		_ = r.closeFiles()
+	}
+}
+
+// serverHeader names every column of server.YYYY-MM-DD.tsv. The counters are
+// cumulative since the daemon started, so a reader takes differences between
+// consecutive rows; a value that drops is a restart, not negative traffic.
+const serverHeader = "time\tfamily\tserved\tunsynced\tkod\tdenied\tmartian\tratelimited\tbadauth\t" +
+	"badversion\tnonclient\tmalformed\toversize\tno_kernel_timestamp\tkernel_drops\tclients\t" +
+	"mode_control\tmode_private\tv1\tv2\tv3\tv4\n"
+
+// recordServer appends one row per address family. Splitting them is what
+// makes the file useful: the NTP pool scores IPv4 and IPv6 separately, and a
+// v6-only outage does not move a combined total.
+func (r *Recorder) recordServer() error {
+	if r.server == nil {
+		return nil
+	}
+	snapshot := r.server()
+	at := r.now().UTC()
+	for _, family := range []struct {
+		name     string
+		counters ntpserver.CounterSnapshot
+	}{{"ipv4", snapshot.IPv4}, {"ipv6", snapshot.IPv6}} {
+		c := family.counters
+		fields := []string{
+			at.Format(time.RFC3339Nano), family.name,
+			count(c.Served), count(c.Unsynced), count(c.KoD),
+			count(c.Denied), count(c.Martian), count(c.RateLimited), count(c.BadAuth),
+			count(c.BadVersion), count(c.NonClient), count(c.Malformed), count(c.Oversize),
+			count(c.NoKernelTS), count(c.KernelDrops), strconv.FormatInt(c.Clients, 10),
+			count(c.Modes[ntp.ModeControl]), count(c.Modes[ntp.ModePrivate]),
+			count(c.Versions[1]), count(c.Versions[2]), count(c.Versions[3]), count(c.Versions[4]),
+		}
+		if err := r.write("server", at, serverHeader, strings.Join(fields, "\t")+"\n"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -264,6 +334,8 @@ func (r *Recorder) reportDrops() {
 }
 
 func number(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
+
+func count(v uint64) string { return strconv.FormatUint(v, 10) }
 
 func escape(v string) string {
 	r := strings.NewReplacer("\\", "\\\\", "\t", "\\t", "\r", "\\r", "\n", "\\n")

@@ -235,10 +235,19 @@ func runDaemon(args []string) int {
 		})
 	}
 
+	// The listener counters are created before the recorder so the daily
+	// statistics can include server traffic, and before the listener itself
+	// so a bind failure cannot leave the recorder pointing at nothing.
+	serverStats := &ntpserver.Stats{}
+
 	var statsRecorder *stats.Recorder
 	var observe func(*engine.Status)
 	if cfg.Stats.Enabled() {
-		statsRecorder = stats.New(cfg.Stats.Dir, log)
+		scfg := stats.Config{Dir: cfg.Stats.Dir, Now: clk.Now, Log: log}
+		if cfg.Serve.Enabled() {
+			scfg.Server = serverStats.Snapshot
+		}
+		statsRecorder = stats.New(scfg)
 		observe = statsRecorder.Record
 	}
 
@@ -268,7 +277,6 @@ func runDaemon(args []string) int {
 		return exitRuntime
 	}
 
-	serverStats := &ntpserver.Stats{}
 	var timeServer *ntpserver.Service
 	if cfg.Serve.Enabled() {
 		allow, deny, require := cfg.ServePrefixes()
