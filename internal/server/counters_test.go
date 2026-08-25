@@ -150,3 +150,28 @@ func modeVersion(b []byte, version uint8) []byte {
 	out[0] = out[0]&^0x38 | (version&0x7)<<3
 	return out
 }
+
+// TestOverflowDelta covers the arithmetic behind the kernel drop counter.
+// The kernel's own counter is cumulative and 32 bits wide.
+func TestOverflowDelta(t *testing.T) {
+	tests := []struct {
+		name     string
+		previous uint32
+		seen     bool
+		current  uint32
+		want     uint64
+	}{
+		{"first reading is taken whole", 0, false, 12, 12},
+		{"first reading of a quiet socket", 0, false, 0, 0},
+		{"no new drops", 40, true, 40, 0},
+		{"steady drops", 40, true, 57, 17},
+		{"counter wrapped", 0xffffffff - 2, true, 5, 8},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := overflowDelta(tc.previous, tc.seen, tc.current); got != tc.want {
+				t.Fatalf("delta %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
