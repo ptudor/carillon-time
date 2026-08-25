@@ -690,6 +690,8 @@ deny           = []
 require_key    = { "203.0.113.7/32" = 1 }          # prefix → key id: MAC mandatory from these
 rate_limit_pps = 8                                  # per client address, token bucket
 rate_burst     = 16
+max_clients    = 65536                              # rate-limit table bound, LRU eviction
+recv_buffer    = 0                                  # SO_RCVBUF bytes; 0 = kernel default
 kod            = true                               # send RATE KoD when limiting
 ```
 
@@ -700,31 +702,78 @@ request arrived on (`IP_PKTINFO` / FreeBSD `IP_SENDSRCADDR`, `IPV6_PKTINFO`).
 The server is not a client: it never sends anything except a reply to a
 request it received.
 
+`recv_buffer` sets `SO_RCVBUF` on each socket. The kernel default is a few
+hundred packets of headroom (≈208 KB on Linux, ≈42 KB on FreeBSD), which a
+busy public server outruns in a burst; the kernel clamps the request to
+`net.core.rmem_max` or `kern.ipc.maxsockbuf`, so the size actually granted is
+read back and logged. Linux is additionally asked for `SO_RXQ_OVFL`, whose
+per-datagram cumulative counter of receive-queue overflows is folded into
+`kernel_drops` (§10.4) — without it a server that cannot keep up is
+indistinguishable from a quiet one. FreeBSD has no per-socket equivalent;
+its drops appear only in `netstat -sp udp`.
+
+**Serving the public internet.** An operator who joins the NTP pool writes
+`allow = ["0.0.0.0/0", "2000::/3"]`, which makes the ACL match every forged
+and unroutable source address too. Startup and `-check` therefore say so,
+naming the prefixes that reach beyond private address space, and repeat the
+warning for `rate_limit_pps` and `recv_buffer` while they hold their LAN
+defaults. The defaults themselves are unchanged: 8 pps per client is right
+for a two-host topology and roughly 64× more permissive than chrony's
+`ratelimit interval 3 burst 8` for a public one.
+
 ### 7.2 Request handling
 
-For each datagram:
+For each datagram, in this order. **Every drop increments exactly one
+counter**, so the outcome counters partition received traffic and a chart of
+good against bad traffic adds up (§10.4):
 
-1. Length ≥ 48. Modes other than 3 (client) are dropped silently — including
-   1, 2, 5, 6, 7. Version 1–4 accepted; the reply carries the request's
-   version.
-2. ACL: `deny` first, then `allow`; no match → drop, count `denied`.
-3. Rate limit per source address (token bucket, `rate_limit_pps`/
-   `rate_burst`, entries expire after 60 s idle, table capped at 65 536
-   addresses with LRU eviction). Over limit → if `kod`, reply with stratum 0,
-   refid `RATE`, poll = our suggested minimum, LI=3, at most once per 4 s per
-   client; else drop.
-4. Authentication: if the request carries a MAC and the key id is known,
-   verify; a bad MAC → drop, count `badauth`. If the source matches
+1. Size. Truncated (`MSG_TRUNC`) or larger than 1500 bytes → drop, count
+   `oversize`.
+2. Destination. A request addressed to a broadcast or multicast group would
+   need an illegal source address on the reply, and one datagram sent to a
+   directed broadcast would ask every host on the subnet to answer at once →
+   drop, count `martian`.
+3. Decode. Shorter than 48 bytes, or a malformed extension field or MAC
+   trailer → drop, count `malformed`. Version 0 or above 4 → drop, count
+   `bad_version`; versions 1–4 are accepted and the reply carries the
+   request's version.
+4. Mode. Only mode 3 (client) is answered, plus mode 0 from a version 1
+   client — NTPv1 predates a meaningful mode field and ntpd answers those
+   too. Everything else → drop, count `non_client`, and separately by mode,
+   so the modes 6 and 7 that carry every NTP amplification attack are visible
+   as a scan rather than as silence.
+5. Source address. Unspecified, `0.0.0.0/8`, multicast, the limited
+   broadcast address, or a source port of zero → drop, count `martian`. This
+   check is independent of the ACL and cannot be configured away, because on
+   a public server the ACL matches these too. Loopback sources are served: a
+   host queries its own server over `127.0.0.1`, and the kernel already drops
+   loopback-sourced packets arriving on a real interface.
+6. ACL: `deny` first, then `allow`; no match → drop, count `denied`.
+7. Rate limit per source address (token bucket, `rate_limit_pps`/
+   `rate_burst`, entries expire after 60 s idle, table bounded by
+   `max_clients` with LRU eviction). Over limit → count `rate_limited`, and
+   if `kod`, reply with stratum 0, refid `RATE`, poll = our suggested
+   minimum, LI=3, at most once per 4 s per client, counted as `kod`; else
+   drop. Under a flood of forged source addresses LRU eviction keeps the
+   heavy hitters tracked and discards the one-shot tail, which is the right
+   way round.
+8. Authentication: if the request carries a MAC and the key id is known,
+   verify; a bad MAC → drop, count `bad_auth`. If the source matches
    `require_key` and the request has no valid MAC with *that* key → drop.
    A valid MAC on the request produces a MAC on the reply with the same key.
-5. Build the reply (§7.3). Its length is exactly the request's: 48 bytes, or
-   48 + 20 when the request carried a MAC that verified. Extension fields in
-   the request are never echoed, so a reply is never longer than what was
-   received.
-6. Transmit timestamp is read immediately before `sendmsg`.
+9. Build the reply (§7.3), count `served`. Its length is exactly the
+   request's: 48 bytes, or 48 + 20 when the request carried a MAC that
+   verified. Extension fields in the request are never echoed, so a reply is
+   never longer than what was received — a property fuzzed over arbitrary
+   request bytes and arbitrary source addresses.
+10. Transmit timestamp is read immediately before `sendmsg`.
 
 Extension fields in requests are ignored (skipped to find a trailing MAC per
 RFC 7822 framing) and never echoed.
+
+Counters are kept per address family. The NTP pool scores IPv4 and IPv6 as
+two independent monitors, and a v6-only outage does not move a combined
+total.
 
 ### 7.3 Server variables
 
@@ -882,11 +931,13 @@ address = "1.pool.ntp.org"
 name    = "pool-c"
 address = "2.pool.ntp.org"
 
-[serve]
+[serve]                                             # public: see §7.1
 listen         = ["0.0.0.0:123", "[::]:123"]
-allow          = ["0.0.0.0/0", "::/0"]
-rate_limit_pps = 4
+allow          = ["0.0.0.0/0", "2000::/3", "127.0.0.0/8", "::1/128"]
+rate_limit_pps = 0.25
 rate_burst     = 8
+max_clients    = 262144
+recv_buffer    = 4194304
 
 [discipline]
 min_survivors = 1
@@ -904,7 +955,9 @@ first config above with the `gps` block replaced by a `pps` block and a
 
 `carillon -check` validates the file, resolves nothing over the network, checks
 device existence and permissions, keys-file mode, `pps_mode` on FreeBSD, and
-warns about the stratum-1-without-leapfile case.
+warns about the stratum-1-without-leapfile case and about an ACL that reaches
+past private address space while `rate_limit_pps` and `recv_buffer` still hold
+their LAN defaults.
 
 ---
 
@@ -928,7 +981,11 @@ Unix socket, newline-delimited JSON request/response, `0660`. Commands:
   (`falseticker`/`survivor`/`system`/`noselect`/`unreachable`), prefer.
 - `refclock` — PPS window σ, locked, qualified, sequence gaps, pulse
   interval σ, measured NMEA lag, fix status, satellites.
-- `serverstats` — served/denied/ratelimited/badauth/unsynced counters.
+- `serverstats` — the §7.2 outcome counters with their totals and an `ipv4`
+  and `ipv6` object beside them, the mode and version histograms, the
+  distinct-client gauge, and kernel receive drops. `carillonctl` prints one
+  total/ipv4/ipv6 column set with each refusal reason indented under the
+  total it contributes to.
 - `waitsync [seconds]` — block until SYNCED or timeout; exit status for init.
 
 `carillonctl` prints these as aligned tables; `-json` passes the raw reply through.
@@ -997,23 +1054,46 @@ The `/metrics` endpoint exports:
 `carillon_source_selected{source}`, `carillon_source_events_total{source,result}`,
 `carillon_pps_samples_total{source,result=ok|timeout|spike|gap|glitch}`,
 `carillon_pps_jitter_seconds{source}`, `carillon_pps_locked{source}`,
-`carillon_server_requests_total{result}`, `carillon_server_last_request_timestamp_seconds`,
-`carillon_server_last_served_timestamp_seconds`, `carillon_server_enabled`,
-`carillon_source_receive_timestamp_seconds{source}`,
-`carillon_source_kernel_timestamp_missing_total{source}`,
-`carillon_server_kernel_timestamp_missing_total`, `carillon_leap_pending`,
+`carillon_server_enabled`, `carillon_source_receive_timestamp_seconds{source}`,
+`carillon_source_kernel_timestamp_missing_total{source}`, `carillon_leap_pending`,
 `carillon_leapfile_expiry_timestamp_seconds`, `carillon_leapfile_valid`,
 `carillon_gps_fix_valid{source}`, `carillon_gps_satellites{source}`,
 `carillon_gps_nmea_lag_seconds{source}`, and `carillon_build_info{version}`.
 Labels come only from configured source names
 or fixed finite enums; operator roles are deliberately not metric labels.
 
+Server traffic is exported per address family, `family="ipv4"|"ipv6"`:
+
+| Metric | Meaning |
+|---|---|
+| `carillon_server_requests_total{family,result}` | every datagram read, partitioned by outcome: `served`, `denied`, `martian`, `rate_limited`, `bad_auth`, `bad_version`, `non_client`, `malformed`, `oversize` |
+| `carillon_server_unsynced_replies_total{family}` | subset of `result="served"`: answered with LI=3 |
+| `carillon_server_kod_replies_total{family}` | subset of `result="rate_limited"`: RATE kisses sent |
+| `carillon_server_refused_mode_total{family,mode}` | refusals broken out by NTP mode; `mode="control"` and `mode="private"` are amplification probes |
+| `carillon_server_client_version_total{family,version}` | accepted requests by client protocol version |
+| `carillon_server_clients{family}` | distinct clients in the rate-limit table, which expires entries after a minute |
+| `carillon_server_kernel_drops_total{family}` | receive-queue overflows (Linux `SO_RXQ_OVFL`; always 0 on FreeBSD) |
+| `carillon_server_kernel_timestamp_missing_total{family}` | requests received without a kernel timestamp |
+| `carillon_server_last_request_timestamp_seconds{family}` | last valid client request |
+| `carillon_server_last_served_timestamp_seconds{family}` | last reply sent |
+
+The `result` label is a partition, so summing over it gives total received
+traffic with nothing double counted. The two subset counters are deliberately
+separate metrics rather than extra `result` values, which would break that
+sum. `sum by (result) (rate(carillon_server_requests_total[5m]))` is the
+good-against-bad traffic chart.
+
 ### 10.5 Files
 
 - **Drift file:** one line, frequency in ppm, written atomically (temp +
   rename) every hour and at shutdown, read at start. Same format as chrony's.
 - **Statistics** (optional, `[stats] dir`): `loop.tsv` (per update: time, θ,
-  freq, ψ, poll, state), `pps.tsv` (per accepted pulse: time, θ), `sources.tsv`.
+  freq, ψ, poll, state), `pps.tsv` (per accepted pulse: time, θ),
+  `sources.tsv`, and `server.tsv` (one row per address family per minute
+  while the listener is enabled, carrying every counter of §10.4 plus the
+  mode 6 and 7 probe counts and the version histogram; values are cumulative
+  since startup, so a reader takes differences and treats a drop as a
+  restart).
   A new file per UTC day (`loop.2026-08-23.tsv`); buffered, flushed each
   minute and on exit. Snapshot delivery to the writer is bounded and
   non-blocking: a stalled disk drops and counts statistics snapshots rather
@@ -1271,6 +1351,25 @@ fit for Linux and FreeBSD servers but its static binary and runtime footprint
 are too large for the intended routers. Keeping the router implementation in
 C also lets its packaging, privilege model, and hardware acceptance remain
 specific to constrained OpenWrt targets instead of distorting this daemon.
+
+**D14 — Martian filtering is not configurable.** D6 makes the ACL the way an
+operator says who may be served, but the moment that answer is "the internet"
+the ACL stops being a filter: `0.0.0.0/0` matches `0.0.0.0`, `224.0.0.1` and
+`255.255.255.255` as readily as a real client. Those datagrams can only be
+forged, and answering one turns a single spoofed packet into a packet aimed
+at a multicast group. ntpd and chrony both drop them regardless of their own
+access rules, and there is no configuration that would make answering them
+correct — so there is no knob. Loopback is the deliberate exception, since a
+host legitimately queries its own server and the kernel already refuses
+loopback-sourced packets from a real interface.
+
+**D15 — Every drop is counted, and the outcome counters partition the
+traffic.** Silent drops were the original design and they made the most
+interesting traffic invisible: an operator could not distinguish a mode 6
+amplification scan from an idle hour. Counting is nearly free, and making the
+outcomes mutually exclusive — with `unsynced` and `kod` as separate metrics
+rather than extra `result` values — is what lets a stacked chart of good
+against bad traffic add up to what the socket actually received.
 
 ---
 
