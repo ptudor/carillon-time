@@ -45,6 +45,11 @@ type udpListener struct {
 	handler    *Handler
 	log        *slog.Logger
 	recvBuffer int
+
+	// overflow is the last value of the kernel's cumulative drop counter for
+	// this socket, owned by the serve goroutine.
+	overflow     uint32
+	haveOverflow bool
 }
 
 // Listen opens every configured socket and prepares its receive timestamp and
@@ -94,6 +99,12 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 	}
 	if err := enablePacketInfo(raw, network); err != nil {
 		return fail("server: listen %s: destination address capture: %w", addr, err)
+	}
+	if err := enableOverflowReporting(raw); err != nil {
+		// A diagnostic, not a requirement: keep serving time and say which
+		// metric will stay at zero.
+		log.Warn("kernel receive-overflow reporting unavailable; carillon_server_kernel_drops_total will not count",
+			"listen", addr, "error", err)
 	}
 	if recvBuffer > 0 {
 		if err := conn.SetReadBuffer(recvBuffer); err != nil {
@@ -188,6 +199,7 @@ func (l *udpListener) serve(ctx context.Context) error {
 			return fmt.Errorf("server: receive on %s: %w", l.addr, err)
 		}
 		c := l.handler.stats.family(from.Addr())
+		l.recordOverflow(c, oob[:oobn])
 		if flags&syscall.MSG_TRUNC != 0 || n > ntp.MaxPacketSize {
 			c.oversize.Add(1)
 			continue
@@ -218,4 +230,29 @@ func (l *udpListener) serve(ctx context.Context) error {
 			l.log.Debug("send failed", "client", from, "error", err)
 		}
 	}
+}
+
+// recordOverflow folds the kernel's cumulative socket drop counter into the
+// stats as a delta. The kernel counter is 32 bits and wraps, which unsigned
+// subtraction handles; the first reading is taken whole, because anything it
+// already counted was dropped by this socket.
+func (l *udpListener) recordOverflow(c *counters, oob []byte) {
+	got, ok := parseOverflow(oob)
+	if !ok {
+		return
+	}
+	if delta := overflowDelta(l.overflow, l.haveOverflow, got); delta != 0 {
+		c.kernelDrops.Add(delta)
+	}
+	l.overflow, l.haveOverflow = got, true
+}
+
+// overflowDelta returns how many newly dropped datagrams a reading of the
+// kernel's cumulative counter represents. The counter is 32 bits and wraps,
+// which unsigned subtraction handles.
+func overflowDelta(previous uint32, seen bool, current uint32) uint64 {
+	if !seen {
+		return uint64(current)
+	}
+	return uint64(current - previous)
 }

@@ -108,7 +108,7 @@ func newCollector(snapshot func() Snapshot) *collector {
 		serverModes:       desc("carillon_server_refused_mode_total", "Refused datagrams by NTP association mode; modes 6 and 7 are amplification probes.", "family", "mode"),
 		serverVersions:    desc("carillon_server_client_version_total", "Accepted client requests by NTP protocol version.", "family", "version"),
 		serverClients:     desc("carillon_server_clients", "Distinct clients in the rate-limit table, which expires entries after one minute.", "family"),
-		serverKernelDrops: desc("carillon_server_kernel_drops_total", "Datagrams the kernel dropped because the socket receive queue was full.", "family"),
+		serverKernelDrops: desc("carillon_server_kernel_drops_total", "Datagrams the kernel dropped because the socket receive queue was full; Linux only, FreeBSD reports no per-socket count.", "family"),
 		serverLastRequest: desc("carillon_server_last_request_timestamp_seconds", "Unix timestamp of the last valid NTP client request.", "family"),
 		serverLastServed:  desc("carillon_server_last_served_timestamp_seconds", "Unix timestamp of the last NTP response served.", "family"),
 		serverNoKernelTS:  desc("carillon_server_kernel_timestamp_missing_total", "NTP requests received without a kernel timestamp.", "family"),

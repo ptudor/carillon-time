@@ -165,9 +165,10 @@ iburst  = true
 #                  outruns that in a burst, and the loss is invisible except
 #                  as clients that never got an answer. The kernel clamps the
 #                  request to net.core.rmem_max (Linux) or kern.ipc.maxsockbuf
-#                  (FreeBSD); the size actually granted is logged at startup,
-#                  and carillon_server_kernel_drops_total counts what was
-#                  lost anyway.
+#                  (FreeBSD); the size actually granted is logged at startup.
+#                  On Linux carillon_server_kernel_drops_total counts what was
+#                  lost anyway; FreeBSD has no per-socket count, so watch
+#                  netstat -sp udp there instead.
 #
 #[serve]
 #listen         = ["0.0.0.0:123", "[::]:123"]
