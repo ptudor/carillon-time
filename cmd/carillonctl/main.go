@@ -25,7 +25,6 @@ import (
 
 	"carillon/internal/config"
 	"carillon/internal/control"
-	"carillon/internal/ntp"
 )
 
 func main() {
@@ -151,27 +150,24 @@ func printServerStats(s *control.ServerStats) {
 	// not stretch the counter columns.
 	detail := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	defer detail.Flush()
-	fmt.Fprintf(detail, "Client versions\t%s\n", histogram(s.Versions, func(i int) string {
-		return "v" + strconv.Itoa(i)
-	}))
-	fmt.Fprintf(detail, "Refused modes\t%s\n", histogram(s.Modes, func(i int) string {
-		return ntp.Mode(i).String()
-	}))
-	if !s.LastRequest.IsZero() {
+	fmt.Fprintf(detail, "Client versions\t%s\n", histogram(s.Versions, control.VersionOrder, "v"))
+	fmt.Fprintf(detail, "Refused modes\t%s\n", histogram(s.Modes, control.ModeOrder, ""))
+	if s.LastRequest != nil {
 		fmt.Fprintf(detail, "Last request\t%s\n", s.LastRequest.UTC().Format(time.RFC3339Nano))
 	}
-	if !s.LastServed.IsZero() {
+	if s.LastServed != nil {
 		fmt.Fprintf(detail, "Last served\t%s\n", s.LastServed.UTC().Format(time.RFC3339Nano))
 	}
 }
 
-// histogram renders the non-zero buckets of a counter array, so a quiet
-// server shows a short line instead of a row of zeros.
-func histogram(values []uint64, name func(int) string) string {
-	var parts []string
-	for i, v := range values {
-		if v != 0 {
-			parts = append(parts, fmt.Sprintf("%s=%d", name(i), v))
+// histogram renders a counter map in the given order, skipping buckets that
+// were never used so a quiet server shows a short line instead of a row of
+// zeros. prefix decorates each key, so versions read as "v4" rather than "4".
+func histogram(counts map[string]uint64, order []string, prefix string) string {
+	parts := make([]string, 0, len(counts))
+	for _, key := range order {
+		if v := counts[key]; v != 0 {
+			parts = append(parts, fmt.Sprintf("%s%s=%d", prefix, key, v))
 		}
 	}
 	if len(parts) == 0 {

@@ -6,10 +6,12 @@ package control
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"carillon/internal/discipline"
 	"carillon/internal/engine"
+	"carillon/internal/ntp"
 	ntpserver "carillon/internal/server"
 )
 
@@ -100,15 +102,26 @@ type CounterStats struct {
 	KernelDrops uint64 `json:"kernel_drops"`
 	Clients     int64  `json:"clients"`
 
-	// Modes counts refused datagrams by NTP mode; Versions counts accepted
-	// requests by client protocol version. Both are indexed by the field's
-	// own value, so Modes[6] is the control mode and Versions[4] is NTPv4.
-	Modes    []uint64 `json:"modes"`
-	Versions []uint64 `json:"versions"`
+	// Modes counts refused datagrams by NTP mode name ("control", "private");
+	// Versions counts accepted requests by protocol version ("3", "4"). Only
+	// non-zero buckets appear, so a quiet server carries neither field.
+	Modes    map[string]uint64 `json:"modes,omitempty"`
+	Versions map[string]uint64 `json:"versions,omitempty"`
 
-	LastRequest time.Time `json:"last_request,omitempty"`
-	LastServed  time.Time `json:"last_served,omitempty"`
+	// LastRequest and LastServed are nil when nothing has arrived or been
+	// answered yet. They are pointers because encoding/json cannot omit a
+	// zero time.Time, and a client charting these must see the field absent
+	// rather than the year 1.
+	LastRequest *time.Time `json:"last_request,omitempty"`
+	LastServed  *time.Time `json:"last_served,omitempty"`
 }
+
+// ModeOrder and VersionOrder list the histogram keys in their natural order,
+// for callers that render them.
+var (
+	ModeOrder    = []string{"reserved", "symmetric-active", "symmetric-passive", "server", "broadcast", "control", "private"}
+	VersionOrder = []string{"1", "2", "3", "4"}
+)
 
 // Requests returns every datagram accounted for by this snapshot.
 func (c *CounterStats) Requests() uint64 { return c.Served + c.Dropped() }
@@ -138,15 +151,42 @@ func ServerStatsOf(s ntpserver.StatsSnapshot) *ServerStats {
 }
 
 func counterStatsOf(c ntpserver.CounterSnapshot) CounterStats {
-	return CounterStats{
+	out := CounterStats{
 		Served: c.Served, Unsynced: c.Unsynced, KoD: c.KoD,
 		Denied: c.Denied, Martian: c.Martian, RateLimited: c.RateLimited,
 		BadAuth: c.BadAuth, BadVersion: c.BadVersion, NonClient: c.NonClient,
 		Malformed: c.Malformed, Oversize: c.Oversize,
 		NoKernelTS: c.NoKernelTS, KernelDrops: c.KernelDrops, Clients: c.Clients,
-		Modes: c.Modes[:], Versions: c.Versions[:],
-		LastRequest: c.LastRequest, LastServed: c.LastServed,
+		LastRequest: optionalTime(c.LastRequest),
+		LastServed:  optionalTime(c.LastServed),
 	}
+	for mode, value := range c.Modes {
+		// Client mode is the request itself, never a refusal reason.
+		if value == 0 || ntp.Mode(mode) == ntp.ModeClient {
+			continue
+		}
+		if out.Modes == nil {
+			out.Modes = make(map[string]uint64, 4)
+		}
+		out.Modes[ntp.Mode(mode).String()] = value
+	}
+	for version, value := range c.Versions {
+		if value == 0 {
+			continue
+		}
+		if out.Versions == nil {
+			out.Versions = make(map[string]uint64, 4)
+		}
+		out.Versions[strconv.Itoa(version)] = value
+	}
+	return out
+}
+
+func optionalTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // Tracking is the system-level state.
