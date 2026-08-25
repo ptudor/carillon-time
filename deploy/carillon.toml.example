@@ -186,11 +186,20 @@ iburst  = true
 # over authenticated HTTPS; bind a private address and explicitly allow the
 # LAN for direct access from an iPhone.
 
-# Avoid 9123: Fedora and RHEL label that port jboss_management_port_t in the
-# SELinux policy, and a confined process such as a Zabbix agent is refused
-# name_connect to it. The denial is dontaudit'd, so the connection simply
-# fails with ECONNREFUSED and audit.log stays empty while curl from a shell
-# works fine.
+# If a confined process is going to scrape this endpoint on Fedora or RHEL,
+# label the port first. SELinux decides TCP connections per port type, and a
+# scraper such as a Zabbix agent (zabbix_agent_t) may reach http_port_t
+# unconditionally but an unlabelled port only with the nis_enabled boolean,
+# which is off by default. 9123 is worse than unlabelled: it is
+# jboss_management_port_t, which is on no allow list at all.
+#
+#   semanage port -a -t http_port_t -p tcp 9124
+#
+# Without it connect() returns EACCES, the denial is dontaudit'd so audit.log
+# stays empty, and curl renders it as "Could not connect to server" — which
+# reads exactly like ECONNREFUSED and sends you hunting through firewall
+# rules and namespaces. The same command works from a shell, because a login
+# shell is not in the agent's domain.
 
 #[monitor]
 #listen = "127.0.0.1:9124"

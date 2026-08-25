@@ -1011,12 +1011,19 @@ name   = "Twocom"
 roles  = ["colo", "ntp-pool"]
 ```
 
-`listen` is one numeric TCP address and non-zero port. Avoid 9123: Fedora and
-RHEL label it `jboss_management_port_t`, and a confined scraper such as a
-Zabbix agent (`zabbix_agent_t`) is refused `name_connect` to it. The rule is
-`dontaudit`'d, so the symptom is a bare ECONNREFUSED with nothing in
-`audit.log`, while `curl` from a login shell works — which sends you looking
-at the wrong layer for a long time. `allow` is checked
+`listen` is one numeric TCP address and non-zero port. On Fedora or RHEL, a
+confined scraper needs the port labelled before it can reach this endpoint:
+SELinux decides TCP connections per port type, and `zabbix_agent_t` may reach
+`http_port_t` unconditionally but an unlabelled port only under the
+`nis_enabled` boolean, which is off by default. Port 9123 is not merely
+unlabelled — it is `jboss_management_port_t`, on no allow list at all. So
+`semanage port -a -t http_port_t -p tcp 9124`, which grants exactly the one
+connection wanted rather than enabling `nis_enabled` and opening every
+unreserved port to that domain. Without it `connect()` returns `EACCES`, the
+denial is `dontaudit`'d so `audit.log` stays empty, and curl renders it as
+"Could not connect to server" — indistinguishable from `ECONNREFUSED`, while
+the same command from a login shell succeeds because a shell is not in the
+agent's domain. `allow` is checked
 against the immediate TCP peer only; forwarded-address headers are ignored.
 For a LAN-direct iPhone client, bind a private address and explicitly allow
 the LAN prefix. An Internet-facing host keeps the default loopback listener
