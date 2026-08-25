@@ -11,7 +11,7 @@
 #   ( umask 077; printf '1 AES128CMAC %s\n' "$(openssl rand -hex 16)" > /etc/carillon/keys )
 #   chown carillon:carillon /etc/carillon/keys
 #   carillon -check -config /etc/carillon/carillon.toml
-#   systemctl disable --now systemd-timesyncd chrony ntp 2>/dev/null
+#   systemctl disable --now systemd-timesyncd chrony ntp ntpsec 2>/dev/null
 #   systemctl enable --now carillon
 #
 # Serial-port PPS needs the pps_ldisc module:
@@ -22,7 +22,7 @@ Description=carillon NTP time daemon
 Documentation=file:///usr/local/share/doc/carillon/DESIGN.md
 After=network-online.target
 Wants=network-online.target
-Conflicts=ntp.service ntpd.service chrony.service chronyd.service systemd-timesyncd.service
+Conflicts=ntp.service ntpd.service ntpsec.service chrony.service chronyd.service systemd-timesyncd.service
 
 [Service]
 Type=simple
@@ -55,8 +55,10 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
-# Serial port and PPS devices for the refclock. Adjust the tty to match
-# the configured device.
+# Serial port and PPS devices for the refclock. Adjust the tty to match the
+# configured device. A client-only or server-only host has no refclock: delete
+# these two lines and SupplementaryGroups=dialout above, which are the only
+# reason this unit needs any device access at all.
 DeviceAllow=/dev/ttyS0 rw
 DeviceAllow=char-pps rw
 

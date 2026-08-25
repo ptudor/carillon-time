@@ -191,6 +191,59 @@ chrony's default and the kernel's own 41 KB of headroom. See the public
 Rollback: reinstall the `.prev` binaries, restore `carillon.toml.prev` on
 both hosts, restart.
 
+## Third host, client-only — navlisten2026, 2026-08-25 (UTC)
+
+Moved `navlisten2026` (172.19.1.62, Debian 13 trixie, x86_64) from ntpsec to
+carillon `1410eae`. First host with no `[serve]` section at all, so it
+exercises the client-only path: `-check` reports "0 NTP listeners".
+
+Baseline, ntpsec immediately before the cutover: offset 3.491 ms, sys_jitter
+1.83 ms, frequency +9.077 ppm, stratum 3, rootdelay 87.891 ms, rootdisp
+28.928 ms, ten internet peers at 21-83 ms.
+
+The handover carried the frequency across cleanly. With no drift file yet the
+engine falls back to the kernel, which ntpsec had left at +9.077 ppm:
+
+    msg="no drift file yet" path=/var/lib/carillon/drift
+    msg="initial frequency" ppm=9.077285766601562 known=true from=kernel
+
+Synchronized 4 s after start, no step. At one minute: offset +1.019 ms,
+frequency +9.082 ppm, root dispersion 22.390 ms. Not yet a fair comparison
+against ntpsec — that needs hours, and is what the Zabbix template is for.
+
+Sources chosen to give an opinion from outside the building as well as inside:
+`gummi` and `twocom` over the LAN (371 us and 320 us delay, 70.8 us and 0.2 us
+jitter), `junia` via `clock.packetexport.com`, and `2.debian.pool.ntp.org`.
+None marked `prefer`: gummi and twocom are chained, so preferring one would
+weight a single failure twice. Selection immediately put `junia` in charge —
+stratum 2 with tight root dispersion beats a stratum-3 LAN server on root
+distance despite 70 ms of path — and classified `debian-2` an outlier at
+80 ms jitter.
+
+Two fixes this shook out:
+
+- The shipped unit listed `ntp.service`, `ntpd.service`, `chrony.service`,
+  `chronyd.service` and `systemd-timesyncd.service` under `Conflicts=` but
+  not `ntpsec.service`, which is what Debian actually calls it. Both hosts
+  here run ntpsec, so the guard would have missed the case it was written
+  for.
+- The unit is deployed here without `SupplementaryGroups=dialout` or either
+  `DeviceAllow=` line. Those exist only for a serial refclock; a client-only
+  or server-only host should have no device access at all, which the unit now
+  says in a comment.
+
+`CAP_NET_BIND_SERVICE` is deliberately kept even though a client binds no
+privileged port: it is what lets the startup probe bind UDP/123 to detect a
+second time daemon. Two daemons disciplining one clock is worth more than the
+capability is worth saving.
+
+Post-cutover: ntpsec disabled and inactive, nothing holding UDP/123, drift
+file written, `/healthz` 200, statistics writing to /var/lib/carillon/stats.
+`claude` added to the `carillon` and `systemd-journal` groups to match gummi,
+so the control socket and unit journal are readable without sudo.
+
+Rollback: `systemctl disable --now carillon; systemctl enable --now ntpsec`.
+
 ## Repeatable checklist
 
 On each host:
