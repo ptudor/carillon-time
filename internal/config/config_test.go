@@ -543,9 +543,14 @@ func TestPublicAllowPrefixes(t *testing.T) {
 		{"lan only", []string{"192.168.1.0/24", "10.0.0.0/8", "fd00:1::/64", "127.0.0.0/8", "::1/128"}, nil},
 		{"default routes", []string{"0.0.0.0/0", "::/0"}, []string{"0.0.0.0/0", "::/0"}},
 		{"global unicast v6", []string{"2000::/3"}, []string{"2000::/3"}},
-		{"mixed", []string{"192.168.1.0/24", "203.0.113.0/24"}, []string{"203.0.113.0/24"}},
 		{"supernet of a private range", []string{"192.0.0.0/8"}, []string{"192.0.0.0/8"}},
 		{"link local only", []string{"169.254.0.0/16", "fe80::/10"}, nil},
+		// A routable delegation is not the internet: its occupants are hosts
+		// the operator knows, and warning about it would be crying wolf.
+		{"delegated v6 site", []string{"2603:8000:ae00:d304::/64"}, nil},
+		{"routable v4 site", []string{"203.0.113.0/24"}, nil},
+		{"the real deployments", []string{"172.19.0.0/16", "2000::/3"}, []string{"2000::/3"}},
+		{"broader than any site", []string{"198.51.0.0/15", "2600::/12"}, []string{"198.51.0.0/15", "2600::/12"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

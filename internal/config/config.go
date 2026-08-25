@@ -789,10 +789,19 @@ var privatePrefixes = []netip.Prefix{
 	netip.MustParsePrefix("fe80::/10"),
 }
 
-// PublicAllowPrefixes returns the entries of [serve] allow that reach beyond
-// private address space, so startup can say out loud that this server answers
-// the internet. It reports the configured strings, not the masked forms, so
-// the message quotes what the operator wrote.
+// Widest prefix an operator can plausibly enumerate. A site is delegated a
+// /16 of IPv4 or a /32 of IPv6 at the outside; anything broader than that is
+// a slice of the address space rather than an allocation, and the hosts in it
+// are not ones the operator knows.
+const (
+	siteBitsV4 = 16
+	siteBitsV6 = 32
+)
+
+// PublicAllowPrefixes returns the entries of [serve] allow that open this
+// server to hosts the operator cannot enumerate, so startup can say out loud
+// that it is answering the internet. It reports the configured strings, not
+// the masked forms, so the message quotes what the operator wrote.
 func (c *Config) PublicAllowPrefixes() []string {
 	var public []string
 	for _, raw := range c.Serve.Allow {
@@ -800,16 +809,29 @@ func (c *Config) PublicAllowPrefixes() []string {
 		if err != nil {
 			continue
 		}
-		if isPublicPrefix(p.Masked()) {
+		if isInternetFacingPrefix(p.Masked()) {
 			public = append(public, raw)
 		}
 	}
 	return public
 }
 
-// isPublicPrefix reports whether p holds any address outside the private,
-// loopback and link-local ranges. p must already be masked.
-func isPublicPrefix(p netip.Prefix) bool {
+// isInternetFacingPrefix reports whether p reaches outside private address
+// space and is broader than any one site's allocation. p must already be
+// masked.
+//
+// Both halves matter. A globally routable /64 is a home or office delegation
+// whose occupants the operator knows, and warning about it would be crying
+// wolf; 2000::/3 is the whole global unicast range and is exactly what an NTP
+// pool member writes.
+func isInternetFacingPrefix(p netip.Prefix) bool {
+	site := siteBitsV6
+	if p.Addr().Is4() {
+		site = siteBitsV4
+	}
+	if p.Bits() >= site {
+		return false
+	}
 	for _, private := range privatePrefixes {
 		// p is entirely inside private when it starts inside it and is no
 		// broader than it.

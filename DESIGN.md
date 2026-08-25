@@ -715,9 +715,12 @@ its drops appear only in `netstat -sp udp`.
 **Serving the public internet.** An operator who joins the NTP pool writes
 `allow = ["0.0.0.0/0", "2000::/3"]`, which makes the ACL match every forged
 and unroutable source address too. Startup and `-check` therefore say so,
-naming the prefixes that reach beyond private address space, and repeat the
-warning for `rate_limit_pps` and `recv_buffer` while they hold their LAN
-defaults. The defaults themselves are unchanged: 8 pps per client is right
+naming the prefixes responsible, and repeat the warning for `rate_limit_pps`
+and `recv_buffer` while they hold their LAN defaults. A prefix counts as
+internet-facing when it is outside private address space *and* broader than
+one site's allocation (/16 for IPv4, /32 for IPv6): a globally routable /64
+is a delegation whose occupants the operator knows, while `2000::/3` is the
+entire global unicast range. The defaults themselves are unchanged: 8 pps per client is right
 for a two-host topology and roughly 64× more permissive than chrony's
 `ratelimit interval 3 burst 8` for a public one.
 
