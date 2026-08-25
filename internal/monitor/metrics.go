@@ -2,14 +2,12 @@ package monitor
 
 import (
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"carillon/internal/control"
-	"carillon/internal/ntp"
 )
 
 type collector struct {
@@ -107,7 +105,7 @@ func newCollector(snapshot func() Snapshot) *collector {
 		serverKoD:         desc("carillon_server_kod_replies_total", "Rate kiss-o'-death replies sent; a subset of result=rate_limited.", "family"),
 		serverModes:       desc("carillon_server_refused_mode_total", "Refused datagrams by NTP association mode; modes 6 and 7 are amplification probes.", "family", "mode"),
 		serverVersions:    desc("carillon_server_client_version_total", "Accepted client requests by NTP protocol version.", "family", "version"),
-		serverClients:     desc("carillon_server_clients", "Distinct clients in the rate-limit table, which expires entries after one minute.", "family"),
+		serverClients:     desc("carillon_server_clients", "Distinct clients in the rate-limit table as of the last request served; entries expire after one minute, so this is roughly the clients seen in the last minute and goes stale on an idle server.", "family"),
 		serverKernelDrops: desc("carillon_server_kernel_drops_total", "Datagrams the kernel dropped because the socket receive queue was full; Linux only, FreeBSD reports no per-socket count.", "family"),
 		serverLastRequest: desc("carillon_server_last_request_timestamp_seconds", "Unix timestamp of the last valid NTP client request.", "family"),
 		serverLastServed:  desc("carillon_server_last_served_timestamp_seconds", "Unix timestamp of the last NTP response served.", "family"),
@@ -232,25 +230,20 @@ func (c *collector) collectFamily(ch chan<- prometheus.Metric, family string, v 
 	}
 	counter(c.serverUnsynced, v.Unsynced, family)
 	counter(c.serverKoD, v.KoD, family)
-	for mode, value := range v.Modes {
-		if mode == int(ntp.ModeClient) {
-			// Client mode is never refused as a mode; it is the request.
-			continue
-		}
-		counter(c.serverModes, value, family, ntp.Mode(mode).String())
+	// Both histograms carry only their non-zero buckets, so a name absent
+	// from the map has never been seen and is exported as zero. Exporting
+	// the whole enum keeps a series from appearing mid-scrape.
+	for _, mode := range control.ModeOrder {
+		counter(c.serverModes, v.Modes[mode], family, mode)
 	}
-	for version, value := range v.Versions {
-		if version == 0 {
-			// The decoder rejects version 0 before it can be counted here.
-			continue
-		}
-		counter(c.serverVersions, value, family, strconv.Itoa(version))
+	for _, version := range control.VersionOrder {
+		counter(c.serverVersions, v.Versions[version], family, version)
 	}
 	gauge(c.serverClients, float64(v.Clients), family)
 	counter(c.serverKernelDrops, v.KernelDrops, family)
 	counter(c.serverNoKernelTS, v.NoKernelTS, family)
-	gauge(c.serverLastRequest, timestampSeconds(v.LastRequest), family)
-	gauge(c.serverLastServed, timestampSeconds(v.LastServed), family)
+	gauge(c.serverLastRequest, optionalTimestampSeconds(v.LastRequest), family)
+	gauge(c.serverLastServed, optionalTimestampSeconds(v.LastServed), family)
 }
 
 func timestampSeconds(v time.Time) float64 {
@@ -258,4 +251,13 @@ func timestampSeconds(v time.Time) float64 {
 		return 0
 	}
 	return float64(v.UnixNano()) / 1e9
+}
+
+// optionalTimestampSeconds exports an absent time as zero, which is how every
+// other "never happened" timestamp in this exposition reads.
+func optionalTimestampSeconds(v *time.Time) float64 {
+	if v == nil {
+		return 0
+	}
+	return timestampSeconds(*v)
 }

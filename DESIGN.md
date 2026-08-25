@@ -983,9 +983,11 @@ Unix socket, newline-delimited JSON request/response, `0660`. Commands:
   interval σ, measured NMEA lag, fix status, satellites.
 - `serverstats` — the §7.2 outcome counters with their totals and an `ipv4`
   and `ipv6` object beside them, the mode and version histograms, the
-  distinct-client gauge, and kernel receive drops. `carillonctl` prints one
-  total/ipv4/ipv6 column set with each refusal reason indented under the
-  total it contributes to.
+  distinct-client gauge, and kernel receive drops. The histograms are objects
+  carrying only their non-zero buckets (`"modes": {"control": 6}`), and
+  `last_request`/`last_served` are absent rather than zero when nothing has
+  happened yet. `carillonctl` prints one total/ipv4/ipv6 column set with each
+  refusal reason indented under the total it contributes to.
 - `waitsync [seconds]` — block until SYNCED or timeout; exit status for init.
 
 `carillonctl` prints these as aligned tables; `-json` passes the raw reply through.
@@ -1071,7 +1073,7 @@ Server traffic is exported per address family, `family="ipv4"|"ipv6"`:
 | `carillon_server_kod_replies_total{family}` | subset of `result="rate_limited"`: RATE kisses sent |
 | `carillon_server_refused_mode_total{family,mode}` | refusals broken out by NTP mode; `mode="control"` and `mode="private"` are amplification probes |
 | `carillon_server_client_version_total{family,version}` | accepted requests by client protocol version |
-| `carillon_server_clients{family}` | distinct clients in the rate-limit table, which expires entries after a minute |
+| `carillon_server_clients{family}` | distinct clients in the rate-limit table as of the last request served. Entries expire after a minute, so this reads as "clients in the last minute" on a busy server and goes stale on an idle one — the table is owned by the listener goroutine and is only walked when a request arrives |
 | `carillon_server_kernel_drops_total{family}` | receive-queue overflows (Linux `SO_RXQ_OVFL`; always 0 on FreeBSD) |
 | `carillon_server_kernel_timestamp_missing_total{family}` | requests received without a kernel timestamp |
 | `carillon_server_last_request_timestamp_seconds{family}` | last valid client request |
