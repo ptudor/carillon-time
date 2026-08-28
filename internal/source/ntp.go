@@ -115,6 +115,8 @@ type NTP struct {
 	poll                int8
 	consecutiveTimeouts int
 	consecutiveMisses   int
+	consecutiveErrs     uint64
+	lastErrText         string
 	denied              bool
 	tsWarned            bool
 	badAuthSeen         uint64
@@ -320,8 +322,11 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		n.updateInfo(func(i *Info) { i.Bogus++; i.LastError = "bogus: " + bogus.reason })
 		n.miss("bogus")
 	default:
-		n.log.Warn("exchange failed", "err", err)
-		n.updateInfo(func(i *Info) { i.LastError = err.Error() })
+		text := err.Error()
+		if n.shouldLogErr(text) {
+			n.log.Warn("exchange failed", "err", err, "count", n.consecutiveErrs)
+		}
+		n.updateInfo(func(i *Info) { i.LastError = text })
 		n.miss("error")
 	}
 	return n.emit(ctx, out, s)
@@ -364,6 +369,8 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	n.reach = n.reach<<1 | 1
 	n.consecutiveTimeouts = 0
 	n.consecutiveMisses = 0
+	n.consecutiveErrs = 0
+	n.lastErrText = ""
 	if wasUnreachable {
 		n.poll = n.cfg.PollMin
 		n.log.Info("server reachable", "resolved", n.addr)
@@ -398,6 +405,20 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	n.poll = adaptPoll(n.poll, f.Offset, f.Jitter, n.cfg.PollMin, n.cfg.PollMax)
 	n.updateInfo(func(i *Info) { i.Reach = n.reach; i.Poll = n.poll })
 	return &sample{out: res, f: f}
+}
+
+// shouldLogErr counts one failed exchange and reports whether it deserves a
+// log line. A server that stays down fails every poll, and an iburst makes
+// that four failures a cycle, so logging each one buries every other line in
+// the file: announce the first failure and any change of failure mode, then
+// stay quiet apart from a periodic reminder. miss() logs the transition to
+// unreachable separately, and hit() clears the count on recovery.
+func (n *NTP) shouldLogErr(text string) bool {
+	n.consecutiveErrs++
+	first := n.consecutiveErrs == 1
+	changed := text != n.lastErrText
+	n.lastErrText = text
+	return first || changed || n.consecutiveErrs%logEvery == 0
 }
 
 // miss records a poll without a usable reply.

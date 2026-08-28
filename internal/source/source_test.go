@@ -601,3 +601,50 @@ func TestNewNTPValidation(t *testing.T) {
 		t.Errorf("defaults: %v %+v", err, n.cfg)
 	}
 }
+
+// TestExchangeErrorLoggingIsThrottled checks the log budget for a source that
+// keeps failing: the first failure speaks, repeats of the same failure stay
+// quiet until the periodic reminder, and a new failure mode speaks at once.
+func TestExchangeErrorLoggingIsThrottled(t *testing.T) {
+	var n NTP
+
+	if !n.shouldLogErr("host is down") {
+		t.Fatal("first failure was not logged")
+	}
+	for i := 2; i < logEvery; i++ {
+		if n.shouldLogErr("host is down") {
+			t.Fatalf("repeat %d was logged, want silence", i)
+		}
+	}
+	if !n.shouldLogErr("host is down") {
+		t.Fatalf("failure %d was not logged as the periodic reminder", logEvery)
+	}
+	if !n.shouldLogErr("network is unreachable") {
+		t.Fatal("a changed failure mode was not logged")
+	}
+	if n.consecutiveErrs != logEvery+1 {
+		t.Fatalf("consecutiveErrs = %d, want %d", n.consecutiveErrs, logEvery+1)
+	}
+}
+
+// TestGoodReplyClearsErrorThrottle checks that recovery rearms the warning,
+// so the next outage announces itself instead of being counted as a repeat.
+func TestGoodReplyClearsErrorThrottle(t *testing.T) {
+	srv := newFakeServer(t, plain)
+	n := newPoller(t, srv, NTPConfig{}, 0)
+	n.consecutiveErrs = logEvery - 1
+	n.lastErrText = "host is down"
+
+	out, stop := run(t, n)
+	defer stop()
+
+	if m := next(t, out); !m.Valid {
+		t.Fatalf("expected a usable reply, got %+v", m)
+	}
+	if n.consecutiveErrs != 0 || n.lastErrText != "" {
+		t.Fatalf("throttle not cleared: count=%d last=%q", n.consecutiveErrs, n.lastErrText)
+	}
+	if !n.shouldLogErr("host is down") {
+		t.Fatal("the first failure after recovery was not logged")
+	}
+}
