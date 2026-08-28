@@ -116,7 +116,6 @@ type NTP struct {
 	consecutiveTimeouts int
 	consecutiveMisses   int
 	consecutiveErrs     uint64
-	lastErrText         string
 	denied              bool
 	tsWarned            bool
 	badAuthSeen         uint64
@@ -322,11 +321,10 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		n.updateInfo(func(i *Info) { i.Bogus++; i.LastError = "bogus: " + bogus.reason })
 		n.miss("bogus")
 	default:
-		text := err.Error()
-		if n.shouldLogErr(text) {
+		if n.shouldLogErr() {
 			n.log.Warn("exchange failed", "err", err, "count", n.consecutiveErrs)
 		}
-		n.updateInfo(func(i *Info) { i.LastError = text })
+		n.updateInfo(func(i *Info) { i.LastError = err.Error() })
 		n.miss("error")
 	}
 	return n.emit(ctx, out, s)
@@ -370,7 +368,6 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	n.consecutiveTimeouts = 0
 	n.consecutiveMisses = 0
 	n.consecutiveErrs = 0
-	n.lastErrText = ""
 	if wasUnreachable {
 		n.poll = n.cfg.PollMin
 		n.log.Info("server reachable", "resolved", n.addr)
@@ -408,17 +405,19 @@ func (n *NTP) hit(res exchangeResult) *sample {
 }
 
 // shouldLogErr counts one failed exchange and reports whether it deserves a
-// log line. A server that stays down fails every poll, and an iburst makes
-// that four failures a cycle, so logging each one buries every other line in
-// the file: announce the first failure and any change of failure mode, then
-// stay quiet apart from a periodic reminder. miss() logs the transition to
-// unreachable separately, and hit() clears the count on recovery.
-func (n *NTP) shouldLogErr(text string) bool {
+// log line: the first, then every logEvery-th, the same throttle badAuthSeen
+// and bogusSeen use. A server that stays down fails every poll, and an iburst
+// makes that four failures a cycle, so logging each one buries every other
+// line in the file. miss() logs the transition to unreachable separately, and
+// hit() clears the count on recovery.
+//
+// Failures are counted, never compared: every exchange opens a fresh socket,
+// so the error text carries a different ephemeral source port each time and
+// no two failures would ever compare equal. Suppressing on "same text as last
+// time" therefore suppresses nothing at all.
+func (n *NTP) shouldLogErr() bool {
 	n.consecutiveErrs++
-	first := n.consecutiveErrs == 1
-	changed := text != n.lastErrText
-	n.lastErrText = text
-	return first || changed || n.consecutiveErrs%logEvery == 0
+	return n.consecutiveErrs == 1 || n.consecutiveErrs%logEvery == 0
 }
 
 // miss records a poll without a usable reply.
