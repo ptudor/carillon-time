@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +15,21 @@ import (
 	"carillon/internal/engine"
 )
 
-func startTestServer(t *testing.T, allow []netip.Prefix, state discipline.State) (*Server, string) {
+func startTestServer(t *testing.T, allow []netip.Prefix, state discipline.State, mutate ...func(*engine.Status)) (*Server, string) {
 	t.Helper()
 	now := time.Now().UTC()
+	status := func() *engine.Status {
+		st := testEngineStatus(now, state)
+		for _, m := range mutate {
+			m(st)
+		}
+		return st
+	}
 	s, err := Listen(Config{
 		Listen:   netip.MustParseAddrPort("127.0.0.1:0"),
 		Allow:    allow,
 		Metadata: Metadata{ID: "test"},
-		Status:   func() *engine.Status { return testEngineStatus(now, state) },
+		Status:   status,
 		Now:      func() time.Time { return now.Add(time.Second) },
 	})
 	if err != nil {
@@ -129,5 +137,55 @@ func TestUnhealthyAndDenied(t *testing.T) {
 	denied.Body.Close()
 	if denied.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "Forbidden") {
 		t.Fatalf("denied: %s %q", denied.Status, body)
+	}
+}
+
+// TestDegradedHealthzStaysOK checks that only unhealthy fails the probe. A
+// degraded instance is still serving usable time, so a load balancer must
+// keep it; the reason for the degradation is carried in the body instead.
+func TestDegradedHealthzStaysOK(t *testing.T) {
+	tests := []struct {
+		name   string
+		state  discipline.State
+		mutate func(*engine.Status)
+		want   int
+		status string
+		reason string
+	}{
+		{"prefer lost", discipline.StateSynced,
+			func(st *engine.Status) { st.PreferLost = true },
+			http.StatusOK, statusDegraded, "preferred_source_lost"},
+		{"holdover", discipline.StateHoldover, nil,
+			http.StatusOK, statusDegraded, "holdover"},
+		{"settling", discipline.StateSettling, nil,
+			http.StatusServiceUnavailable, statusUnhealthy, "settling"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mutate []func(*engine.Status)
+			if tt.mutate != nil {
+				mutate = append(mutate, tt.mutate)
+			}
+			_, base := startTestServer(t, []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, tt.state, mutate...)
+
+			resp, err := http.Get(base + "/healthz")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var probe struct {
+				Health Health `json:"health"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&probe)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != tt.want {
+				t.Fatalf("healthz = %d, want %d (health %+v)", resp.StatusCode, tt.want, probe.Health)
+			}
+			if probe.Health.Status != tt.status || !slices.Contains(probe.Health.Reasons, tt.reason) {
+				t.Fatalf("health body %+v, want %q with reason %q", probe.Health, tt.status, tt.reason)
+			}
+		})
 	}
 }

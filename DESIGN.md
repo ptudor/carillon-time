@@ -1035,10 +1035,14 @@ Endpoints, all GET/HEAD only:
   health, tracking, sources, refclocks and NTP listener statistics. It returns
   HTTP 200 whenever the snapshot can be encoded, including when carillon is
   unsynchronised, so a client can display the cause.
-- `/healthz` — a small JSON probe. Healthy is HTTP 200; degraded or unhealthy
-  is HTTP 503. `synced` is healthy; `holdover` or loss of the preferred source
-  is degraded; other discipline states are unhealthy. A snapshot more than
-  five seconds old is unhealthy.
+- `/healthz` — a small JSON probe. Healthy and degraded are both HTTP 200;
+  only unhealthy is HTTP 503. A degraded instance is still serving time worth
+  using, so failing its probe would withdraw a working server from a load
+  balancer or page for a condition needing no immediate action. `synced` is
+  healthy; `holdover` or loss of the preferred source is degraded; other
+  discipline states are unhealthy. A snapshot more than five seconds old is
+  unhealthy. The body always carries `status` and `reasons`, so a client that
+  wants to alert on degraded reads them rather than the status code.
 - `/metrics` — Prometheus exposition of the same snapshot and counters.
 
 The JSON schema identifier is `carillon.status.v1`. `snapshot_at` is the time

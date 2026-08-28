@@ -84,10 +84,15 @@ func Listen(cfg Config) (*Server, error) {
 	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, snapshot())
 	})
+	// Only unhealthy is 503. A degraded instance — holdover, a lost preferred
+	// source, an expiring leapfile — is still serving time worth using, and
+	// failing its probe would take a working server out of a load balancer or
+	// raise a page for a condition that needs no immediate action. The
+	// distinction stays in the body for a client that wants to alert on it.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		s := snapshot()
 		code := http.StatusOK
-		if s.Health.Status != "healthy" {
+		if s.Health.Status == statusUnhealthy {
 			code = http.StatusServiceUnavailable
 		}
 		writeJSON(w, code, struct {

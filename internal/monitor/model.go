@@ -13,6 +13,14 @@ import (
 
 const schemaV1 = "carillon.status.v1"
 
+// Health statuses. Degraded means the clock is still worth using but
+// something has been lost; unhealthy means it is not.
+const (
+	statusHealthy   = "healthy"
+	statusDegraded  = "degraded"
+	statusUnhealthy = "unhealthy"
+)
+
 // Metadata is operator-provided identity used only by monitoring clients.
 type Metadata struct {
 	ID    string   `json:"id,omitempty"`
@@ -88,35 +96,35 @@ func healthOf(st *engine.Status, servedAt time.Time) Health {
 	if age < 0 {
 		age = 0
 	}
-	h := Health{Status: "healthy", Reasons: []string{}, SnapshotAgeSeconds: age}
+	h := Health{Status: statusHealthy, Reasons: []string{}, SnapshotAgeSeconds: age}
 	switch st.State {
 	case discipline.StateSynced:
 	case discipline.StateHoldover:
-		h.Status = "degraded"
+		h.Status = statusDegraded
 		h.Reasons = append(h.Reasons, "holdover")
 	default:
-		h.Status = "unhealthy"
+		h.Status = statusUnhealthy
 		h.Reasons = append(h.Reasons, st.State.String())
 	}
 	if st.PreferLost {
-		if h.Status == "healthy" {
-			h.Status = "degraded"
+		if h.Status == statusHealthy {
+			h.Status = statusDegraded
 		}
 		h.Reasons = append(h.Reasons, "preferred_source_lost")
 	}
 	if st.Now.IsZero() || age > 5 {
-		h.Status = "unhealthy"
+		h.Status = statusUnhealthy
 		h.Reasons = append(h.Reasons, "snapshot_stale")
 	}
 	if !st.LeapExpiry.IsZero() {
 		remaining := st.LeapExpiry.Sub(st.Now)
 		switch {
 		case remaining <= 0:
-			h.Status = "unhealthy"
+			h.Status = statusUnhealthy
 			h.Reasons = append(h.Reasons, "leapfile_expired")
 		case remaining <= 30*24*time.Hour:
-			if h.Status == "healthy" {
-				h.Status = "degraded"
+			if h.Status == statusHealthy {
+				h.Status = statusDegraded
 			}
 			h.Reasons = append(h.Reasons, "leapfile_expiring")
 		}

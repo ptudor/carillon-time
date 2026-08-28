@@ -209,7 +209,7 @@ iburst  = true
 #roles  = ["colo", "ntp-pool"]
 #
 # GET /api/v1/status  complete JSON snapshot (always 200 when readable)
-# GET /healthz        200 healthy, 503 degraded/unhealthy
+# GET /healthz        200 healthy or degraded, 503 unhealthy
 # GET /metrics        Prometheus exposition
 
 # --- Daily statistics ------------------------------------------------------
