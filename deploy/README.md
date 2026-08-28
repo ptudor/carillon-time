@@ -127,7 +127,7 @@ Enable the read-only snapshot, health, and Prometheus endpoints on loopback:
 
 ```toml
 [monitor]
-listen = "127.0.0.1:9123"
+listen = "127.0.0.1:9124"
 id = "twocom"
 name = "Twocom"
 roles = ["colo", "ntp-pool"]
@@ -136,9 +136,9 @@ roles = ["colo", "ntp-pool"]
 The omitted `allow` retains the loopback-only default. After restarting:
 
 ```sh
-curl --fail http://127.0.0.1:9123/api/v1/status
-curl --fail http://127.0.0.1:9123/healthz
-curl --fail http://127.0.0.1:9123/metrics
+curl --fail http://127.0.0.1:9124/api/v1/status
+curl --fail http://127.0.0.1:9124/healthz
+curl --fail http://127.0.0.1:9124/metrics
 ```
 
 For a public NTP host, keep that listener on loopback and use the authenticated
