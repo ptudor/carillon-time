@@ -244,6 +244,65 @@ so the control socket and unit journal are readable without sudo.
 
 Rollback: `systemctl disable --now carillon; systemctl enable --now ntpsec`.
 
+## Health-probe semantics and log throttle — 2026-08-28 (UTC)
+
+Deployed `2700bc7` to `twocom` and `navlisten2026`, replacing `1410eae`.
+`gummi` has been down since before the 2026-08-27 reboots and was skipped.
+
+Why: `twocom` had been answering `/healthz` with 503 for a day while synced
+and serving 13670 requests with zero drops. `gummi` is its `prefer` source,
+`gummi` is down, and the handler mapped everything that was not `healthy` to
+503 — so a lost preferred source failed the probe. `navlisten2026` stayed 200
+through the same outage only because it marks no source `prefer`.
+
+Changes:
+
+- `/healthz` returns 200 for degraded and 503 only for unhealthy. The body
+  still carries `status` and `reasons`, which is where a client that wants to
+  alert on degraded should read them.
+- The per-exchange failure WARN is throttled to the first and every tenth,
+  the throttle `badAuthSeen` and `bogusSeen` already used.
+
+Results:
+
+- Both hosts passed `-check` and restarted from their drift files with zero
+  steps. Frequency carried across untouched: `twocom` +20.943 to +20.925 ppm,
+  `navlisten2026` +9.625 to +9.623 ppm.
+- `twocom` `/healthz` now returns 200 with `{"status":"degraded",
+  "reasons":["preferred_source_lost"]}`; `navlisten2026` returns 200 healthy.
+  `settling` still returns 503 on both, which is the intended distinction.
+- Log volume on `twocom`: 60 failed exchanges to the dead `gummi` produced 7
+  lines (`count=1,10,20…60`), and the whole 20-minute run produced 24 carillon
+  lines. The previous run had 4488 `exchange failed` lines out of 4545 total,
+  98.7% of everything the daemon had said.
+- `twocom` owns UDP/123 on both families exclusively; `navlisten2026` binds
+  nothing but its loopback monitor, as a client-only host should.
+
+The first attempt at the throttle was wrong and the deployment is what showed
+it. It suppressed a repeat only when the error text matched the previous one,
+but every exchange opens a fresh socket, so each message names a different
+ephemeral source port and no two failures ever compared equal — `count=1`
+through `count=12`, one line per attempt, the same flood. `cd83602` carried
+that version for five minutes before `2700bc7` replaced it. The unit test had
+passed because it fed the function a fixed string, which is not a failure this
+code can produce; the throttle now takes no argument at all, so there is
+nothing per-attempt left to key on.
+
+Two things worth not repeating:
+
+- `twocom` sat in `settling` for 15 minutes with two loop updates before its
+  third qualifying sample arrived, and served 108 requests unsynchronized in
+  that window. This is the RFC 5905 clock filter holding an early low-delay
+  sample, already noted on 2026-08-25, but the cost to clients is clearer now:
+  a restart of a serving host is not a 10-second outage.
+- `navlisten2026` was restarted 17 seconds before `twocom` finished settling
+  and discarded a stratum-16 reply from it (`discarding reply reason="stratum
+  16"`). The same sequencing mistake as 2026-08-24. Waiting for the upstream
+  to reach `synced`, not merely to have been restarted, is the actual rule.
+
+Rollback: `.prev` on `twocom` is `cd83602` (not `1410eae`, which two installs
+in five minutes displaced); `.prev` on `navlisten2026` is `1410eae`.
+
 ## Repeatable checklist
 
 On each host:
