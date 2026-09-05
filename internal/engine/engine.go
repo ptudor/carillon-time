@@ -29,6 +29,12 @@ import (
 // itself, so the shutdown path knows not to make the same call again.
 var errFrequencyRefused = errors.New("kernel refused a frequency change")
 
+// Bounds on the delay before a source whose Run returned is started again.
+const (
+	sourceRestartMin = time.Second
+	sourceRestartMax = time.Minute
+)
+
 // SourceSpec pairs a source with its discipline options.
 type SourceSpec struct {
 	Source  source.Source
@@ -113,6 +119,10 @@ type Engine struct {
 
 	gen        *atomic.Uint64
 	staleDrops map[string]uint64
+
+	// sourceErrors holds the reason a source's goroutine is not running,
+	// overlaid on its own Info snapshot until it is running again.
+	sourceErrors map[string]string
 }
 
 // New builds an engine. It loads the initial frequency (drift file, then the
@@ -137,16 +147,17 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 	gen.CompareAndSwap(0, 1)
 
 	e := &Engine{
-		cfg:        cfg,
-		clk:        clk,
-		log:        log,
-		sys:        discipline.New(cfg.Discipline, freq, known),
-		sources:    make(map[string]SourceSpec, len(cfg.Sources)),
-		meas:       make(chan discipline.Measurement, 64),
-		reqs:       make(chan func(), 16),
-		tick:       time.Second,
-		gen:        gen,
-		staleDrops: make(map[string]uint64, len(cfg.Sources)),
+		cfg:          cfg,
+		clk:          clk,
+		log:          log,
+		sys:          discipline.New(cfg.Discipline, freq, known),
+		sources:      make(map[string]SourceSpec, len(cfg.Sources)),
+		meas:         make(chan discipline.Measurement, 64),
+		reqs:         make(chan func(), 16),
+		tick:         time.Second,
+		gen:          gen,
+		staleDrops:   make(map[string]uint64, len(cfg.Sources)),
+		sourceErrors: make(map[string]string, len(cfg.Sources)),
 	}
 	for _, s := range cfg.Sources {
 		name := s.Source.Name()
@@ -300,14 +311,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func(name string, s source.Source) {
 			defer wg.Done()
-			err := s.Run(ctx, e.meas)
-			if ctx.Err() != nil {
-				return
-			}
-			select {
-			case e.reqs <- func() { e.sourceExited(name, err) }:
-			case <-ctx.Done():
-			}
+			e.runSource(ctx, name, s)
 		}(name, spec.Source)
 	}
 
@@ -394,23 +398,88 @@ func (e *Engine) stale(m discipline.Measurement) bool {
 	return true
 }
 
-func (e *Engine) sourceExited(name string, err error) {
-	if err != nil {
-		e.log.Error("source stopped", "source", name, "error", err)
-	} else {
-		e.log.Warn("source stopped", "source", name)
-	}
-	delete(e.sources, name)
-	for i, n := range e.order {
-		if n == name {
-			e.order = append(e.order[:i], e.order[i+1:]...)
-			break
+// runSource runs one source, restarting it whenever Run returns.
+//
+// In practice no production source returns: all three reopen their device
+// internally. But DESIGN.md §14 promises that a source whose goroutine exits
+// is marked unreachable and retried with backoff, and forgetting it instead
+// made it vanish from carillonctl sources, /api/v1/status and every
+// per-source metric series — where Prometheus sees the series disappear
+// rather than reach drop to zero — with nothing to bring it back.
+func (e *Engine) runSource(ctx context.Context, name string, s source.Source) {
+	backoff := sourceRestartMin
+	for {
+		err := s.Run(ctx, e.meas)
+		if ctx.Err() != nil {
+			return
+		}
+		delay := backoff
+		if !e.request(ctx, func() { e.sourceStopped(name, err, delay) }) {
+			return
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		if !e.request(ctx, func() { e.sourceRestarting(name) }) {
+			return
+		}
+		if backoff < sourceRestartMax {
+			backoff *= 2
+			if backoff > sourceRestartMax {
+				backoff = sourceRestartMax
+			}
 		}
 	}
-	now := e.clk.Monotonic()
-	if err := e.handle(e.sys.RemoveSource(name, now), now); err != nil {
-		e.log.Error("after source removal", "error", err)
+}
+
+// request hands f to the engine goroutine, or reports false if the daemon is
+// shutting down.
+func (e *Engine) request(ctx context.Context, f func()) bool {
+	select {
+	case e.reqs <- f:
+		return true
+	case <-ctx.Done():
+		return false
 	}
+}
+
+// sourceStopped records that a source's goroutine returned. The source stays
+// registered; reach 0 is how every other unreachable source is reported, so
+// the selector, the status output and the metrics all say the same thing.
+func (e *Engine) sourceStopped(name string, err error, retryIn time.Duration) {
+	spec, ok := e.sources[name]
+	if !ok {
+		return
+	}
+	reason := "source stopped"
+	if err != nil {
+		reason = err.Error()
+		e.log.Error("source stopped; restarting", "source", name, "error", err, "retry_in", retryIn)
+	} else {
+		e.log.Warn("source stopped; restarting", "source", name, "retry_in", retryIn)
+	}
+	e.sourceErrors[name] = reason
+	now := e.clk.Monotonic()
+	m := discipline.Measurement{
+		Source: name, Now: now, Reach: 0,
+		Poll: spec.Source.Info().Poll, Generation: e.gen.Load(),
+	}
+	if err := e.handle(e.sys.Update(m), now); err != nil {
+		e.log.Error("after a source stopped", "error", err)
+	}
+}
+
+// sourceRestarting clears the recorded failure just before Run is entered
+// again, so the next Info snapshot is the source's own.
+func (e *Engine) sourceRestarting(name string) {
+	delete(e.sourceErrors, name)
+	e.log.Info("restarting source", "source", name)
+	now := e.clk.Monotonic()
+	e.publish(now)
 }
 
 // handle applies actions, logs events, refreshes the kernel status and
@@ -574,6 +643,11 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 	for name, spec := range e.sources {
 		info := spec.Source.Info()
 		info.Stale += e.staleDrops[name]
+		if reason := e.sourceErrors[name]; reason != "" {
+			// The goroutine is not running, so the source's own snapshot is
+			// as stale as the moment it stopped.
+			info.Reach, info.LastError = 0, reason
+		}
 		s.Infos[name] = info
 	}
 	e.status.Store(s)

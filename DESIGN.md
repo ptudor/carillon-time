@@ -1383,7 +1383,13 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   a bounded 1.5 s `PPS_FETCH`, which shifts reach on a missing pulse and also
   bounds shutdown latency; a vanished device is reopened with backoff. NMEA
   reads use `poll(2)` with a 500 ms bound; a `gps` refclock uses one source
-  goroutine for NMEA and, when enabled, one for PPS.
+  goroutine for NMEA and, when enabled, one for PPS. Should a source's `Run`
+  return anyway, the engine keeps it registered, reports it with reach 0 and
+  the returned error as its `LastError`, and restarts it after a backoff of
+  one second doubling to one minute (§14). Forgetting the source instead
+  would make it disappear from `carillonctl sources`, `/api/v1/status` and
+  every per-source metric series, where Prometheus sees the series vanish
+  rather than reach drop to zero.
 - **Server goroutines:** one per listen socket; read `Status` via the atomic
   pointer; never touch engine state. Rate limiter is per socket goroutine
   (no sharing needed: one client hits one socket).
@@ -1405,6 +1411,17 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   residual phase is abandoned rather than slewed out: it can take arbitrarily
   long, and exit never steps. If the fatal error that ended the run *was* a
   refused frequency change, the restore is skipped rather than repeated.
+
+  The 5 s deadline is on the *auxiliary* goroutines — statistics, the control
+  socket, the NTP listener, the monitor — and is real: main waits on a done
+  channel with a timer and exits anyway, logging which components are still
+  running. The engine has already written the drift file and restored the
+  base frequency by the time it returns, so the deadline costs nothing but a
+  late exit. Without it, a client that asked for `waitsync` with no timeout
+  and then stopped reading held the control handler open for ever —
+  `waitsync 0` clears that connection's deadline — and `service carillon
+  stop` hung until the init system's own `TimeoutStopSec` killed the
+  process. The reply write now carries a 5 s deadline of its own as well.
 - **No `SIGHUP` reload** in v1. Restart. `SIGHUP` is *ignored* rather than
   left unhandled — Go's default action for an unhandled signal is to
   terminate the process at once, so an operator sending HUP expecting a

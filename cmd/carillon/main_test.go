@@ -74,3 +74,31 @@ func TestPublicServeWarnings(t *testing.T) {
 		t.Fatalf("disabled server warned: %+v", got)
 	}
 }
+
+// TestAuxiliariesWaitNamesStragglers covers the other half of RF5X-033: the
+// final wait has a deadline, and a component that misses it is named rather
+// than waited on for ever.
+func TestAuxiliariesWaitNamesStragglers(t *testing.T) {
+	aux := newAuxiliaries()
+	quick := make(chan struct{})
+	stuck := make(chan struct{})
+	aux.start("quick", func() { <-quick })
+	aux.start("NTP server", func() { <-stuck })
+	aux.start("control socket", func() { <-stuck })
+	close(quick)
+
+	start := time.Now()
+	names := aux.wait(200 * time.Millisecond)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("wait took %v; it must give up at the deadline", elapsed)
+	}
+	if len(names) != 2 || names[0] != "NTP server" || names[1] != "control socket" {
+		t.Fatalf("stragglers %v, want the two blocked components in sorted order", names)
+	}
+
+	// Once they finish, wait reports nothing.
+	close(stuck)
+	if names := aux.wait(2 * time.Second); names != nil {
+		t.Fatalf("stragglers after everything stopped: %v", names)
+	}
+}

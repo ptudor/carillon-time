@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -389,50 +390,49 @@ func runDaemon(args []string) int {
 	statsCtx, stopStats := context.WithCancel(context.Background())
 	defer stopStats()
 	auxErr := make(chan error, 3)
-	var wg sync.WaitGroup
+	aux := newAuxiliaries()
 	if statsRecorder != nil {
 		log.Info("statistics enabled", "directory", cfg.Stats.Dir)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			statsRecorder.Run(statsCtx)
-		}()
+		aux.start("statistics", func() { statsRecorder.Run(statsCtx) })
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	aux.start("control socket", func() {
 		if err := ctl.Serve(ctx); err != nil {
 			log.Error("control socket", "error", err)
 			auxErr <- err
 			stop()
 		}
-	}()
+	})
 	if timeServer != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		aux.start("NTP server", func() {
 			if err := timeServer.Serve(ctx); err != nil {
 				log.Error("NTP server", "error", err)
 				auxErr <- err
 				stop()
 			}
-		}()
+		})
 	}
 	if monitorServer != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		aux.start("monitor", func() {
 			if err := monitorServer.Serve(ctx); err != nil {
 				log.Error("monitor", "error", err)
 				auxErr <- err
 				stop()
 			}
-		}()
+		})
 	}
 	runErr := eng.Run(ctx)
 	stopStats()
 	stop()
-	wg.Wait()
+	// The engine has already written the drift file and restored the base
+	// frequency by the time Run returns, so the deadline below only bounds
+	// how long a stuck auxiliary can delay the exit. Without it a client
+	// that asked for `waitsync 0` and stopped reading held the control
+	// server's handler open and `service carillon stop` hung until the init
+	// system's own timeout killed the process.
+	if stuck := aux.wait(shutdownDeadline); len(stuck) > 0 {
+		log.Error("components did not stop before the shutdown deadline; exiting anyway",
+			"components", strings.Join(stuck, ", "), "deadline", shutdownDeadline)
+	}
 	if runErr == nil {
 		select {
 		case runErr = <-auxErr:
@@ -445,6 +445,63 @@ func runDaemon(args []string) int {
 	}
 	log.Info("stopped")
 	return 0
+}
+
+// shutdownDeadline bounds the wait for the auxiliary goroutines (DESIGN.md
+// §12). Exiting a few seconds late is better than not exiting at all.
+const shutdownDeadline = 5 * time.Second
+
+// auxiliaries tracks the long-running goroutines beside the engine so that
+// one which fails to stop can be named rather than merely waited on.
+type auxiliaries struct {
+	wg      sync.WaitGroup
+	mu      sync.Mutex
+	running map[string]bool
+}
+
+func newAuxiliaries() *auxiliaries {
+	return &auxiliaries{running: make(map[string]bool)}
+}
+
+func (a *auxiliaries) start(name string, f func()) {
+	a.mu.Lock()
+	a.running[name] = true
+	a.mu.Unlock()
+	a.wg.Add(1)
+	go func() {
+		defer func() {
+			a.mu.Lock()
+			delete(a.running, name)
+			a.mu.Unlock()
+			a.wg.Done()
+		}()
+		f()
+	}()
+}
+
+// wait blocks until every auxiliary has stopped or the deadline passes,
+// returning the names of those still running.
+func (a *auxiliaries) wait(deadline time.Duration) []string {
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(deadline)
+	defer t.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-t.C:
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	names := make([]string, 0, len(a.running))
+	for n := range a.running {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // loadKeys reads the keys file when configured and checks that every

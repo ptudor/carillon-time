@@ -729,6 +729,66 @@ the dated paths. `TestRecorderPrunesExpiredDays` plants a day outside
 today's file written.  `TestRecorderKeepsEverythingByDefault` asserts
 `keep_days = 0` removes nothing.
 
+## RF5X-032 — An exited source is deleted from status instead of shown unreachable — FIXED
+
+**Changed.** The per-source goroutine now runs `Engine.runSource`, which calls
+`Run` in a loop, restarting it after a backoff of one second doubling to one
+minute, and logging each stop with the retry delay. `sourceExited` — which
+deleted the source from `e.sources`, `e.order` and the `System` — is gone.
+While the goroutine is down the engine records the returned error in
+`sourceErrors` and feeds the `System` a reach-0 measurement, so the selector,
+`carillonctl sources`, `/api/v1/status` and every per-source metric report it
+exactly as they report any other unreachable source; `publishStatus` overlays
+reach 0 and the error on the source's own `Info` snapshot, which is otherwise
+as stale as the moment it stopped. The record is cleared just before `Run` is
+entered again. The `Source` interface is untouched, and `System.RemoveSource`
+remains for its other caller and its own test.
+
+**Files.** `internal/engine/engine.go`, `internal/engine/engine_test.go`,
+`DESIGN.md` §12.
+
+**Verification.** PASS. `TestEngineSourceExitRemovesIt` became
+`TestEngineSourceExitMarksItUnreachableAndRestarts`, as the review asks: it
+requires the source to stay in the status with reach 0 and
+`LastError == "port vanished"`, the daemon to enter holdover, the source to be
+restarted and run again, and its error to clear. Against the old
+delete-and-forget behaviour it fails with `Sources:[]` — the source had
+vanished from the snapshot entirely. The `scripted` test source gained a
+`failOnce` flag so a restart can be observed recovering.
+
+## RF5X-033 — Shutdown has no deadline — FIXED
+
+**Changed.** The four auxiliary goroutines are started through a small
+`auxiliaries` helper that remembers which are still running. `main` replaces
+the bare `wg.Wait()` with `aux.wait(shutdownDeadline)` — 5 s, as `DESIGN.md`
+§12 always promised — which returns the names of any stragglers; they are
+logged at ERROR and the daemon exits anyway. `control.Server.reply` now sets a
+5 s write deadline before writing, so a client that asked for `waitsync` with
+no timeout (which clears that connection's deadline entirely) and then stopped
+reading cannot hold the handler, `Serve`, and the shutdown open once the
+socket buffer fills. The drift-write ordering is unchanged: the engine writes
+the drift file and restores the base frequency before `Run` returns, which is
+before any of this.
+
+**Files.** `cmd/carillon/main.go`, `cmd/carillon/main_test.go`,
+`internal/control/server.go`, `internal/control/control_test.go`,
+`DESIGN.md` §12.
+
+**Verification.** PASS, with one honest caveat.
+`TestAuxiliariesWaitNamesStragglers` starts one component that finishes and
+two that block, and asserts `wait` gives up at the deadline and names exactly
+the two blocked ones in sorted order, then reports nothing once they finish.
+`TestShutdownUnreadWaitsync` is the review's stated test — it opens a
+`waitsync 0` connection, never reads it, proves the server accepted it (a
+second request completes, and the accept loop is sequential), then cancels and
+requires `Serve` to return within 6 s. **It is a regression guard rather than
+a reproduction:** it also passes with the write deadline removed, because a
+reply that small fits in the socket buffer and the write returns immediately.
+Filling the buffer would need a response far larger than any this protocol
+produces. The deadline still closes the hole the review identifies — the
+buffer is finite and the handler had no bound at all — and the `auxiliaries`
+deadline bounds the exit regardless of what the control server does.
+
 ---
 
 ## Session checkpoint — 2026-09-05
@@ -738,10 +798,9 @@ Findings addressed so far, in the review's suggested fix order: RF5X-001,
 half **skipped**) and 009, 008/023/024/035, 007, 011/025, then the Lows
 013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 026, 027, 028, 029, 030, 031.
 
-**Still to do:** RF5X-032 (a source whose goroutine exits should be marked
-unreachable and restarted with backoff, not deleted from status) and RF5X-033
-(no deadline on the final `wg.Wait()`; `control.Server.reply` needs a write
-deadline). Nothing else from the review is outstanding.
+RF5X-032 and RF5X-033 were completed in a second sitting the same day, which
+closes the review: **34 of the 36 findings fixed, 2 skipped** (RF5X-012 in
+full, and the FreeBSD half of RF5X-003), each with its reason recorded above.
 
 `go vet ./...` passes for darwin, linux and freebsd; `go test -race ./...`
 passes on darwin.
