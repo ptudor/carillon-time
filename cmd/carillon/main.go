@@ -275,7 +275,7 @@ func runDaemon(args []string) int {
 			},
 			MinSurvivors:  cfg.Discipline.MinSurvivors,
 			HoldoverMax:   cfg.Discipline.HoldoverMax,
-			SettleUpdates: 3,
+			SettleUpdates: cfg.Discipline.SettleUpdates,
 		},
 		DriftFile:  cfg.Daemon.DriftFile,
 		Sources:    specs,

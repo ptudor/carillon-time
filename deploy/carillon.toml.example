@@ -238,6 +238,14 @@ holdover_max = 3600
 # Maximum phase correction rate, ppm. The kernel caps total correction at
 # 500 ppm, so slew capacity is 500 minus the frequency correction in use.
 max_slew_ppm = 500
+# Measurements for the system source that must arrive after a step before
+# the clock is served as synchronized (DESIGN.md section 6.5). One is enough
+# for the guards around it: a post-step loop update must also have run, and
+# another step must no longer be on the table. Raise it on a path noisy
+# enough that a single post-step sample is not convincing -- but note the
+# server answers LI=3 / stratum 16 for the whole window, so every client and
+# every downstream carillon rejects it while it counts.
+settle_updates = 1
 
 # --- Stepping policy --------------------------------------------------------
 [step]

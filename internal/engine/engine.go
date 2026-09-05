@@ -424,7 +424,7 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 			for _, src := range e.sources {
 				src.Source.Reset()
 			}
-			reset := e.sys.InvalidateSources(now)
+			reset := e.sys.Resync(now)
 			for _, ev := range reset.Events {
 				e.logEvent(ev)
 			}

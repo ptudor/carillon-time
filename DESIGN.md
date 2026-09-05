@@ -615,9 +615,9 @@ touching the engine.
 ### 6.5 States
 
 ```
-  UNSYNCED ──first update──► SETTLING ──|θ|<4ψ for 3 updates──► SYNCED
-      ▲                          │                                 │
-      └──── all sources lost ────┴───── (holdover timeout) ◄───────┘
+  UNSYNCED ──first update──► SETTLING ──settling criterion──► SYNCED
+      ▲                          │                              │
+      └──── all sources lost ────┴───── (holdover timeout) ◄────┘
                                                         HOLDOVER: PPS/all sources unreachable,
                                                         freq held, root dispersion growing at φ
 ```
@@ -625,10 +625,34 @@ touching the engine.
 - **UNSYNCED:** server replies LI=3, stratum 16 (§7.4); kernel `STA_UNSYNC`
   set; no frequency changes have been applied yet.
 - **SETTLING:** corrections are applied; the server still answers as
-  unsynchronized until three loop updates have gone by without a step. (The
-  root dispersion, which includes the pending slew, tells clients the truth
-  from then on; waiting for the offset to shrink first would keep a slowly
-  converging client unsynced for an hour for no gain.)
+  unsynchronized. (The root dispersion, which includes the pending slew,
+  tells clients the truth from then on; waiting for the offset to shrink
+  first would keep a slowly converging client unsynced for an hour for no
+  gain.) The state is left for SYNCED when all three of these hold:
+
+  1. at least one loop update has run since the last step — a step is never
+     served as synchronized;
+  2. at least `settle_updates` measurements (default 1) have arrived *for the
+     system source* since the last step;
+  3. another step is no longer on the table: either the step budget is spent
+     or the offset at the last update was under `threshold`.
+
+  Progress is deliberately **not** counted in loop updates. A loop update
+  needs a *new lowest-delay* filter sample, and on a quiet path the first
+  reply is often the best the filter will see for dozens of polls: counting
+  three of those kept a restarted host answering LI=3 for 15 minutes on a LAN
+  and up to 51 minutes at poll 10, with every client and every downstream
+  instance rejecting it while its clock was in fact fine. The evidence
+  (2 and 1 above) is reset by **every** step, not only the first — otherwise a
+  second step inside the startup window declares SYNCED an update early.
+
+  A **leap transition is not a loss of synchronization.** The engine calls
+  `System.Resync` rather than `InvalidateSources`: source estimates are
+  dropped (their samples straddle the boundary) but the next fresh
+  measurement restores SYNCED directly. A leap moves the clock by a whole
+  second and changes neither the frequency nor the residual phase error, so
+  there is nothing to settle, and passing through SETTLING would answer LI=3
+  at exactly the moment a leap second makes a good server most valuable.
 - **SYNCED:** `STA_UNSYNC` cleared, maxerror/esterror maintained; server
   serves. Clearing `STA_UNSYNC` is also what allows the kernel to write the
   clock back to the RTC periodically (Linux's 11-minute mode).
@@ -851,9 +875,13 @@ Maintained in the `Status` snapshot by the engine after every loop update:
 When not SYNCED the server still answers (clients then see a rejected source
 rather than a timeout, which is easier to diagnose): LI=3, packet stratum
 **16** (not 0 — stratum 0 means Kiss-o'-Death), refid `INIT` before the first
-update, `STEP` just after a step, `HOLD` after holdover expiry, following
-ntpd's conventions so chrony/ntpd users recognise them. Root dispersion is
-reported as 16 s.
+update, `STEP` just after a step, `HOLD` after holdover expiry, and `PANC`
+after a refused panic correction, following ntpd's conventions so
+chrony/ntpd users recognise them. `HOLD` is reserved for holdover expiry
+because that is how ntpd and chrony users read it — "was synchronized, lost
+its sources" — and sends the operator to look at reachability; a clock so far
+out that the panic gate refused it is a different problem and says so with
+its own code. Root dispersion is reported as 16 s.
 
 ---
 
