@@ -310,3 +310,78 @@ effective buffer. The FreeBSD-specific path (an actual `ENOBUFS` from
 `sbreserve_locked`) cannot be exercised here — `twocom` with
 `recv_buffer = 4194304` and default sysctls is the remaining step, per the
 review.
+
+## RF5X-008 — Rate limiting before MAC verification starves the authenticated association — FIXED
+
+**Changed.** For a source address inside a `require_key` prefix, `Handle` now
+verifies the MAC before consulting the limiter, and verified requests get
+their own token bucket keyed by `(prefix, key id)` rather than sharing the
+address's bucket with anyone able to forge it. An unverified request from such
+an address is dropped as `bad_auth` before the limiter is touched, so a
+spoofed flood costs the attacker one CMAC per packet and cannot reach the
+authenticated bucket at all. Addresses outside `require_key` keep the original
+order (limiter, then authentication), which caps the extra CMAC work to the
+handful of `/32`s `require_key` names. The reply-length invariant, the
+`bad_auth`/`rate_limited` meanings and the KoD throttle are unchanged.
+
+**Files.** `internal/server/responder.go`, `internal/server/ratelimit.go`,
+`internal/server/responder_test.go`, `DESIGN.md` §7.2.
+
+**Verification.** PASS. `TestAuthenticatedPeerSurvivesASpoofedFlood` sends 100
+unsigned requests from a `require_key` `/32` in one second and asserts all 100
+are `bad_auth` and none `rate_limited`, then that the peer's correctly signed
+poll is still served — the review's stated test.
+
+## RF5X-023 — Version histogram and last_request recorded before the ACL checks — FIXED
+
+**Changed.** `c.versions[...]` and `storeLatest(&c.lastRequest, ...)` moved
+from just after the ACL to just before the reply is built, after the limiter
+and authentication. Metric names are unchanged; the help text for
+`carillon_server_client_version_total` and `DESIGN.md` §10.4 now say what it
+counts.
+
+**Files.** `internal/server/responder.go`, `internal/server/responder_test.go`,
+`internal/monitor/metrics.go`, `DESIGN.md` §7.2, §10.4.
+
+**Verification.** PASS. `TestVersionHistogramCountsOnlyAcceptedRequests` sends
+a burst past the token bucket and asserts the histogram and `last_request` do
+not move while the requests are being rate-limited.
+
+## RF5X-024 — IPv6 rate limiting per /128 — FIXED
+
+**Changed.** The rate-limit table is keyed by a `bucketKey{addr, keyID}` whose
+address is masked to `rate_limit_v6_prefix` for IPv6 (new `[serve]` knob,
+default 64, validated 32..128) and left whole for IPv4. The clients gauge
+therefore counts /64s for v6, which the metric help and `DESIGN.md` §10.4 now
+say. The IPv4 behaviour and the KoD throttle are unchanged.
+
+**Files.** `internal/server/ratelimit.go`, `internal/server/responder.go`,
+`internal/config/config.go`, `cmd/carillon/main.go`,
+`deploy/carillon.toml.example`, `internal/monitor/metrics.go`, `DESIGN.md`
+§7.2, §10.4, `internal/server/responder_test.go`.
+
+**Verification.** PASS. `TestRateLimiterKeysIPv6ByPrefix` puts 20 addresses
+from one `/64` through the limiter and asserts they share one bucket, that a
+second `/64` is a second bucket, that two IPv4 addresses are still two
+buckets, and that an authenticated request gets its own.
+
+## RF5X-035 — No crypto-NAK for an unknown key id — FIXED
+
+**Changed.** A request carrying a MAC that cannot be authenticated — an
+unknown key id, or a digest that does not verify — is now answered with a
+crypto-NAK: the 48-byte header plus a four-byte zero key id, counted
+`bad_auth`, unauthenticated. Previously an unknown key id got a plain 48-byte
+reply and a bad digest got silence. A *correctly* signed request under a key
+the `require_key` rule does not permit, and a request with no trailer at all,
+keep the existing drop: neither is a key the server does not know, so a NAK
+would tell the client nothing its own configuration does not. `ntp.CryptoNAKSize`
+was exported for the reply builder and the tests.
+
+**Files.** `internal/ntp/packet.go`, `internal/server/responder.go`,
+`internal/server/responder_test.go`, `DESIGN.md` §7.2.
+
+**Verification.** PASS. `TestAuthentication` asserts a 52-byte reply that
+decodes as `IsCryptoNAK()` for both a corrupted digest and an unknown key id,
+and that it is never longer than the request. `FuzzReplyNeverAmplifies` gained
+the assertion the review asks for — a NAK is only ever sent for a request of
+at least 52 bytes — and ran clean for 21 s / 2.8 M executions.

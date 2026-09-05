@@ -296,14 +296,15 @@ func runDaemon(args []string) int {
 		timeServer, err = ntpserver.Listen(ntpserver.ServiceConfig{
 			Listen: cfg.ServeListenAddrs(),
 			Handler: ntpserver.Config{
-				Allow:        allow,
-				Deny:         deny,
-				RequireKey:   require,
-				Keys:         keys,
-				RateLimitPPS: cfg.Serve.RateLimitPPS,
-				RateBurst:    cfg.Serve.RateBurst,
-				MaxClients:   cfg.Serve.MaxClients,
-				KoD:          cfg.Serve.KoD,
+				Allow:             allow,
+				Deny:              deny,
+				RequireKey:        require,
+				Keys:              keys,
+				RateLimitPPS:      cfg.Serve.RateLimitPPS,
+				RateBurst:         cfg.Serve.RateBurst,
+				RateLimitV6Prefix: cfg.Serve.RateLimitV6Prefix,
+				MaxClients:        cfg.Serve.MaxClients,
+				KoD:               cfg.Serve.KoD,
 				Status: func() ntpserver.SystemStatus {
 					st := eng.Status()
 					return ntpserver.SystemStatus{

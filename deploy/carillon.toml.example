@@ -157,6 +157,12 @@ iburst  = true
 #                  forged source address can draw out of this server by 32x.
 #                  chrony and ntpd both default to about one packet every
 #                  eight seconds.
+#   rate_limit_v6_prefix
+#                  IPv6 prefix one token bucket covers. Every residential
+#                  IPv6 customer controls at least a /64, so a bucket per
+#                  /128 lets one host draw rate_burst replies per address
+#                  indefinitely and churn the table, evicting real clients.
+#                  IPv4 is always per address.
 #   max_clients    The rate-limit table is bounded and evicts the least
 #                  recently used entry, so a flood of forged addresses costs
 #                  fixed memory. Roughly 100 bytes an entry.
@@ -181,6 +187,7 @@ iburst  = true
 #deny           = []
 #rate_limit_pps = 0.25
 #rate_burst     = 8
+#rate_limit_v6_prefix = 64
 #max_clients    = 262144
 #recv_buffer    = 4194304
 #kod            = true
