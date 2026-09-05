@@ -23,6 +23,11 @@ const (
 	// PPS sample itself is only unambiguous within ±0.5 s; the guard band
 	// leaves 0.1 s of margin.
 	PPSGuard = 0.4
+
+	// ppsAgreementFloor is the smallest slack allowed when comparing a PPS
+	// offset with a numbering source's: a millisecond covers the numbering
+	// source's own jitter budget on any real path.
+	ppsAgreementFloor = 1e-3
 )
 
 // SelectStatus is a source's role after the most recent selection.
@@ -96,6 +101,12 @@ type SourceState struct {
 	// Status and Distance are outputs of the last Select call.
 	Status   SelectStatus
 	Distance float64
+
+	// DisagreesWith and Disagreement describe a PPS source whose offset is
+	// too far from the numbering source that should be vouching for it: the
+	// signature of a pulse captured on the wrong edge. Empty otherwise.
+	DisagreesWith string
+	Disagreement  float64
 
 	// everReachable and everSurvived remember that this source has been
 	// usable at least once, so that "the preferred source is not usable"
@@ -175,6 +186,25 @@ func (s *SourceState) candidate() (bool, SelectStatus) {
 	return true, StatusSurvivor
 }
 
+// ppsAgreement compares a PPS source's offset with the surviving numbering
+// sources. It reports agreement as soon as one of them is within its own root
+// distance plus a jitter allowance; otherwise it names the closest and by how
+// much it disagrees, which is what points an operator at edge, pps_mode 0x10
+// or offset.
+func ppsAgreement(p *SourceState, numbering []*SourceState, now float64) (name string, delta float64, agrees bool) {
+	closest := math.Inf(1)
+	for _, n := range numbering {
+		d := math.Abs(n.Offset - p.Offset)
+		if d <= n.RootDistance(now)+math.Max(4*n.Jitter, ppsAgreementFloor) {
+			return "", 0, true
+		}
+		if d < closest {
+			closest, name = d, n.Name
+		}
+	}
+	return name, closest, false
+}
+
 // Selection is the outcome of Select.
 type Selection struct {
 	// Survivors are the sources that passed intersection and clustering,
@@ -236,14 +266,34 @@ func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
 
 	// A PPS edge only says "a second starts here". It may be used once a
 	// surviving numbering source agrees the clock is within the guard band.
+	var numbering []*SourceState
 	for _, s := range survivors {
 		if s.Numbering && math.Abs(s.Offset) < PPSGuard {
-			sel.PPSQualified = true
-			break
+			numbering = append(numbering, s)
 		}
 	}
+	sel.PPSQualified = len(numbering) > 0
 	if sel.PPSQualified {
 		for _, p := range pps {
+			// Proximity to zero is not agreement. A PPS captured on the
+			// wrong edge — "assert" on a receiver whose second mark is the
+			// falling edge, or an inverted signal that pps_mode should have
+			// had 0x10 for — reports a rock-steady offset equal to the
+			// pulse width, typically 20–200 ms, with microsecond jitter. It
+			// locks, and the numbering source then reports roughly minus
+			// the pulse width, still comfortably inside the 0.4 s band. The
+			// daemon would discipline the clock 20–200 ms wrong while
+			// advertising stratum 1, refid PPS and a few microseconds of
+			// root dispersion, and the correct NTP source would be the one
+			// that looked wrong. So require the PPS to agree with a
+			// surviving numbering source to within that source's own
+			// uncertainty.
+			name, delta, agrees := ppsAgreement(p, numbering, now)
+			p.DisagreesWith, p.Disagreement = name, delta
+			if !agrees {
+				p.Status = StatusFalseticker
+				continue
+			}
 			p.Status = StatusSurvivor
 			survivors = append(survivors, p)
 		}

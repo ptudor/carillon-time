@@ -385,3 +385,34 @@ decodes as `IsCryptoNAK()` for both a corrupted digest and an unknown key id,
 and that it is never longer than the request. `FuzzReplyNeverAmplifies` gained
 the assertion the review asks for — a NAK is only ever sent for a request of
 at least 52 bytes — and ran clean for 21 s / 2.8 M executions.
+
+## RF5X-007 — A qualified prefer PPS never enters the intersection; a wrong-edge PPS is undetected — FIXED
+
+**Changed.** PPS qualification now requires *agreement*, not just the presence
+of a numbering source near zero. `Select` collects the surviving numbering
+sources that pass the existing `|θ| < 0.4 s` test, and each PPS source must
+satisfy `|θ_n − θ_pps| ≤ λ_n + max(4·ψ_n, 1 ms)` against at least one of them
+(`ppsAgreement`). A locked, stable PPS that fails is marked
+`StatusFalseticker` rather than `StatusUnqualified`, which makes `reselect`
+emit `EventFalseticker` and the engine log at WARN once; the transition
+Unqualified→Falseticker no longer emits the misleading `EventPPSQualified`.
+`SourceState`/`SourceStatus` carry `DisagreesWith`/`Disagreement`, surfaced as
+`disagrees_with`/`disagreement_seconds` on the control socket and as an
+AGREEMENT column in `carillonctl refclock`, and a disagreeing pulse reads as
+not qualified and not locked. The 0.4 s guard band, the PPS bypass of the
+combine step once qualified, and the no-numbering-source `EventPPSUnqualified`
+path are unchanged.
+
+**Files.** `internal/discipline/select.go`, `internal/discipline/system.go`,
+`internal/discipline/select_test.go`, `internal/control/protocol.go`,
+`cmd/carillonctl/main.go`, `DESIGN.md` §5.2.
+
+**Verification.** PASS. `TestSelectPPSMustAgreeWithItsNumberingSource` is the
+review's stated test: NTP at θ = 0.000 with a PPS at θ = 0.120 and 1 µs jitter
+gives `StatusFalseticker`, the NTP source as system source, `PreferLost` true,
+and `disagrees with ntp by 0.120`; NTP at θ = 0.100 ± 2 ms with a PPS at
+θ = 0.101 stays qualified and drives the clock. The existing
+`TestSelectPPSQualification` was corrected — its NTP source was 0.1 s from its
+PPS, which is exactly the wrong-edge signature. The hardware check (swap
+`edge`, confirm the daemon logs the disagreement and does not go to stratum 1)
+remains a target-host step.

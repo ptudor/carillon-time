@@ -123,6 +123,11 @@ type SourceStatus struct {
 	RefID      ntp.RefID
 	Leap       ntp.Leap
 	Updated    float64
+
+	// DisagreesWith and Disagreement are set on a PPS source whose offset
+	// is too far from the numbering source that should vouch for it.
+	DisagreesWith string
+	Disagreement  float64
 }
 
 // System ties the sources, selection and loop together and owns the state
@@ -304,7 +309,7 @@ func (s *System) reselect(now float64) Result {
 		if src.PPS {
 			if is == StatusUnqualified && was != StatusUnqualified {
 				res.Events = append(res.Events, Event{Kind: EventPPSUnqualified, Source: src.Name})
-			} else if was == StatusUnqualified && is != StatusUnqualified && is != StatusUnreachable && is != StatusInvalid {
+			} else if was == StatusUnqualified && is != StatusUnqualified && is != StatusUnreachable && is != StatusInvalid && is != StatusFalseticker {
 				res.Events = append(res.Events, Event{Kind: EventPPSQualified, Source: src.Name})
 			}
 		}
@@ -497,21 +502,23 @@ func (s *System) Status(now float64) Status {
 	}
 	for _, src := range s.all() {
 		st.Sources = append(st.Sources, SourceStatus{
-			Name:       src.Name,
-			Status:     src.Status,
-			Prefer:     src.Prefer,
-			NoSelect:   src.NoSelect,
-			Reach:      src.Reach,
-			Poll:       src.Poll,
-			Offset:     src.Offset,
-			Delay:      src.Delay,
-			Dispersion: src.Dispersion,
-			Jitter:     src.Jitter,
-			Distance:   src.Distance,
-			Stratum:    src.Stratum,
-			RefID:      src.RefID,
-			Leap:       src.Leap,
-			Updated:    src.Updated,
+			Name:          src.Name,
+			Status:        src.Status,
+			Prefer:        src.Prefer,
+			NoSelect:      src.NoSelect,
+			Reach:         src.Reach,
+			Poll:          src.Poll,
+			Offset:        src.Offset,
+			Delay:         src.Delay,
+			Dispersion:    src.Dispersion,
+			Jitter:        src.Jitter,
+			Distance:      src.Distance,
+			Stratum:       src.Stratum,
+			RefID:         src.RefID,
+			Leap:          src.Leap,
+			DisagreesWith: src.DisagreesWith,
+			Disagreement:  src.Disagreement,
+			Updated:       src.Updated,
 		})
 	}
 	return st

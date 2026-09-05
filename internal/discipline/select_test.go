@@ -165,13 +165,19 @@ func TestSelectMinSurvivors(t *testing.T) {
 	}
 }
 
-func TestSelectPPSQualification(t *testing.T) {
-	ntpSrc := src("ntp", 0.1, 0.020, Options{Numbering: true})
-	pps := &SourceState{
+// testPPSSource is a locked, stable PPS at the given offset: rock-steady, a
+// couple of microseconds of dispersion, and marked prefer.
+func testPPSSource(offset float64) *SourceState {
+	return &SourceState{
 		Name: "pps", Options: Options{PPS: true, Prefer: true},
 		Reach: 0xff, Poll: 4, Valid: true, At: 100, Updated: 100,
-		Offset: 50e-6, Dispersion: 2e-6, Jitter: 1e-6, Stratum: 0, Leap: ntp.LeapNone,
+		Offset: offset, Dispersion: 2e-6, Jitter: 1e-6, Stratum: 0, Leap: ntp.LeapNone,
 	}
+}
+
+func TestSelectPPSQualification(t *testing.T) {
+	ntpSrc := src("ntp", 60e-6, 0.020, Options{Numbering: true})
+	pps := testPPSSource(50e-6)
 	sel := Select([]*SourceState{ntpSrc, pps}, 100, 1)
 	if !sel.PPSQualified || sel.System != pps || sel.Offset != 50e-6 {
 		t.Fatalf("pps must drive when qualified: q=%v sys=%v off=%v", sel.PPSQualified, sel.System.Name, sel.Offset)
@@ -187,6 +193,45 @@ func TestSelectPPSQualification(t *testing.T) {
 	}
 	if !sel.PreferLost {
 		t.Fatal("an unqualified prefer PPS counts as prefer lost")
+	}
+}
+
+// TestSelectPPSMustAgreeWithItsNumberingSource covers RF5X-007. A PPS
+// captured on the wrong edge reports a rock-steady offset equal to the pulse
+// width, so it locks and qualifies on proximity to zero alone, and the daemon
+// disciplines the clock by that much while advertising stratum 1 refid PPS.
+// Agreement with the numbering source, not just its presence, is what makes
+// the second numbering trustworthy.
+func TestSelectPPSMustAgreeWithItsNumberingSource(t *testing.T) {
+	ntpSrc := src("ntp", 0.000, 0.020, Options{Numbering: true})
+	pps := testPPSSource(0.120) // a 120 ms pulse width, captured on the wrong edge
+	sel := Select([]*SourceState{ntpSrc, pps}, 100, 1)
+	if pps.Status != StatusFalseticker {
+		t.Fatalf("wrong-edge PPS status %v, want falseticker", pps.Status)
+	}
+	if sel.System != ntpSrc {
+		t.Fatalf("system source %v, want the numbering source", sel.System.Name)
+	}
+	if !sel.PreferLost {
+		t.Fatal("a disagreeing prefer PPS counts as prefer lost")
+	}
+	if pps.DisagreesWith != "ntp" || math.Abs(pps.Disagreement-0.120) > 1e-6 {
+		t.Fatalf("disagreement reported as %q by %v, want ntp by 0.120",
+			pps.DisagreesWith, pps.Disagreement)
+	}
+
+	// The offset itself is not the test: a clock that is 100 ms out has both
+	// sources saying so, and the PPS is then the better of the two.
+	ntpSrc = src("ntp", 0.100, 0.020, Options{Numbering: true})
+	ntpSrc.Jitter = 2e-3
+	pps = testPPSSource(0.101)
+	sel = Select([]*SourceState{ntpSrc, pps}, 100, 1)
+	if !sel.PPSQualified || sel.System != pps || pps.Status != StatusSystem {
+		t.Fatalf("an agreeing PPS must drive: qualified=%v system=%v status=%v",
+			sel.PPSQualified, sel.System.Name, pps.Status)
+	}
+	if pps.DisagreesWith != "" || pps.Disagreement != 0 {
+		t.Fatalf("agreeing PPS reported a disagreement: %q %v", pps.DisagreesWith, pps.Disagreement)
 	}
 }
 

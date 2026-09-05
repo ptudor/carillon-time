@@ -106,7 +106,7 @@ func run(args []string) int {
 func printRefclocks(rs []control.Refclock) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	defer w.Flush()
-	fmt.Fprintln(w, "NAME\tTYPE\tDEVICE\tEDGE\tREACH\tPOLL\tWINDOW σ\tQUALIFIED\tLOCKED\tFIX/SATS\tLAG\tSEQ\tGAPS/GLITCHES/SPIKES")
+	fmt.Fprintln(w, "NAME\tTYPE\tDEVICE\tEDGE\tREACH\tPOLL\tWINDOW σ\tQUALIFIED\tLOCKED\tFIX/SATS\tLAG\tSEQ\tGAPS/GLITCHES/SPIKES\tAGREEMENT")
 	for _, r := range rs {
 		fix := "-"
 		if r.FixKnown {
@@ -116,10 +116,16 @@ func printRefclocks(rs []control.Refclock) {
 		if r.LagSamples != 0 {
 			lag = seconds(r.MeasuredLag, false)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%v\t%v\t%s\t%s\t%d\t%d/%d/%d\n",
+		// A pulse that disagrees with the source numbering its seconds is
+		// almost always on the wrong edge: check edge, pps_mode 0x10, offset.
+		agreement := "-"
+		if r.DisagreesWith != "" {
+			agreement = fmt.Sprintf("disagrees with %s by %s", r.DisagreesWith, seconds(r.Disagreement, false))
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%v\t%v\t%s\t%s\t%d\t%d/%d/%d\t%s\n",
 			r.Name, r.Type, r.Device, r.Edge, control.ReachOctal(r.Reach), r.Poll,
 			seconds(r.WindowJitter, false), r.Qualified, r.Locked, fix, lag,
-			r.Sequence, r.Gaps, r.Glitches, r.Spikes)
+			r.Sequence, r.Gaps, r.Glitches, r.Spikes, agreement)
 	}
 }
 
