@@ -41,6 +41,15 @@ const (
 	// MinPoll and MaxPoll bound the poll exponent (log2 seconds).
 	MinPoll = 2
 	MaxPoll = 17
+
+	// reachBits is the width of a source's reachability register, and so the
+	// number of missed polls after which a source that is still reporting
+	// would read as unreachable.
+	reachBits = 8
+
+	// minFreshness is the floor on the freshness deadline in seconds, so a
+	// very short poll cannot produce a deadline that ordinary jitter trips.
+	minFreshness = 64.0
 )
 
 // Measurement is what a source delivers to the engine after its own clock
@@ -72,7 +81,27 @@ type Measurement struct {
 
 	// Valid is false when a poll produced no usable sample; then only
 	// Source, Now, Reach and Poll are meaningful.
+	//
+	// Valid means "a new estimate to consume", not "the poll succeeded".
+	// A good reply whose clock filter winner is unchanged is emitted with
+	// Valid = false, because there is nothing new to integrate.
 	Valid bool
+
+	// Acquired reports that this event *is* a successful acquisition from
+	// the source in the current clock epoch: an authenticated, plausible
+	// reply that entered the filter, an accepted PPS edge, an accepted NMEA
+	// sentence. It is deliberately separate from Valid: a good reply whose
+	// filter winner is unchanged is an acquisition without a new estimate,
+	// and a timeout, a bad MAC, a rejected packet, an invalidation notice
+	// or a sample from a superseded epoch is a heartbeat without one.
+	//
+	// Settling counts acquisitions, so a transport heartbeat cannot stand
+	// in for the post-step evidence the state machine requires (RA6X-010).
+	//
+	// Valid implies acquisition — there is no new estimate without one — so
+	// a producer only has to set this for the acquisition-without-estimate
+	// case. Read it through IsAcquisition.
+	Acquired bool
 
 	// Invalidate explicitly discards the source's previous estimate while
 	// retaining reachability. Ordinary misses leave it false so an older NTP
@@ -123,3 +152,8 @@ type Options struct {
 	// Numbering source before it may be used (see System).
 	PPS bool
 }
+
+// IsAcquisition reports whether this event is a successful acquisition from
+// the source: either it carries a new estimate, or it is an accepted sample
+// whose clock filter winner did not change.
+func (m Measurement) IsAcquisition() bool { return m.Valid || m.Acquired }

@@ -222,7 +222,7 @@ func (n *NTP) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 				return nil
 			}
 			n.miss("resolve failed")
-			if !n.emit(ctx, out, nil, n.generation()) {
+			if !n.emit(ctx, out, nil, n.generation(), false) {
 				return nil
 			}
 		case n.cfg.IBurst && n.reach == 0:
@@ -329,6 +329,11 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		n.updateInfo(func(i *Info) { i.Sent++ })
 	}
 	var s *sample
+	// acquired is set only by a reply that was authenticated, plausible and
+	// entered the clock filter. It is separate from s != nil: a good reply
+	// whose filter winner is unchanged produces no new estimate but is
+	// still a successful acquisition (RA6X-010).
+	var acquired bool
 	var kiss *kissError
 	var bogus *bogusError
 	switch {
@@ -349,6 +354,7 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 			n.discardStale(now)
 		default:
 			s = n.hit(res)
+			acquired = true
 		}
 	case ctx.Err() != nil:
 		return false
@@ -390,7 +396,7 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		// generation is current now.
 		gen = n.generation()
 	}
-	return n.emit(ctx, out, s, gen)
+	return n.emit(ctx, out, s, gen, acquired)
 }
 
 // discardStale records a reply whose exchange spanned a clock step or leap
@@ -539,13 +545,14 @@ func (n *NTP) miss(reason string) {
 }
 
 // emit sends the measurement for the poll that just completed.
-func (n *NTP) emit(ctx context.Context, out chan<- discipline.Measurement, s *sample, gen uint64) bool {
+func (n *NTP) emit(ctx context.Context, out chan<- discipline.Measurement, s *sample, gen uint64, acquired bool) bool {
 	m := discipline.Measurement{
 		Source:     n.cfg.Name,
 		Now:        n.clk.Monotonic(),
 		Reach:      n.reach,
 		Poll:       n.poll,
 		Generation: gen,
+		Acquired:   acquired,
 	}
 	if s != nil {
 		pkt := s.out.Packet

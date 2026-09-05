@@ -2,6 +2,8 @@ package discipline
 
 import (
 	"fmt"
+	"math"
+	"net/netip"
 	"testing"
 
 	"carillon/internal/ntp"
@@ -216,4 +218,567 @@ func TestAstra6LeapConsensusCases(t *testing.T) {
 			t.Fatalf("a PPS with no calendar information voted down the warning: LI %v", s.leap)
 		}
 	})
+}
+
+// TestAstra6SettlingLossDoesNotSynchronize is the review's RA6X-009 probe.
+// SETTLING and SYNCED both entered HOLDOVER when selection lost its last
+// source, and HOLDOVER is served as synchronized by the wire and the kernel —
+// so losing evidence increased the trust placed in a clock the daemon had
+// never finished settling.
+func TestAstra6SettlingLossDoesNotSynchronize(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 3
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	s.Update(Measurement{Source: "a", Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone})
+	if s.State() != StateSettling {
+		t.Fatalf("setup state=%v", s.State())
+	}
+	s.Update(Measurement{Source: "a", Now: 2, Reach: 0, Poll: 6})
+	st := s.Status(2)
+	if st.State == StateHoldover || st.Leap != ntp.LeapUnsync || st.Stratum != 16 {
+		t.Fatalf("never synchronized but loss yields state=%v LI=%v stratum=%d", st.State, st.Leap, st.Stratum)
+	}
+}
+
+// TestAstra6HoldoverEntryRequiresSynchronization covers the rest of
+// RA6X-009's list.
+func TestAstra6HoldoverEntryRequiresSynchronization(t *testing.T) {
+	valid := func(name string, at float64, offset float64) Measurement {
+		return Measurement{
+			Source: name, Now: at, At: at, Valid: true, Reach: 255, Poll: 6,
+			Offset: offset, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone,
+		}
+	}
+	lost := func(name string, at float64) Measurement {
+		return Measurement{Source: name, Now: at, Reach: 0, Poll: 6, Invalidate: true}
+	}
+
+	t.Run("an already-synced daemon still holds over", func(t *testing.T) {
+		cfg := simConfig()
+		cfg.SettleUpdates = 1
+		s := New(cfg, 0, true)
+		s.AddSource("a", Options{Numbering: true})
+		s.Update(valid("a", 1, 0.001))
+		s.Update(valid("a", 2, 0.001))
+		if s.State() != StateSynced {
+			t.Fatalf("setup state=%v", s.State())
+		}
+		s.Update(lost("a", 3))
+		if s.State() != StateHoldover {
+			t.Fatalf("a synchronized daemon must hold over: state=%v", s.State())
+		}
+	})
+
+	t.Run("loss after a step stays unsynchronized", func(t *testing.T) {
+		cfg := simConfig()
+		cfg.SettleUpdates = 1
+		s := New(cfg, 0, true)
+		s.AddSource("a", Options{Numbering: true})
+		s.Update(valid("a", 1, 0.001))
+		s.Update(valid("a", 2, 0.001))
+		if s.State() != StateSynced {
+			t.Fatalf("setup state=%v", s.State())
+		}
+		// A step invalidates the synchronization that preceded it.
+		res := s.Update(valid("a", 3, 5))
+		stepped := false
+		for _, a := range res.Actions {
+			if a.Kind == ActionStep {
+				stepped = true
+			}
+		}
+		if !stepped {
+			t.Skip("this configuration did not step")
+		}
+		s.Update(lost("a", 4))
+		if s.State() == StateHoldover {
+			t.Fatal("losing the source right after a step was served as holdover")
+		}
+	})
+
+	t.Run("settling after synchronization may hold over", func(t *testing.T) {
+		cfg := simConfig()
+		cfg.SettleUpdates = 3
+		s := New(cfg, 0, true)
+		s.AddSource("a", Options{Numbering: true})
+		for i := 1; i <= 5; i++ {
+			s.Update(valid("a", float64(i), 0.001))
+		}
+		if s.State() != StateSynced {
+			t.Fatalf("setup state=%v", s.State())
+		}
+		// Drop to SETTLING without a step: lose the source, come back, and
+		// lose it again. Synchronization is still applicable.
+		s.Update(lost("a", 10))
+		if s.State() != StateHoldover {
+			t.Fatalf("state after the first loss: %v", s.State())
+		}
+		s.Update(valid("a", 11, 0.001))
+		s.Update(lost("a", 12))
+		if s.State() != StateHoldover {
+			t.Fatalf("a previously synchronized daemon must still hold over: %v", s.State())
+		}
+	})
+}
+
+// TestAstra6MissIsNotSettlingEvidence is the review's RA6X-010 probe. Every
+// Measurement naming the system source incremented the settling counter,
+// including timeouts, bad authentication and rejected packets, so a transport
+// heartbeat could complete settling on its own.
+func TestAstra6MissIsNotSettlingEvidence(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 1
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	s.Update(Measurement{Source: "a", Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone})
+	s.Update(Measurement{Source: "a", Now: 65, Reach: 254, Poll: 6})
+	if s.State() == StateSynced {
+		t.Fatal("timeout-only measurement completed settling")
+	}
+}
+
+// TestAstra6SettlingEvidenceKinds covers RA6X-010's list: which events count
+// toward settling and which do not.
+func TestAstra6SettlingEvidenceKinds(t *testing.T) {
+	base := Measurement{Source: "a", Reach: 255, Poll: 6}
+	cases := []struct {
+		name   string
+		mutate func(*Measurement)
+		counts bool
+	}{
+		{"a good reply with an unchanged filter winner", func(m *Measurement) { m.Acquired = true }, true},
+		{"a new estimate", func(m *Measurement) {
+			m.Valid, m.At, m.Offset, m.Delay, m.Jitter, m.Stratum = true, 65, 0.001, 0.01, 1e-6, 2
+		}, true},
+		{"a timeout", func(m *Measurement) { m.Reach = 254 }, false},
+		{"a bad MAC", func(m *Measurement) { m.Reach = 254 }, false},
+		{"an unusable stratum", func(m *Measurement) { m.Reach = 254 }, false},
+		{"a reset notice", func(m *Measurement) { m.Invalidate = true }, false},
+		{"a PPS spike", func(m *Measurement) { m.Reach = 254 }, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := simConfig()
+			cfg.SettleUpdates = 1
+			s := New(cfg, 0, true)
+			s.AddSource("a", Options{Numbering: true})
+			s.Update(Measurement{Source: "a", Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone})
+			if s.State() != StateSettling {
+				t.Fatalf("setup state=%v", s.State())
+			}
+			m := base
+			m.Now = 65
+			c.mutate(&m)
+			s.Update(m)
+			if got := s.State() == StateSynced; got != c.counts {
+				t.Fatalf("settling completed = %v, want %v (state %v)", got, c.counts, s.State())
+			}
+		})
+	}
+}
+
+// TestAstra6TickExpiresSilentSources is the RA6X-003 probe. Selection ages
+// uncertainty and rejects over-distance sources, but it ran only on a
+// measurement or an explicit lifecycle event: if every producer went silent a
+// synchronized source stayed selected indefinitely and the holdover timer
+// never started.
+func TestAstra6TickExpiresSilentSources(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 1
+	cfg.HoldoverMax = 600
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	for i := 1; i <= 2; i++ {
+		s.Update(Measurement{
+			Source: "a", Now: float64(i), At: float64(i), Valid: true, Reach: 255, Poll: 6,
+			Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone,
+		})
+	}
+	if s.State() != StateSynced {
+		t.Fatalf("setup state=%v", s.State())
+	}
+
+	// Nothing reports again. Ticks alone must expire the source, start
+	// holdover, and eventually run it out.
+	now := 2.0
+	holdoverAt := 0.0
+	unsyncedAt := 0.0
+	for now < 20000 {
+		now += 1
+		s.Tick(now)
+		if holdoverAt == 0 && s.State() == StateHoldover {
+			holdoverAt = now
+		}
+		if s.State() == StateUnsynced {
+			unsyncedAt = now
+			break
+		}
+	}
+	if holdoverAt == 0 {
+		t.Fatal("ticks alone never entered holdover; the source stayed selected for ever")
+	}
+	// The freshness deadline for poll 6 is eight polls: 512 s.
+	if holdoverAt > 700 {
+		t.Fatalf("holdover started at %v s, far past the source's own freshness deadline", holdoverAt)
+	}
+	if unsyncedAt == 0 {
+		t.Fatal("holdover never expired")
+	}
+	if unsyncedAt-holdoverAt < cfg.HoldoverMax {
+		t.Fatalf("holdover lasted %v s, less than the configured %v", unsyncedAt-holdoverAt, cfg.HoldoverMax)
+	}
+	st := s.Status(unsyncedAt)
+	if st.Leap != ntp.LeapUnsync || st.Stratum != 16 {
+		t.Fatalf("expired holdover still advertises LI=%v stratum=%d", st.Leap, st.Stratum)
+	}
+}
+
+// TestAstra6TickKeepsSparseButLegalPolls checks the freshness deadline does
+// not punish a legitimately sparse association.
+func TestAstra6TickKeepsSparseButLegalPolls(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 1
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	for i := 1; i <= 2; i++ {
+		s.Update(Measurement{
+			Source: "a", Now: float64(i), At: float64(i), Valid: true, Reach: 255, Poll: 17,
+			Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone,
+		})
+	}
+	if s.State() != StateSynced {
+		t.Fatalf("setup state=%v", s.State())
+	}
+	// Six hours of silence from a poll-17 association is entirely legal and
+	// well inside the RFC root-distance limit, which is what eventually
+	// retires such a source (Phi ageing reaches MaxDistance at about 27.8
+	// hours). The freshness deadline must not preempt it.
+	for now := 3.0; now < 21600; now += 60 {
+		s.Tick(now)
+	}
+	if s.State() != StateSynced {
+		t.Fatalf("a legal poll-17 association was expired after six hours: %v", s.State())
+	}
+}
+
+// TestAstra6FreshnessDeadlineScales pins the deadline to the source's own
+// poll interval, so a sparse association is not punished for being sparse and
+// a 1 Hz refclock is not carried for a day.
+func TestAstra6FreshnessDeadlineScales(t *testing.T) {
+	cases := []struct {
+		poll int8
+		want float64
+	}{
+		{2, minFreshness},  // 8*4 = 32 s, raised to the floor
+		{3, minFreshness},  // 8*8 = 64 s, exactly the floor
+		{4, 128},           // a PPS refclock
+		{6, 512},           // the default NTP minimum
+		{10, 8192},         // the default NTP maximum
+		{17, 8 * 131072},   // the largest legal poll
+		{0, minFreshness},  // below MinPoll: clamped
+		{100, 8 * 131072},  // above MaxPoll: clamped
+		{-5, minFreshness}, // nonsense: clamped
+	}
+	for _, c := range cases {
+		if got := freshnessDeadline(c.poll); got != c.want {
+			t.Errorf("freshnessDeadline(%d) = %v, want %v", c.poll, got, c.want)
+		}
+	}
+	// The deadline must never be tighter than the reach register it stands
+	// in for.
+	for poll := int8(MinPoll); poll <= MaxPoll; poll++ {
+		if d, reach := freshnessDeadline(poll), reachBits*math.Ldexp(1, int(poll)); d < reach && d != minFreshness {
+			t.Errorf("freshnessDeadline(%d) = %v, tighter than the %v s reach register", poll, d, reach)
+		}
+	}
+}
+
+// TestAstra6TickDoesNotReintegrate checks the tick-driven reselection cannot
+// re-apply an observation the loop has already consumed, and that switching
+// the system source away and back does not either.
+func TestAstra6TickDoesNotReintegrate(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 1
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	s.Update(Measurement{
+		Source: "a", Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6,
+		Offset: 0.5, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone,
+	})
+	updates := s.loop.Updates
+	for now := 2.0; now < 12; now++ {
+		s.Tick(now)
+	}
+	if s.loop.Updates != updates {
+		t.Fatalf("ticks integrated %d further loop updates from one observation", s.loop.Updates-updates)
+	}
+}
+
+// TestAstra6ReportsNeverReachablePreferAfterFallback covers RA6X-050.
+// PreferLost required the preferred source to have been reachable at least
+// once, so a miswired or permanently unavailable preferred GPS could be
+// absent for ever while fallback service was reported healthy.
+func TestAstra6ReportsNeverReachablePreferAfterFallback(t *testing.T) {
+	gps := &SourceState{Name: "gps", Options: Options{Prefer: true, Numbering: true}}
+	up := &SourceState{
+		Name: "up", Options: Options{Numbering: true},
+		Reach: 255, Poll: 6, Valid: true, At: 1, Updated: 1,
+		Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2,
+	}
+	// Successful fallback operation; the preferred source never answers.
+	var sel Selection
+	for now := 1.0; now < 5; now++ {
+		up.Updated = now
+		sel = Select([]*SourceState{gps, up}, now, 1)
+	}
+	if sel.System != up {
+		t.Fatalf("fallback was not established: system=%v", sel.System)
+	}
+	if !sel.PreferLost {
+		t.Fatal("a preferred source that never answered is never reported lost")
+	}
+}
+
+// TestAstra6PreferLostPhases covers the rest of RA6X-050's list.
+func TestAstra6PreferLostPhases(t *testing.T) {
+	newPair := func() (*SourceState, *SourceState) {
+		return &SourceState{Name: "gps", Options: Options{Prefer: true, Numbering: true}},
+			&SourceState{Name: "up", Options: Options{Numbering: true}}
+	}
+	makeValid := func(s *SourceState, now, offset float64) {
+		s.Reach, s.Poll, s.Valid = 255, 6, true
+		s.At, s.Updated = now, now
+		s.Offset, s.Delay, s.Jitter, s.Stratum = offset, 0.01, 1e-6, 2
+	}
+
+	t.Run("initial acquisition is quiet", func(t *testing.T) {
+		gps, up := newPair()
+		sel := Select([]*SourceState{gps, up}, 1, 1)
+		if sel.PreferLost {
+			t.Fatal("prefer loss reported before anything was ever usable")
+		}
+	})
+
+	t.Run("a delayed first answer clears it", func(t *testing.T) {
+		gps, up := newPair()
+		makeValid(up, 1, 0.001)
+		sel := Select([]*SourceState{gps, up}, 1, 1)
+		if !sel.PreferLost {
+			t.Fatal("setup: prefer loss not reported")
+		}
+		makeValid(gps, 2, 0.001)
+		sel = Select([]*SourceState{gps, up}, 2, 1)
+		if sel.PreferLost {
+			t.Fatal("prefer loss still reported after the preferred source answered")
+		}
+		if sel.System != gps {
+			t.Fatalf("the preferred source did not take over: %v", sel.System)
+		}
+	})
+
+	t.Run("later loss and recovery", func(t *testing.T) {
+		gps, up := newPair()
+		makeValid(gps, 1, 0.001)
+		makeValid(up, 1, 0.001)
+		if sel := Select([]*SourceState{gps, up}, 1, 1); sel.PreferLost {
+			t.Fatal("setup: prefer loss reported while the preferred source was fine")
+		}
+		gps.Reach, gps.Valid = 0, false
+		if sel := Select([]*SourceState{gps, up}, 2, 1); !sel.PreferLost {
+			t.Fatal("losing the preferred source was not reported")
+		}
+		makeValid(gps, 3, 0.001)
+		up.Updated = 3
+		if sel := Select([]*SourceState{gps, up}, 3, 1); sel.PreferLost {
+			t.Fatal("recovery was not reported")
+		}
+	})
+
+	t.Run("noselect prefer is not a configured preference", func(t *testing.T) {
+		gps, up := newPair()
+		gps.NoSelect = true
+		makeValid(up, 1, 0.001)
+		if sel := Select([]*SourceState{gps, up}, 1, 1); sel.PreferLost {
+			t.Fatal("a noselect source counted as a configured preference")
+		}
+	})
+}
+
+// TestAstra6ClearsObsoleteDisagreement covers RA6X-051. DisagreesWith and
+// Disagreement were assigned only inside the PPS-qualified branch, so losing
+// the numbering source left a previously disagreeing PPS marked with a
+// current-looking finding even though no comparison existed any more.
+func TestAstra6ClearsObsoleteDisagreement(t *testing.T) {
+	pps := &SourceState{
+		Name: "pps0", Options: Options{PPS: true},
+		Reach: 255, Poll: 4, Valid: true, At: 1, Updated: 1,
+		Offset: 0.1, Delay: 0, Jitter: 1e-7, Stratum: 0,
+	}
+	gps := &SourceState{
+		Name: "gps", Options: Options{Numbering: true},
+		Reach: 255, Poll: 4, Valid: true, At: 1, Updated: 1,
+		Offset: 0.0, Delay: 0.001, Jitter: 1e-6, Stratum: 0,
+	}
+	sel := Select([]*SourceState{pps, gps}, 1, 1)
+	if !sel.PPSQualified || pps.DisagreesWith == "" {
+		t.Fatalf("setup: qualified=%v disagreement=%q", sel.PPSQualified, pps.DisagreesWith)
+	}
+
+	t.Run("numbering loss clears it", func(t *testing.T) {
+		gps.Reach, gps.Valid = 0, false
+		Select([]*SourceState{pps, gps}, 2, 1)
+		if pps.DisagreesWith != "" || pps.Disagreement != 0 {
+			t.Fatalf("obsolete diagnostic retained: %q %v", pps.DisagreesWith, pps.Disagreement)
+		}
+	})
+
+	t.Run("pps reach zero clears it", func(t *testing.T) {
+		gps.Reach, gps.Valid = 255, true
+		gps.Updated = 3
+		pps.Updated = 3
+		Select([]*SourceState{pps, gps}, 3, 1)
+		if pps.DisagreesWith == "" {
+			t.Fatal("setup: no disagreement to clear")
+		}
+		pps.Reach, pps.Valid = 0, false
+		Select([]*SourceState{pps, gps}, 4, 1)
+		if pps.DisagreesWith != "" {
+			t.Fatalf("an unreachable PPS kept its disagreement: %q", pps.DisagreesWith)
+		}
+	})
+
+	t.Run("agreement clears it", func(t *testing.T) {
+		pps.Reach, pps.Valid, pps.Offset, pps.Updated = 255, true, 0.0, 5
+		gps.Updated = 5
+		Select([]*SourceState{pps, gps}, 5, 1)
+		if pps.DisagreesWith != "" {
+			t.Fatalf("an agreeing PPS kept a disagreement: %q", pps.DisagreesWith)
+		}
+	})
+
+	t.Run("noselect clears it", func(t *testing.T) {
+		pps.Offset, pps.Updated, pps.NoSelect = 0.1, 6, false
+		gps.Updated = 6
+		Select([]*SourceState{pps, gps}, 6, 1)
+		if pps.DisagreesWith == "" {
+			t.Fatal("setup: no disagreement to clear")
+		}
+		pps.NoSelect = true
+		Select([]*SourceState{pps, gps}, 7, 1)
+		if pps.DisagreesWith != "" {
+			t.Fatalf("a noselect PPS kept its disagreement: %q", pps.DisagreesWith)
+		}
+	})
+}
+
+// TestAstra6RejectsTimingLoops covers RA6X-038. A peer reporting this host as
+// its reference, or a configured self-address, was still eligible: after
+// losing a real upstream two mutually configured instances could begin
+// selecting each other's retained time while advertising independence.
+func TestAstra6RejectsTimingLoops(t *testing.T) {
+	me4 := netip.MustParseAddr("192.0.2.10")
+	me6 := netip.MustParseAddr("2001:db8::10")
+	local := map[ntp.RefID]bool{
+		ntp.RefIDFromAddr(me4): true,
+		ntp.RefIDFromAddr(me6): true,
+	}
+	peer := netip.MustParseAddr("192.0.2.20")
+	third := netip.MustParseAddr("198.51.100.7")
+
+	src := func(name string, addr netip.Addr, ref ntp.RefID, stratum uint8) *SourceState {
+		return &SourceState{
+			Name: name, Options: Options{Numbering: true},
+			Reach: 255, Poll: 6, Valid: true, At: 1, Updated: 1,
+			Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: stratum,
+			SourceRefID: ntp.RefIDFromAddr(addr), RefID: ref,
+		}
+	}
+
+	cases := []struct {
+		name     string
+		source   *SourceState
+		rejected bool
+	}{
+		{"a peer synchronized to us", src("peer", peer, ntp.RefIDFromAddr(me4), 2), true},
+		{"a peer synchronized to our v6 address", src("peer6", peer, ntp.RefIDFromAddr(me6), 2), true},
+		{"our own address configured as a server", src("self", me4, ntp.RefIDFromAddr(third), 2), true},
+		{"our own v6 address configured as a server", src("self6", me6, ntp.RefIDFromAddr(third), 2), true},
+		{"a peer sharing a third upstream", src("peer", peer, ntp.RefIDFromAddr(third), 2), false},
+		{"a stratum-1 peer with a textual refid", src("gps", peer, ntp.RefIDFromString("GPS"), 1), false},
+		{"a stratum-1 peer whose textual id looks like our address", src("odd", peer, ntp.RefIDFromString("PPS"), 1), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sel := SelectWithLocal([]*SourceState{c.source}, 1, 1, local)
+			rejected := sel.System == nil
+			if rejected != c.rejected {
+				t.Fatalf("rejected=%v, want %v (status %v)", rejected, c.rejected, c.source.Status)
+			}
+			if c.rejected {
+				var reported bool
+				for _, ev := range sel.Events {
+					if ev.Kind == EventTimingLoop && ev.Source == c.source.Name {
+						reported = true
+					}
+				}
+				if !reported {
+					t.Fatal("a rejected timing loop was not reported")
+				}
+			}
+		})
+	}
+}
+
+// TestAstra6TimingLoopTransitions checks the event fires once on each
+// transition and that recovery is reported.
+func TestAstra6TimingLoopTransitions(t *testing.T) {
+	me := netip.MustParseAddr("192.0.2.10")
+	local := map[ntp.RefID]bool{ntp.RefIDFromAddr(me): true}
+	peer := &SourceState{
+		Name: "peer", Options: Options{Numbering: true},
+		Reach: 255, Poll: 6, Valid: true, At: 1, Updated: 1,
+		Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2,
+		SourceRefID: ntp.RefIDFromAddr(netip.MustParseAddr("192.0.2.20")),
+		RefID:       ntp.RefIDFromAddr(me),
+	}
+	count := func(sel Selection, kind EventKind) int {
+		n := 0
+		for _, ev := range sel.Events {
+			if ev.Kind == kind {
+				n++
+			}
+		}
+		return n
+	}
+	if got := count(SelectWithLocal([]*SourceState{peer}, 1, 1, local), EventTimingLoop); got != 1 {
+		t.Fatalf("first selection reported %d loop events, want 1", got)
+	}
+	if got := count(SelectWithLocal([]*SourceState{peer}, 2, 1, local), EventTimingLoop); got != 0 {
+		t.Fatalf("a standing loop was reported again: %d events", got)
+	}
+	peer.RefID = ntp.RefIDFromAddr(netip.MustParseAddr("198.51.100.7"))
+	sel := SelectWithLocal([]*SourceState{peer}, 3, 1, local)
+	if got := count(sel, EventTimingLoopCleared); got != 1 {
+		t.Fatalf("recovery reported %d times, want 1", got)
+	}
+	if sel.System != peer {
+		t.Fatal("the peer was not usable again once its reference changed")
+	}
+}
+
+// TestAstra6NoLocalIdentityDisablesTheCheck confirms the check is inert when
+// local addresses could not be enumerated.
+func TestAstra6NoLocalIdentityDisablesTheCheck(t *testing.T) {
+	me := netip.MustParseAddr("192.0.2.10")
+	peer := &SourceState{
+		Name: "peer", Options: Options{Numbering: true},
+		Reach: 255, Poll: 6, Valid: true, At: 1, Updated: 1,
+		Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2,
+		SourceRefID: ntp.RefIDFromAddr(netip.MustParseAddr("192.0.2.20")),
+		RefID:       ntp.RefIDFromAddr(me),
+	}
+	if sel := Select([]*SourceState{peer}, 1, 1); sel.System != peer {
+		t.Fatal("the loop check fired with no local identity configured")
+	}
 }

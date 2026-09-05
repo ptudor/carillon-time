@@ -364,6 +364,10 @@ func TestAstra6SourceStopPropagatesFatalErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	clk.fail.Store(true)
+	// syncKernel skips the syscall when the status is unchanged; clear the
+	// cache so the stop path is guaranteed to make an actuator call, which
+	// is the thing whose failure must propagate.
+	e.haveKernel = false
 	if err := e.sourceStopped("a", errors.New("gone"), time.Second); err == nil {
 		t.Fatal("an actuator failure during source-stop reselection was swallowed")
 	}

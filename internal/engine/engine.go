@@ -907,6 +907,11 @@ func (e *Engine) logEvent(ev discipline.Event) {
 		e.log.Error("PPS present but nothing to number its seconds — add an NTP server or use a gps refclock", "source", ev.Source)
 	case discipline.EventPPSQualified:
 		e.log.Info("PPS seconds qualified again", "source", ev.Source)
+	case discipline.EventTimingLoop:
+		e.log.Error("refusing a source that is this daemon or is synchronized to it", "source", ev.Source,
+			"hint", "remove the self-reference, or give both instances an independent upstream")
+	case discipline.EventTimingLoopCleared:
+		e.log.Info("source is no longer a timing loop", "source", ev.Source)
 	}
 }
 

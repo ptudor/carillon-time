@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime"
@@ -285,6 +286,7 @@ func runDaemon(args []string) int {
 			MinSurvivors:  cfg.Discipline.MinSurvivors,
 			HoldoverMax:   cfg.Discipline.HoldoverMax,
 			SettleUpdates: cfg.Discipline.SettleUpdates,
+			LocalRefIDs:   localRefIDs(log),
 		},
 		DriftFile:         cfg.Daemon.DriftFile,
 		DriftStableWindow: time.Duration(cfg.Daemon.DriftStableSeconds * float64(time.Second)),
@@ -750,4 +752,36 @@ func yesno(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// localRefIDs is the set of RFC 5905 §7.3 reference identifiers naming this
+// host, one per local unicast address on every interface. Selection uses it
+// to refuse a source that is this daemon or that is synchronized to it
+// (RA6X-038).
+//
+// Every address is included, so a multihomed host is covered whichever one a
+// peer reaches it on, and loopback is included so a configuration pointing at
+// the local server is caught. The set is built once at startup, like the rest
+// of the configuration; an address added later is not covered until a
+// restart. Enumeration failing is not fatal — it only disables the check —
+// because a daemon that cannot list its interfaces can still keep time.
+func localRefIDs(log *slog.Logger) map[ntp.RefID]bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Warn("cannot enumerate local addresses; self-synchronization and timing loops will not be detected", "error", err)
+		return nil
+	}
+	ids := make(map[ntp.RefID]bool, len(addrs))
+	for _, a := range addrs {
+		prefix, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		addr, ok := netip.AddrFromSlice(prefix.IP)
+		if !ok {
+			continue
+		}
+		ids[ntp.RefIDFromAddr(addr.Unmap())] = true
+	}
+	return ids
 }

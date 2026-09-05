@@ -102,17 +102,32 @@ type SourceState struct {
 	Status   SelectStatus
 	Distance float64
 
-	// DisagreesWith and Disagreement describe a PPS source whose offset is
+	// usedAt is the sample time of the last estimate the loop consumed from
+	// this source. It is per source rather than one system-wide value,
+	// because switching the system source and switching back must not make
+	// an unchanged observation look new (RA6X-003, RA6X-001).
+	usedAt float64
+
+	// stale is set by Select when the estimate is older than this source's
+	// own freshness deadline. See freshnessDeadline.
+	stale bool
+
+	// DisagreesWith and Disagreement describe the comparison made in the
+	// most recent Select, for a PPS source whose offset is
 	// too far from the numbering source that should be vouching for it: the
 	// signature of a pulse captured on the wrong edge. Empty otherwise.
 	DisagreesWith string
 	Disagreement  float64
 
-	// everReachable and everSurvived remember that this source has been
-	// usable at least once, so that "the preferred source is not usable"
-	// is not reported before it has ever had a chance to be.
-	everReachable bool
-	everSurvived  bool
+	// inLoop remembers that this source was last seen to be a timing loop,
+	// so the event is reported once on each transition.
+	inLoop bool
+
+	// everSurvived remembers that this source has been usable at least
+	// once, so that "the preferred source is not usable" is not reported
+	// during the initial acquisition phase, when nothing has established
+	// service yet.
+	everSurvived bool
 
 	// sinceStep counts the valid measurements this source has delivered
 	// since the last clock step. A second step must not rest on a single
@@ -180,10 +195,42 @@ func (s *SourceState) candidate() (bool, SelectStatus) {
 		return false, StatusUnreachable
 	case s.NoSelect:
 		return false, StatusNoSelect
+	case s.stale:
+		// Nothing has been heard from this source for longer than its own
+		// polling makes plausible. Reach normally says this first, but reach
+		// only moves when a producer emits something: a source whose
+		// goroutine is wedged, or whose device is in a reconnect loop that
+		// reports nothing, would otherwise stay selected for the 27 hours
+		// it takes Phi ageing alone to push its distance past MaxDistance
+		// (RA6X-003).
+		return false, StatusUnreachable
 	case !s.Valid, s.Leap == ntp.LeapUnsync, s.Stratum >= 16, s.Distance >= MaxDistance:
 		return false, StatusInvalid
 	}
 	return true, StatusSurvivor
+}
+
+// freshnessDeadline is how long a source's estimate may stand without a new
+// measurement before it stops being eligible. It is derived from the source's
+// own poll interval, so a legitimately sparse NTP association at poll 17 is
+// not punished for being sparse, and a 1 Hz refclock is not carried for a day.
+//
+// Eight poll intervals is the width of the reach register: a source that has
+// missed that many slots would have reach 0 if anything were still reporting
+// on its behalf. The floor keeps a very short poll from producing a deadline
+// so tight that ordinary jitter trips it.
+func freshnessDeadline(poll int8) float64 {
+	if poll < MinPoll {
+		poll = MinPoll
+	}
+	if poll > MaxPoll {
+		poll = MaxPoll
+	}
+	d := reachBits * math.Ldexp(1, int(poll))
+	if d < minFreshness {
+		return minFreshness
+	}
+	return d
 }
 
 // ppsAgreement compares a PPS source's offset with the surviving numbering
@@ -226,29 +273,83 @@ type Selection struct {
 
 	// Low and High are the intersection interval, for diagnostics.
 	Low, High float64
+
+	// Events carries notable things selection itself noticed, such as a
+	// source entering or leaving a timing loop.
+	Events []Event
 }
 
 // Select runs the RFC 5905 §11.2 selection, clustering and combining
 // algorithms over the sources at time now and writes each source's Status
 // and Distance. minSurvivors is the number of survivors required before a
 // system source is declared.
+// timingLoop reports whether a source is this daemon, or is synchronized to
+// it. RFC 5905's fitness test (appendix A.5.5.3) includes the same check.
+//
+// Both directions matter. SourceRefID is the peer's own address: matching it
+// means the configured server *is* this host. RefID is what the peer says it
+// is synchronized to: matching it means our time would come back to us. A
+// textual identifier — "GPS ", "PPS ", a kiss code — is never an address and
+// is never a loop.
+//
+// Two peers that share a third upstream have equal RefIDs to each other, not
+// to ours, so ordinary shared-upstream configurations are unaffected. For
+// IPv6 the identifier is a 32-bit hash of the address, so a collision could
+// reject a legitimate peer; that fails closed, costs one source, and has a
+// probability of about 2^-32 per local address. A peer behind NAT reporting a
+// public address this host does not itself hold cannot be detected here.
+func timingLoop(s *SourceState, local map[ntp.RefID]bool) bool {
+	if len(local) == 0 {
+		return false
+	}
+	if !s.SourceRefID.IsText() && local[s.SourceRefID] {
+		return true
+	}
+	if s.Stratum > 1 && !s.RefID.IsText() && local[s.RefID] {
+		return true
+	}
+	return false
+}
+
 func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
+	return SelectWithLocal(sources, now, minSurvivors, nil)
+}
+
+// SelectWithLocal is Select with the local reference identities needed for the
+// timing-loop check.
+func SelectWithLocal(sources []*SourceState, now float64, minSurvivors int, local map[ntp.RefID]bool) Selection {
 	var sel Selection
 	var cands, pps []*SourceState
-	preferConfigured, preferSeen, anySurvived := false, false, false
+	preferConfigured, anySurvived := false, false
 	for _, s := range sources {
 		s.Distance = s.RootDistance(now)
-		ok, st := s.candidate()
-		s.Status = st
-		if s.Reach != 0 {
-			s.everReachable = true
+		s.stale = s.Valid && now-s.Updated > freshnessDeadline(s.Poll)
+		if s.PPS {
+			// These describe the comparison made in *this* selection.
+			// Retaining them when no comparison happens — the PPS was
+			// rejected as a candidate, or nothing survived to number its
+			// seconds — makes a historical finding read as a current one
+			// and sends an operator hunting for an edge or calibration
+			// error when the present problem is numbering loss (RA6X-051).
+			s.DisagreesWith, s.Disagreement = "", 0
 		}
+		ok, st := s.candidate()
+		if ok && timingLoop(s, local) {
+			ok, st = false, StatusInvalid
+			if !s.inLoop {
+				s.inLoop = true
+				sel.Events = append(sel.Events, Event{Kind: EventTimingLoop, Source: s.Name})
+			}
+		} else if s.inLoop {
+			s.inLoop = false
+			sel.Events = append(sel.Events, Event{Kind: EventTimingLoopCleared, Source: s.Name})
+		}
+		s.Status = st
 		if s.everSurvived {
 			anySurvived = true
 		}
 		if s.Prefer && !s.NoSelect {
 			preferConfigured = true
-			preferSeen = preferSeen || s.everReachable
 		}
 		if !ok {
 			continue
@@ -311,7 +412,16 @@ func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
 	// Reporting it there logs an ERROR at every daemon start, followed by
 	// "preferred source is back in charge" a few seconds later, which is a
 	// false page for anyone alerting on ERROR lines.
-	reportPreferLost := preferConfigured && preferSeen && (anySurvived || len(survivors) > 0)
+	//
+	// What is suppressed is the *initial acquisition phase*, not the case
+	// the operator most needs to hear about. Requiring the preferred source
+	// itself to have been reachable once meant a miswired or misconfigured
+	// preferred GPS could be absent for ever while fallback service was
+	// reported healthy (RA6X-050). Once some source has established
+	// service, a configured preferred source that is not usable is
+	// reported, whether or not it has ever answered.
+	fallbackEstablished := anySurvived || len(survivors) > 0
+	reportPreferLost := preferConfigured && fallbackEstablished
 	if len(survivors) == 0 || len(survivors) < minSurvivors {
 		sel.PreferLost = reportPreferLost
 		return sel

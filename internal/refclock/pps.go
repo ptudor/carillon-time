@@ -414,6 +414,10 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 		return m
 	}
 	p.rejectRun = 0
+	// The edge passed sequence, interval and spike checks: this is a
+	// successful acquisition even if the window is not yet deep enough for
+	// the measurement to be Valid (RA6X-010).
+	m.Acquired = true
 	wasUnreachable := p.reach == 0
 	p.reach = p.reach<<1 | 1
 	if wasUnreachable && p.haveEverPulse {
