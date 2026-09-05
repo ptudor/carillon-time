@@ -54,6 +54,14 @@ type Config struct {
 	// Version is reported in status snapshots.
 	Version string
 
+	// Generation is the measurement epoch shared with the sources: the
+	// engine bumps it on every clock step and leap reset, and each source
+	// stamps the value it read when it began a sample. It is created here
+	// rather than by the engine because the sources are constructed first.
+	// Nil means the engine keeps a private counter, which is right for
+	// tests whose sources do not stamp.
+	Generation *atomic.Uint64
+
 	// Observe receives each immutable status snapshot after publication. It
 	// must return promptly; optional statistics use a bounded non-blocking
 	// queue so disk I/O never enters the clock-discipline path.
@@ -102,6 +110,9 @@ type Engine struct {
 	driftErrShown  bool
 	lastLeapWall   time.Time
 	lastFileLeap   ntp.Leap
+
+	gen        *atomic.Uint64
+	staleDrops map[string]uint64
 }
 
 // New builds an engine. It loads the initial frequency (drift file, then the
@@ -116,15 +127,25 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 	freq, known, origin := initialFrequency(cfg.DriftFile, clk, log)
 	log.Info("initial frequency", "ppm", freq, "known", known, "from", origin)
 
+	gen := cfg.Generation
+	if gen == nil {
+		gen = new(atomic.Uint64)
+	}
+	// Generation 0 means "unstamped" and is never stale, so the live
+	// counter starts at 1.
+	gen.CompareAndSwap(0, 1)
+
 	e := &Engine{
-		cfg:     cfg,
-		clk:     clk,
-		log:     log,
-		sys:     discipline.New(cfg.Discipline, freq, known),
-		sources: make(map[string]SourceSpec, len(cfg.Sources)),
-		meas:    make(chan discipline.Measurement, 64),
-		reqs:    make(chan func(), 16),
-		tick:    time.Second,
+		cfg:        cfg,
+		clk:        clk,
+		log:        log,
+		sys:        discipline.New(cfg.Discipline, freq, known),
+		sources:    make(map[string]SourceSpec, len(cfg.Sources)),
+		meas:       make(chan discipline.Measurement, 64),
+		reqs:       make(chan func(), 16),
+		tick:       time.Second,
+		gen:        gen,
+		staleDrops: make(map[string]uint64, len(cfg.Sources)),
 	}
 	for _, s := range cfg.Sources {
 		name := s.Source.Name()
@@ -271,6 +292,9 @@ loop:
 		case <-ctx.Done():
 			break loop
 		case m := <-e.meas:
+			if e.stale(m) {
+				continue
+			}
 			if err := e.handle(e.sys.Update(m), m.Now); err != nil {
 				runErr = err
 				break loop
@@ -321,6 +345,27 @@ func (e *Engine) restoreBaseFrequency(runErr error) {
 		"ppm", base, "abandoned_slew_ppm", applied-base, "abandoned_phase", e.sys.Pending())
 }
 
+// stale reports whether a measurement describes a clock reading the engine
+// has since invalidated. Sources stamp the generation they read when they
+// began a sample and discard the sample themselves if it changed before they
+// emitted; this catches the remaining window, where the engine bumped the
+// generation after the source's last look but before this measurement came
+// off the channel. Applying such a measurement is what stepped the clock a
+// second time by the same amount.
+func (e *Engine) stale(m discipline.Measurement) bool {
+	if m.Generation == 0 {
+		return false // the source does not stamp generations
+	}
+	current := e.gen.Load()
+	if m.Generation >= current {
+		return false
+	}
+	e.staleDrops[m.Source]++
+	e.log.Debug("discarding a measurement taken before a clock step",
+		"source", m.Source, "generation", m.Generation, "current", current)
+	return true
+}
+
 func (e *Engine) sourceExited(name string, err error) {
 	if err != nil {
 		e.log.Error("source stopped", "source", name, "error", err)
@@ -351,6 +396,9 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 				return fmt.Errorf("engine: %w of %.3f ppm: %w", errFrequencyRefused, a.Value, err)
 			}
 		case discipline.ActionStep:
+			// Bump before the step so that anything a source is holding,
+			// and anything already queued, is recognisable as pre-step.
+			e.gen.Add(1)
 			before := e.clk.Now()
 			if err := e.clk.Step(time.Duration(a.Value * float64(time.Second))); err != nil {
 				return fmt.Errorf("engine: kernel refused step of %.6f s: %w", a.Value, err)
@@ -370,6 +418,9 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 	wall := e.clk.Now()
 	if e.cfg.LeapTable != nil {
 		if e.cfg.LeapTable.Crossed(e.lastLeapWall, wall) {
+			// A leap moves the clock by a second: every measurement in
+			// flight is wrong by exactly that much.
+			e.gen.Add(1)
 			for _, src := range e.sources {
 				src.Source.Reset()
 			}
@@ -493,7 +544,9 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 		s.LeapSource = "sources"
 	}
 	for name, spec := range e.sources {
-		s.Infos[name] = spec.Source.Info()
+		info := spec.Source.Info()
+		info.Stale += e.staleDrops[name]
+		s.Infos[name] = info
 	}
 	e.status.Store(s)
 	if e.cfg.Observe != nil {

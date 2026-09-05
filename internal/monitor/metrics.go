@@ -170,6 +170,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		for result, value := range map[string]uint64{
 			"sent": src.Sent, "received": src.Received, "timeout": src.Timeouts,
 			"bogus": src.Bogus, "bad_auth": src.BadAuth, "kiss": src.Kiss,
+			"stale": src.Stale,
 		} {
 			counter(c.sourceEvents, value, src.Name, result)
 		}

@@ -23,7 +23,7 @@ func hasAction(acts []Action, k ActionKind) (Action, bool) {
 
 func TestLoopFirstUpdate(t *testing.T) {
 	l := NewLoop(loopCfg(), 12.5, true)
-	u := l.Update(0.010, 6, 1000, false)
+	u := l.Update(0.010, 6, 1000, false, true)
 	if u.Stepped || u.Ignored || u.PanicRefused {
 		t.Fatalf("%+v", u)
 	}
@@ -37,7 +37,7 @@ func TestLoopFirstUpdate(t *testing.T) {
 
 func TestLoopStepPolicy(t *testing.T) {
 	l := NewLoop(loopCfg(), 0, true)
-	u := l.Update(1.0, 6, 0, false)
+	u := l.Update(1.0, 6, 0, false, true)
 	if !u.Stepped || l.Steps != 1 {
 		t.Fatalf("expected step: %+v", u)
 	}
@@ -48,11 +48,11 @@ func TestLoopStepPolicy(t *testing.T) {
 		t.Fatal("step must reset filters")
 	}
 	// Two more updates use up the limit of 3.
-	l.Update(0.001, 6, 64, false)
-	l.Update(0.001, 6, 128, false)
+	l.Update(0.001, 6, 64, false, true)
+	l.Update(0.001, 6, 128, false, true)
 	// Two poll intervals after the previous update the popcorn gate no
 	// longer applies, so the offset is accepted — and slewed, not stepped.
-	u = l.Update(1.0, 6, 128+128, true)
+	u = l.Update(1.0, 6, 128+128, true, true)
 	if u.Stepped {
 		t.Fatal("no step allowed after the startup window")
 	}
@@ -66,47 +66,47 @@ func TestLoopStepPolicy(t *testing.T) {
 	never := loopCfg()
 	never.StepLimit = 0
 	l = NewLoop(never, 0, true)
-	if u := l.Update(5, 6, 0, false); u.Stepped {
+	if u := l.Update(5, 6, 0, false, true); u.Stepped {
 		t.Fatal("limit 0 must never step")
 	}
 	always := loopCfg()
 	always.StepLimit = -1
 	l = NewLoop(always, 0, true)
 	for i := 0; i < 5; i++ {
-		l.Update(0.001, 6, float64(i)*64, false)
+		l.Update(0.001, 6, float64(i)*64, false, true)
 	}
-	if u := l.Update(5, 6, 1000, true); !u.Stepped {
+	if u := l.Update(5, 6, 1000, true, true); !u.Stepped {
 		t.Fatal("limit -1 must always step")
 	}
 }
 
 func TestLoopPanic(t *testing.T) {
 	l := NewLoop(loopCfg(), 0, true)
-	u := l.Update(2000, 6, 0, false)
+	u := l.Update(2000, 6, 0, false, true)
 	if !u.PanicRefused || len(u.Actions) != 0 || l.Updates != 0 {
 		t.Fatalf("panic must refuse: %+v", u)
 	}
 	cfg := loopCfg()
 	cfg.PanicAtStartup = true
 	l = NewLoop(cfg, 0, true)
-	if u := l.Update(2000, 6, 0, false); !u.Stepped {
+	if u := l.Update(2000, 6, 0, false, true); !u.Stepped {
 		t.Fatalf("panic_at_startup must step: %+v", u)
 	}
-	if u := l.Update(2000, 6, 64, false); !u.PanicRefused {
+	if u := l.Update(2000, 6, 64, false, true); !u.PanicRefused {
 		t.Fatal("only the first correction may exceed the panic threshold")
 	}
 	// Panic with stepping disabled is still refused rather than slewed.
 	cfg = loopCfg()
 	cfg.StepLimit = 0
 	l = NewLoop(cfg, 0, true)
-	if u := l.Update(2000, 6, 0, false); !u.PanicRefused {
+	if u := l.Update(2000, 6, 0, false, true); !u.PanicRefused {
 		t.Fatal("panic with limit 0 must refuse")
 	}
 }
 
 func TestLoopTickSlew(t *testing.T) {
 	l := NewLoop(loopCfg(), 10, true)
-	l.Update(0.010, 6, 0, false) // tau = 4·64 = 256
+	l.Update(0.010, 6, 0, false, true) // tau = 4·64 = 256
 	acts := l.Tick(1)
 	a, ok := hasAction(acts, ActionSetFrequency)
 	if !ok {
@@ -132,7 +132,7 @@ func TestLoopTickClamps(t *testing.T) {
 	cfg := loopCfg()
 	cfg.StepLimit = 0 // slew everything, so a 10 s offset becomes pending phase
 	l := NewLoop(cfg, 400, true)
-	l.Update(10, 6, 0, false) // pending 10 s, slew wants 9.7 ms/s
+	l.Update(10, 6, 0, false, true) // pending 10 s, slew wants 9.7 ms/s
 	acts := l.Tick(1)
 	a, _ := hasAction(acts, ActionSetFrequency)
 	if a.Value != 500 {
@@ -143,7 +143,7 @@ func TestLoopTickClamps(t *testing.T) {
 		t.Fatalf("pending %v", l.Pending)
 	}
 	l = NewLoop(cfg, 0, true)
-	l.Update(10, 6, 0, false)
+	l.Update(10, 6, 0, false, true)
 	acts = l.Tick(1)
 	a, _ = hasAction(acts, ActionSetFrequency)
 	if a.Value != 500 {
@@ -167,9 +167,9 @@ func TestLoopFrequencyClamp(t *testing.T) {
 		t.Fatalf("initial clamp: %v", l.Freq)
 	}
 	l = NewLoop(loopCfg(), 0, true)
-	l.Update(0, 2, 0, false)
+	l.Update(0, 2, 0, false, true)
 	for i := 1; i < 2000; i++ {
-		l.Update(0.007, 2, float64(i)*4, false) // just inside the linear region at poll 2 (τ = 16 s)
+		l.Update(0.007, 2, float64(i)*4, false, true) // just inside the linear region at poll 2 (τ = 16 s)
 	}
 	if l.Freq != 500 {
 		t.Fatalf("a persistent positive offset must drive the frequency to the +500 ppm clamp: %v", l.Freq)
@@ -180,11 +180,11 @@ func TestLoopAntiWindup(t *testing.T) {
 	cfg := loopCfg()
 	cfg.StepLimit = 0
 	l := NewLoop(cfg, 10, true)
-	l.Update(0, 6, 0, false)
+	l.Update(0, 6, 0, false, true)
 	// A 1 s offset at τ = 256 s cannot be slewed within the 500 ppm bound
 	// (needs 2000 s); the frequency must not integrate meanwhile.
 	for i := 1; i <= 40; i++ {
-		l.Update(1.0-float64(i)*0.02, 6, float64(i)*64, false)
+		l.Update(1.0-float64(i)*0.02, 6, float64(i)*64, false, true)
 	}
 	if l.Freq != 10 {
 		t.Fatalf("frequency wound up to %v during a saturated slew", l.Freq)
@@ -195,11 +195,11 @@ func TestLoopPopcorn(t *testing.T) {
 	l := NewLoop(loopCfg(), 0, true)
 	now := 0.0
 	for i := 0; i < 10; i++ {
-		l.Update(1e-5*float64(i%2), 6, now, i > 2)
+		l.Update(1e-5*float64(i%2), 6, now, i > 2, true)
 		now += 64
 	}
 	jit := l.Jitter
-	u := l.Update(0.050, 6, now, true) // a spike 64 s after the previous update
+	u := l.Update(0.050, 6, now, true, true) // a spike 64 s after the previous update
 	if !u.Ignored {
 		t.Fatalf("spike must be ignored (jitter %v): %+v", jit, u)
 	}
@@ -207,7 +207,7 @@ func TestLoopPopcorn(t *testing.T) {
 		t.Fatal("an ignored spike must not inflate the jitter")
 	}
 	// The same offset arriving after two poll intervals is accepted.
-	u = l.Update(0.050, 6, now+128, true)
+	u = l.Update(0.050, 6, now+128, true, true)
 	if u.Ignored {
 		t.Fatal("a persistent offset must be accepted after two poll intervals")
 	}
@@ -217,7 +217,7 @@ func TestLoopBootstrapFrequency(t *testing.T) {
 	// With no known frequency, the loop measures it directly over
 	// FreqMeasure seconds: an offset growing 50 µs/s means +50 ppm.
 	l := NewLoop(loopCfg(), 0, false)
-	l.Update(0, 6, 0, false)
+	l.Update(0, 6, 0, false, true)
 	for i := 1; i <= 15; i++ {
 		now := float64(i) * 64
 		// Simulate: offset grows at 50 ppm, minus what the loop slewed.
@@ -225,7 +225,7 @@ func TestLoopBootstrapFrequency(t *testing.T) {
 			l.Tick(now - 64 + float64(k))
 		}
 		offset := 50e-6*now - l.slewed
-		l.Update(offset, 6, now, false)
+		l.Update(offset, 6, now, false, true)
 	}
 	if !l.FreqKnown {
 		t.Fatal("frequency must be known after the measurement window")

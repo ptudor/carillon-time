@@ -406,3 +406,83 @@ func TestSystemRemoveSource(t *testing.T) {
 		t.Fatal("source must be gone")
 	}
 }
+
+// TestSystemSecondStepNeedsMoreThanOneSample is RF5X-002 item 5, the defence
+// in depth behind the generation counter: once the clock has been stepped, a
+// second step must not rest on a single post-step sample from a single
+// source. A measurement computed before the step and applied after it is
+// exactly that, and it used to step the clock again by the same amount in the
+// opposite direction.
+func TestSystemSecondStepNeedsMoreThanOneSample(t *testing.T) {
+	sys := New(simConfig(), 0, true)
+	sys.AddSource("a", Options{Numbering: true})
+	steps := func(res Result) int {
+		n := 0
+		for _, a := range res.Actions {
+			if a.Kind == ActionStep {
+				n++
+			}
+		}
+		return n
+	}
+	m := func(offset, now float64) Measurement {
+		return Measurement{
+			Source: "a", Now: now, At: now, Reach: 0xff, Poll: 6, Valid: true,
+			Offset: offset, Delay: 0.010, Dispersion: 0.001, Jitter: 50e-6,
+			Stratum: 2, Leap: ntp.LeapNone, Precision: -20,
+			SourceRefID: ntp.RefIDFromString("a"),
+		}
+	}
+
+	if n := steps(sys.Update(m(2.0, 64))); n != 1 {
+		t.Fatalf("the first step must be immediate; steps=%d", n)
+	}
+	// The pre-step measurement that arrives next is worth one post-step
+	// sample and must not step.
+	res := sys.Update(m(-2.0, 128))
+	if n := steps(res); n != 0 {
+		t.Fatalf("a second step on one post-step sample; steps=%d", n)
+	}
+	if sys.loop.Updates != 1 || sys.loop.Pending != 0 {
+		t.Fatalf("a deferred step must leave the loop untouched: updates=%d pending=%v",
+			sys.loop.Updates, sys.loop.Pending)
+	}
+	// A second post-step sample that still wants a step gets one.
+	if n := steps(sys.Update(m(-2.0, 192))); n != 1 {
+		t.Fatalf("a genuine second step must still be allowed; steps=%d", n)
+	}
+}
+
+// TestSystemSecondStepWithTwoAgreeingSurvivors is the other arm of the gate:
+// two survivors that have both reported since the step are enough, because
+// survivors have already passed the intersection and so agree.
+func TestSystemSecondStepWithTwoAgreeingSurvivors(t *testing.T) {
+	sys := New(simConfig(), 0, true)
+	sys.AddSource("a", Options{Numbering: true})
+	sys.AddSource("b", Options{Numbering: true})
+	m := func(name string, offset, now float64) Measurement {
+		return Measurement{
+			Source: name, Now: now, At: now, Reach: 0xff, Poll: 6, Valid: true,
+			Offset: offset, Delay: 0.010, Dispersion: 0.001, Jitter: 50e-6,
+			Stratum: 2, Leap: ntp.LeapNone, Precision: -20,
+			SourceRefID: ntp.RefIDFromString(name),
+		}
+	}
+	steps := 0
+	apply := func(res Result) {
+		for _, a := range res.Actions {
+			if a.Kind == ActionStep {
+				steps++
+			}
+		}
+	}
+	apply(sys.Update(m("a", 2.0, 64)))
+	if steps != 1 {
+		t.Fatalf("first step: steps=%d", steps)
+	}
+	apply(sys.Update(m("a", -2.0, 128))) // one post-step sample: deferred
+	apply(sys.Update(m("b", -2.0, 129))) // two survivors agree: allowed
+	if steps != 2 {
+		t.Fatalf("two agreeing survivors must permit the step; steps=%d", steps)
+	}
+}

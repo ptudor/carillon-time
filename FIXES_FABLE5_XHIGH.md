@@ -103,3 +103,53 @@ says not to change — reporting the filter output on every poll and gating only
 the loop update on `updated`, as ntpd does — which is a larger design change
 than this finding authorises and overlaps RF5X-006. Left unfixed; the finding
 is real but needs a fix specification that addresses the staleness rule too.
+
+## RF5X-002 — Pre-step measurements applied after the step, causing a second step — FIXED
+
+**Changed.** `discipline.Measurement` gained a `Generation uint64` stamp. The
+engine owns an `atomic.Uint64` (shared with the sources through
+`engine.Config.Generation`, created in `main.go` because the sources are built
+first) that starts at 1 and is incremented in `handle()` immediately before
+`ActionStep` is applied and immediately before the leap-crossing `Reset()`
+sweep. Each source reads it when it *starts* a sample — NTP before T1, PPS
+before the fetch, NMEA at the `$` that fixes the arrival timestamp — and
+re-reads it before the sample is used; on a change the sample is dropped
+without entering the filter or window, reach is still updated, and a new
+`Stale` counter is incremented (`Received` is not, since the reply was not
+usable). `Engine.stale()` then drops any measurement whose generation is
+behind its own, closing the remaining window between a source's last look and
+the engine dequeuing. `Generation == 0` means "unstamped" and is never stale,
+so test doubles and the `-check`/query paths are unaffected. Stale drops are
+merged into the published per-source `Info` and surface as
+`carillon_source_events_total{result="stale"}` and `carillonctl sources`'
+`stale` field.
+
+Item 5 (defence in depth) is implemented as a caller veto: `Loop.Update` took
+a new `mayStep` argument and reports `Deferred` when a step is withheld —
+leaving the loop wholly untouched, so neither the step budget nor an update is
+consumed. `System.mayStep` grants it always for the first step of a run, and
+afterwards only when the system source has ≥ 2 valid measurements since the
+last step (`SourceState.sinceStep`, zeroed by `invalidate()`) or ≥ 2 survivors
+have each reported once. `Source.Reset()`, the step-policy semantics and the
+existing `Measurement` field names are unchanged.
+
+**Files.** `internal/discipline/measurement.go`, `loop.go`, `select.go`,
+`system.go`, `sim_test.go`, `loop_test.go`; `internal/engine/engine.go`,
+`engine_test.go`; `internal/source/source.go`, `ntp.go`, `source_test.go`;
+`internal/refclock/pps.go`, `nmea.go`; `internal/control/protocol.go`;
+`internal/monitor/metrics.go`; `cmd/carillon/main.go`; `DESIGN.md` §5.1, §6.4,
+§6.6.
+
+**Verification.** PASS. `TestEngineStepsOnceWithTwoSources` promotes the
+review's scratch test and asserts `len(clk.Steps) == 1`; with both guards
+removed it reports the review's evidence verbatim — *steps applied to the
+clock: [2s 2s]*. `TestEngineDropsStaleMeasurement` covers the engine-side
+drop and the "generation 0 is never stale" rule.
+`TestGenerationBumpDiscardsReply` (package `source`) bumps the generation
+inside the fake server's handler and asserts the reply is discarded:
+`Received` unchanged at 0, `Stale == 1`, filter empty, measurement not valid,
+reach still 1. `TestGenerationStampedOnMeasurements` checks the stamp itself.
+`TestSystemSecondStepNeedsMoreThanOneSample` and
+`TestSystemSecondStepWithTwoAgreeingSurvivors` cover both arms of the step
+gate, including that a deferred step leaves `Updates` and `Pending` alone.
+`go vet ./...` and `go test -race ./...` pass.

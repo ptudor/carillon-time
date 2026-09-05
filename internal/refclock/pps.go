@@ -60,7 +60,14 @@ type PPSConfig struct {
 	// between two pulses; without it the daemon's own correction of the
 	// offset the PPS reported looks like a spike.
 	MaxSlewPPM float64
-	OnPulse    func(time.Time)
+
+	// Generation returns the engine's measurement epoch. It is read before
+	// each fetch and again when the edge arrives; a change means the clock
+	// was stepped while we waited, so the kernel's timestamp for that edge
+	// predates the step. Nil disables the check.
+	Generation func() uint64
+
+	OnPulse func(time.Time)
 }
 
 // PPS consumes kernel-timestamped pulse edges and emits robust, averaged
@@ -91,6 +98,7 @@ type PPS struct {
 	stable        bool
 	haveEverPulse bool
 	rejectRun     int
+	staleSeen     uint64
 }
 
 // NewPPS validates cfg and opens its kernel PPS device. Opening at daemon
@@ -174,6 +182,15 @@ func defaultAndValidatePPS(cfg *PPSConfig, clk clock.Clock) error {
 
 func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
+// generation reads the engine's measurement epoch, or 0 when the source was
+// built without one.
+func (p *PPS) generation() uint64 {
+	if p.cfg.Generation == nil {
+		return 0
+	}
+	return p.cfg.Generation()
+}
+
 // Name implements source.Source.
 func (p *PPS) Name() string { return p.cfg.Name }
 
@@ -202,10 +219,22 @@ func (p *PPS) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 		if p.resetRequested.Swap(false) {
 			p.resetWindow()
 		}
+		gen := p.generation()
 		s, err := p.reader.Fetch(defaultFetchTimeout)
 		switch {
 		case err == nil:
+			if now := p.generation(); now != gen {
+				// The clock was stepped while we waited for this edge, so
+				// the kernel's timestamp for it is on the wrong side of the
+				// step. Drop the pulse rather than let it into the window.
+				p.discardStale(now)
+				if !p.emit(ctx, out, p.emptyMeasurement()) {
+					return nil
+				}
+				continue
+			}
 			m := p.accept(s)
+			m.Generation = gen
 			if !p.emit(ctx, out, m) {
 				return nil
 			}
@@ -227,6 +256,16 @@ func (p *PPS) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 			}
 		}
 	}
+}
+
+// discardStale drops a pulse whose kernel timestamp predates a clock step.
+// The edge itself happened, so reach is unaffected; only the offset is
+// unusable, and the window is dropped because everything in it is too.
+func (p *PPS) discardStale(now uint64) {
+	p.staleSeen++
+	p.resetWindow()
+	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) { i.Stale++ })
+	p.log.Info("discarding a pulse that spans a clock step", "count", p.staleSeen, "generation", now)
 }
 
 func (p *PPS) reopen(ctx context.Context) error {
@@ -446,13 +485,20 @@ func (p *PPS) reject(kind string, m *discipline.Measurement) {
 }
 
 func (p *PPS) emptyMeasurement() discipline.Measurement {
-	return discipline.Measurement{Source: p.cfg.Name, Now: p.clk.Monotonic(), Reach: p.reach, Poll: p.poll}
+	return discipline.Measurement{
+		Source: p.cfg.Name, Now: p.clk.Monotonic(), Reach: p.reach, Poll: p.poll,
+		Generation: p.generation(),
+	}
 }
 
 func (p *PPS) emit(ctx context.Context, out chan<- discipline.Measurement, m discipline.Measurement) bool {
 	m.Now = p.clk.Monotonic()
 	m.Reach = p.reach
 	m.Poll = p.poll
+	if !m.Valid {
+		// Nothing was measured, so nothing is tied to a clock reading.
+		m.Generation = p.generation()
+	}
 	select {
 	case out <- m:
 		return true

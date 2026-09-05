@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -140,6 +141,12 @@ func runDaemon(args []string) int {
 		return exitRuntime
 	}
 
+	// The measurement epoch is shared between the engine and every source:
+	// the engine bumps it whenever a step or a leap makes work in flight
+	// wrong, and each source stamps the value it read when it began a
+	// sample. It is created here because the sources are built first.
+	generation := new(atomic.Uint64)
+
 	var specs []engine.SourceSpec
 	for i := range cfg.Servers {
 		s := &cfg.Servers[i]
@@ -149,12 +156,13 @@ func runDaemon(args []string) int {
 			key = &k
 		}
 		src, err := source.NewNTP(source.NTPConfig{
-			Name:    s.Name,
-			Address: s.Address,
-			Key:     key,
-			IBurst:  s.IBurst,
-			PollMin: int8(s.PollMin),
-			PollMax: int8(s.PollMax),
+			Name:       s.Name,
+			Address:    s.Address,
+			Key:        key,
+			IBurst:     s.IBurst,
+			PollMin:    int8(s.PollMin),
+			PollMax:    int8(s.PollMax),
+			Generation: generation.Load,
 		}, clk, log)
 		if err != nil {
 			log.Error("server", "name", s.Name, "error", err)
@@ -176,7 +184,7 @@ func runDaemon(args []string) int {
 			src, err := refclock.NewPPS(refclock.PPSConfig{
 				Name: r.Name, Device: r.Device, Edge: edge, Offset: r.Offset,
 				LockJitter: r.LockJitter, PollMin: int8(r.PollMin), PollMax: int8(r.PollMax),
-				MaxSlewPPM: cfg.Discipline.MaxSlewPPM,
+				MaxSlewPPM: cfg.Discipline.MaxSlewPPM, Generation: generation.Load,
 			}, clk, log)
 			if err != nil {
 				log.Error("refclock", "name", r.Name, "error", err)
@@ -196,6 +204,7 @@ func runDaemon(args []string) int {
 		nmea, err := refclock.NewNMEA(refclock.NMEAConfig{
 			Name: r.Name + "/nmea", Device: r.Device, Baud: r.Baud,
 			Offset: r.NMEAOffset, Sentences: r.Sentences, BuildTime: buildinfo.Time(), Pulse: pulse,
+			Generation: generation.Load,
 		}, clk, log)
 		if err != nil {
 			log.Error("refclock", "name", r.Name, "error", err)
@@ -224,7 +233,7 @@ func runDaemon(args []string) int {
 			Name: r.Name + "/pps", Type: "gps-pps", Device: ppsDevice,
 			Edge: edge, Offset: r.PPSOffset, LockJitter: r.LockJitter,
 			PollMin: int8(r.PollMin), PollMax: int8(r.PollMax), OnPulse: pulse.Observe,
-			MaxSlewPPM: cfg.Discipline.MaxSlewPPM,
+			MaxSlewPPM: cfg.Discipline.MaxSlewPPM, Generation: generation.Load,
 		}, clk, log)
 		if err != nil {
 			_ = nmea.Close()
@@ -268,11 +277,12 @@ func runDaemon(args []string) int {
 			HoldoverMax:   cfg.Discipline.HoldoverMax,
 			SettleUpdates: 3,
 		},
-		DriftFile: cfg.Daemon.DriftFile,
-		Sources:   specs,
-		LeapTable: leapTable,
-		Version:   buildinfo.Version,
-		Observe:   observe,
+		DriftFile:  cfg.Daemon.DriftFile,
+		Sources:    specs,
+		LeapTable:  leapTable,
+		Version:    buildinfo.Version,
+		Observe:    observe,
+		Generation: generation,
 	}, clk, log)
 	if err != nil {
 		log.Error("engine", "error", err)

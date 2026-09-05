@@ -225,6 +225,36 @@ a `Measurement` carries a filtered estimate; `Valid = false` reports a poll
 that produced no new estimate. After a clock step the engine calls `Reset()`
 on every source, because samples taken before the step are wrong by the step.
 
+**Measurement generation.** `Reset()` alone is not enough: it only affects
+samples not yet added. Every source runs in its own goroutine and sends into a
+buffered channel, so at startup several measurements are queued before the
+engine reads the first. The engine steps on one of them and then reads
+another that was computed against the pre-step clock — which, being the only
+valid candidate left, becomes the system source and steps the clock a second
+time by the same amount in the opposite direction. The same window exists
+*inside* one exchange, whose T1 is before a step and T4 after it.
+
+So the engine owns a **generation** counter (`atomic.Uint64`, starting at 1)
+which it increments before every clock step and before every leap-transition
+reset. Each source reads it when it *starts* a sample — an NTP source before
+T1, a PPS source before the fetch that will return the edge, an NMEA source at
+the `$` that fixes the arrival timestamp — and reads it again before the
+sample is used:
+
+- if it changed, the sample is dropped: it does not enter the source's filter
+  or window, reach is updated (the server did answer, the edge did happen),
+  the `Stale` counter is incremented, and the emitted `Measurement` is
+  `Valid = false`;
+- otherwise the `Measurement` carries that generation, and the engine drops
+  any measurement whose generation is behind its own — the remaining window,
+  where the bump happened after the source's last look but before the engine
+  dequeued the measurement.
+
+`Measurement.Generation = 0` means the source does not stamp and is never
+treated as stale. Stale drops are counted per source and surface as
+`carillon_source_events_total{result="stale"}` and the `stale` field of
+`carillonctl sources`.
+
 Per-source config common to all types: `prefer` and `noselect`. There is no
 per-source weight; combining is by root distance (§6.3).
 
@@ -533,7 +563,7 @@ spike gate and a clock-jitter estimate. The *gains* are not ntpd's — see D8.
 Per update with `θ = θ_sys`:
 
 ```
-if the step policy fires (§6.6): Step(θ); pending = 0; Reset() every source; return
+if the step policy fires (§6.6) and a step is permitted: Step(θ); pending = 0; Reset() every source; return
 if synced and |θ − θ_prev| > 3·ψ_clk and μ < 2P: ignore it (popcorn spike); return
 ψ_clk   = exp. average (weight 1/8) of |θ − θ_prev|, floored at the clock precision
 pending = θ                                       # replace, don't accumulate
@@ -625,6 +655,16 @@ panic            = 1000   # seconds; refuse to correct more than this ...
 panic_at_startup = false  # ... unless set, in which case it is allowed for the very first correction
                           # (set true on hosts with no RTC that start at 1970/build time)
 ```
+
+**A second step needs more evidence than the first.** The first step of a run
+is always permitted — it is how a host with no RTC gets its clock. A *further*
+step is permitted only when the system source has delivered at least two valid
+measurements since the last step, or when at least two survivors have each
+delivered one (survivors have passed the intersection, so they agree). A step
+that is withheld is *deferred*, not slewed: no loop state changes, no step
+budget is consumed, and the decision is retaken on the next sample. This is
+the second line of defence behind the generation counter (§5.1) against a
+measurement computed before a step being applied after it.
 
 Semantics match chrony's `makestep 0.5 3` plus ntpd's panic gate. A refused
 panic correction is fatal: the daemon logs the offset and exits 1 rather than
