@@ -468,8 +468,13 @@ noselect = false
 **On the wire:**
 
 - A fresh UDP socket per request, bound to an ephemeral port (RFC 9109 port
-  randomisation), connected to the server address, closed after the reply or
-  timeout.
+  randomisation), **connected** (`connect(2)`) to the server address, closed
+  after the reply or timeout. Connected matters: ICMP port-unreachable is
+  delivered only to a connected socket, so a host that is up but is not
+  running NTP fails at once instead of costing the full 2 s timeout on every
+  poll and 8 s on an `iburst`. It is reported as a miss with the reason
+  "connection refused". The reply's source address is still checked, because
+  a server that answers from a different address is one whose reply we drop.
 - A hostname is resolved once, when the source starts, and re-resolved only
   after 8 consecutive timeouts (the server may have moved). There is no
   periodic re-resolution. A pool name such as `2.fedora.pool.ntp.org` answers
@@ -492,8 +497,16 @@ noselect = false
   "bogus"), root distance sane (`< 1 s` unless configured otherwise),
   reference time not in the future by more than 1 s.
 - **Kiss-o'-Death** (stratum 0): `RATE` → double the poll interval and honour
-  the packet's poll field as the new minimum; `DENY`/`RSTR` → stop polling that
-  server and log ERROR. Any KoD packet that carries a valid MAC is honoured;
+  the packet's poll field as a new **minimum** that persists for as long as
+  we are talking to that server (cleared only when re-resolution yields a
+  different address). It bounds `adaptPoll` from below and survives a loss of
+  reachability; without that, the next noisy update drops the poll straight
+  back under what the server demanded, earns another kiss, and the client
+  oscillates at the server's limit instead of backing off (RFC 8633 §5.4). A
+  demand longer than `poll_max` raises the effective maximum — with one log
+  line — rather than being silently clamped, since continuing to poll faster
+  than a server asked is how a client earns a `DENY`.
+  `DENY`/`RSTR` → stop polling that server and log ERROR. Any KoD packet that carries a valid MAC is honoured;
   unauthenticated KoDs are honoured only for `RATE`.
 - `iburst`: a burst of 4 requests 2 s apart on start-up and whenever the
   server transitions from unreachable to reachable.

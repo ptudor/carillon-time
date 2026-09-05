@@ -431,10 +431,15 @@ func (s *Server) String() string {
 // host:port, IPv4, IPv4:port, [IPv6], [IPv6]:port, and a bare unbracketed
 // IPv6 address (which then uses the default port).
 func (s *Server) HostPort() (host string, port uint16, err error) {
-	return splitHostPort(s.Address)
+	return ParseServerAddress(s.Address)
 }
 
-func splitHostPort(addr string) (string, uint16, error) {
+// ParseServerAddress is the single parser for an upstream address. It is
+// exported so that the source package can be handed a host and a port rather
+// than re-parsing the string with a second implementation: a configuration
+// that passed -check must not then fail when the source is constructed, after
+// the clock and the serial devices are already open.
+func ParseServerAddress(addr string) (string, uint16, error) {
 	if addr == "" {
 		return "", 0, errors.New("address is empty")
 	}

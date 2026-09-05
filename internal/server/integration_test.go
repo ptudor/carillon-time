@@ -53,7 +53,7 @@ func TestClientServerEndToEnd(t *testing.T) {
 
 	qctx, qcancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer qcancel()
-	result, err := source.Query(qctx, s.Addrs()[0].String(), &key, clock.ReadOnly(), 2*time.Second)
+	result, err := source.Query(qctx, s.Addrs()[0].Addr().String(), s.Addrs()[0].Port(), &key, clock.ReadOnly(), 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

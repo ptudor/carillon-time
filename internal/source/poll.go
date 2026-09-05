@@ -1,11 +1,8 @@
 package source
 
 import (
-	"fmt"
 	"math/rand/v2"
-	"net"
 	"net/netip"
-	"strconv"
 	"time"
 
 	"carillon/internal/ntp"
@@ -55,50 +52,6 @@ func clampPrecision(p int8) int8 {
 		return -30
 	}
 	return p
-}
-
-// splitHostPort parses an upstream address: a hostname, an IPv4 or IPv6
-// literal, or any of those with a port ("host:123", "[2001:db8::1]:123").
-// A bare IPv6 literal without brackets is accepted as a host. The default
-// port is 123.
-func splitHostPort(address string) (host string, port uint16, err error) {
-	if address == "" {
-		return "", 0, fmt.Errorf("empty address")
-	}
-	if a, perr := netip.ParseAddr(address); perr == nil {
-		return a.String(), ntp.Port, nil
-	}
-	h, p, serr := net.SplitHostPort(address)
-	if serr != nil {
-		// No port present (a hostname, or a bracketed literal without one).
-		if len(address) > 2 && address[0] == '[' && address[len(address)-1] == ']' {
-			inner := address[1 : len(address)-1]
-			if _, perr := netip.ParseAddr(inner); perr == nil {
-				return inner, ntp.Port, nil
-			}
-		}
-		if len(address) > 0 && address[0] != '[' && !containsColon(address) {
-			return address, ntp.Port, nil
-		}
-		return "", 0, fmt.Errorf("invalid address %q: %w", address, serr)
-	}
-	if h == "" {
-		return "", 0, fmt.Errorf("invalid address %q: empty host", address)
-	}
-	n, aerr := strconv.ParseUint(p, 10, 16)
-	if aerr != nil || n == 0 {
-		return "", 0, fmt.Errorf("invalid address %q: bad port %q", address, p)
-	}
-	return h, uint16(n), nil
-}
-
-func containsColon(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ':' {
-			return true
-		}
-	}
-	return false
 }
 
 // sameEndpoint reports whether two address/port pairs name the same peer,

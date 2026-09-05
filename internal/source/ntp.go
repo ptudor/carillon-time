@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"carillon/internal/clock"
@@ -63,8 +64,15 @@ type NTPConfig struct {
 	// Name identifies the source in logs and status; defaults to Address.
 	Name string
 
-	// Address is the server: hostname or IP literal, optional port.
+	// Address is the server as configured, for logs and status only.
 	Address string
+
+	// Host and Port are the parsed form. They come from
+	// config.ParseServerAddress so that a configuration -check accepted
+	// cannot fail again here, with the clock and the serial devices
+	// already open. Host is a hostname or an IP literal without brackets.
+	Host string
+	Port uint16
 
 	// Key, when set, authenticates requests and requires authenticated
 	// replies (RFC 8573 AES-128-CMAC).
@@ -124,9 +132,16 @@ type NTP struct {
 	consecutiveErrs     uint64
 	denied              bool
 	tsWarned            bool
-	badAuthSeen         uint64
-	bogusSeen           uint64
-	staleSeen           uint64
+	// kodMinPoll is the poll a RATE kiss demanded. RFC 8633 §5.4 makes it a
+	// new *minimum*, not a one-off bump: without it the next noisy update
+	// lets adaptPoll drop straight back below what the server asked for,
+	// earning another kiss, and the client oscillates at the server's limit
+	// instead of backing off. Reset only when the address is re-resolved,
+	// since the demand belongs to the server we were talking to.
+	kodMinPoll  int8
+	badAuthSeen uint64
+	bogusSeen   uint64
+	staleSeen   uint64
 }
 
 // NewNTP validates cfg and returns a source ready to Run.
@@ -134,9 +149,11 @@ func NewNTP(cfg NTPConfig, clk clock.Clock, log *slog.Logger) (*NTP, error) {
 	if cfg.Name == "" {
 		cfg.Name = cfg.Address
 	}
-	host, port, err := splitHostPort(cfg.Address)
-	if err != nil {
-		return nil, fmt.Errorf("source %q: %w", cfg.Name, err)
+	if cfg.Host == "" {
+		return nil, fmt.Errorf("source %q: host is empty", cfg.Name)
+	}
+	if cfg.Port == 0 {
+		return nil, fmt.Errorf("source %q: port is zero", cfg.Name)
 	}
 	if cfg.PollMin == 0 {
 		cfg.PollMin = 6
@@ -161,8 +178,8 @@ func NewNTP(cfg NTPConfig, clk clock.Clock, log *slog.Logger) (*NTP, error) {
 	}
 	n := &NTP{
 		cfg:    cfg,
-		host:   host,
-		port:   port,
+		host:   cfg.Host,
+		port:   cfg.Port,
 		clk:    clk,
 		log:    log.With("source", cfg.Name),
 		filter: discipline.NewFilter(ntp.Log2Seconds(clk.Precision())),
@@ -261,6 +278,8 @@ func (n *NTP) ensureResolved(ctx context.Context) bool {
 	case !n.haveAddr:
 		n.log.Info("resolved server", "address", n.cfg.Address, "resolved", addr)
 	case addr != n.addr:
+		// A different server has no opinion about our poll interval yet.
+		n.kodMinPoll = 0
 		n.filter.Reset()
 		n.log.Info("resolved server", "address", n.cfg.Address, "resolved", addr, "previous", n.addr)
 	}
@@ -328,6 +347,12 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		n.consecutiveTimeouts++
 		n.updateInfo(func(i *Info) { i.Timeouts++; i.LastError = "timeout" })
 		n.miss("timeout")
+	case errors.Is(err, errUnreachable):
+		// The host is up but is not serving NTP. Counted with the timeouts
+		// so re-resolution still kicks in, but without the 2 s wait.
+		n.consecutiveTimeouts++
+		n.updateInfo(func(i *Info) { i.Timeouts++; i.LastError = errUnreachable.Error() })
+		n.miss("connection refused")
 	case errors.Is(err, errBadAuth):
 		n.badAuthSeen++
 		if n.badAuthSeen == 1 || n.badAuthSeen%logEvery == 0 {
@@ -384,7 +409,21 @@ func (n *NTP) handleKiss(k *kissError) {
 		if k.pkt.Poll > want {
 			want = k.pkt.Poll
 		}
+		if want > n.cfg.PollMax {
+			// The server is asking for longer than poll_max allows. Honour
+			// it anyway: continuing to poll faster than a server has asked
+			// is how a client earns a DENY.
+			n.log.Warn("server demands a poll beyond poll_max; honouring it",
+				"demanded", want, "poll_max", n.cfg.PollMax)
+			if want > discipline.MaxPoll {
+				want = discipline.MaxPoll
+			}
+			n.cfg.PollMax = want
+		}
 		want = clampPoll(want, n.cfg.PollMin, n.cfg.PollMax)
+		if want > n.kodMinPoll {
+			n.kodMinPoll = want
+		}
 		n.log.Warn("server asked us to slow down", "old_poll", n.poll, "new_poll", want)
 		n.poll = want
 		n.miss("kiss RATE")
@@ -414,7 +453,7 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	n.consecutiveMisses = 0
 	n.consecutiveErrs = 0
 	if wasUnreachable {
-		n.poll = n.cfg.PollMin
+		n.poll = n.pollFloor()
 		n.log.Info("server reachable", "resolved", n.addr)
 	}
 	if n.resetRequested.Swap(false) {
@@ -444,9 +483,18 @@ func (n *NTP) hit(res exchangeResult) *sample {
 		n.updateInfo(func(i *Info) { i.Reach = n.reach; i.Poll = n.poll })
 		return nil
 	}
-	n.poll = adaptPoll(n.poll, f.Offset, f.Jitter, n.cfg.PollMin, n.cfg.PollMax)
+	n.poll = adaptPoll(n.poll, f.Offset, f.Jitter, n.pollFloor(), n.cfg.PollMax)
 	n.updateInfo(func(i *Info) { i.Reach = n.reach; i.Poll = n.poll })
 	return &sample{out: res, f: f}
+}
+
+// pollFloor is the shortest poll interval this source may use: the
+// configured minimum, raised by anything a RATE kiss has demanded.
+func (n *NTP) pollFloor() int8 {
+	if n.kodMinPoll > n.cfg.PollMin {
+		return n.kodMinPoll
+	}
+	return n.cfg.PollMin
 }
 
 // shouldLogErr counts one failed exchange and reports whether it deserves a
@@ -537,6 +585,10 @@ func realSleep(ctx context.Context, d time.Duration) bool {
 var (
 	errTimeout = errors.New("no reply before timeout")
 	errBadAuth = errors.New("reply failed authentication")
+	// errUnreachable is an ICMP port-unreachable matched to our connected
+	// socket: the host answered, nothing is listening on 123. It counts as
+	// a miss like a timeout, but arrives immediately.
+	errUnreachable = errors.New("no NTP server at the address")
 )
 
 // bogusError is a reply that was addressed to us but is unusable.
@@ -602,7 +654,11 @@ func exchange(ctx context.Context, p exchangeParams) (exchangeResult, error) {
 		network = "udp4"
 		addr = netip.AddrPortFrom(a, addr.Port())
 	}
-	conn, err := net.ListenUDP(network, nil)
+	// A *connected* socket, per DESIGN.md §5.4. ICMP port-unreachable is
+	// only delivered to one, so a host that is up but is not running NTP
+	// otherwise costs the full timeout on every poll — 2 s of a source
+	// goroutine per poll, 8 s for an iburst — instead of failing at once.
+	conn, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(addr))
 	if err != nil {
 		return res, fmt.Errorf("socket: %w", err)
 	}
@@ -627,7 +683,10 @@ func exchange(ctx context.Context, p exchangeParams) (exchangeResult, error) {
 	}
 
 	t1 := p.clk.Now()
-	if _, err := conn.WriteToUDPAddrPort(buf, addr); err != nil {
+	if _, err := conn.Write(buf); err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return res, errUnreachable
+		}
 		return res, fmt.Errorf("send to %s: %w", addr, err)
 	}
 	res.Sent = true
@@ -644,6 +703,13 @@ func exchange(ctx context.Context, p exchangeParams) (exchangeResult, error) {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				return res, errTimeout
+			}
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				// The kernel matched an ICMP port-unreachable to this
+				// connected socket. Nothing is listening; do not wait out
+				// the timeout for a reply that cannot come.
+				res.Sent = true
+				return res, errUnreachable
 			}
 			return res, fmt.Errorf("receive: %w", err)
 		}
@@ -728,11 +794,7 @@ type Result struct {
 // Query performs a single exchange with a server, for diagnostics. A kiss
 // code, authentication failure, or unusable reply is returned as an error
 // that says why.
-func Query(ctx context.Context, address string, key *auth.Key, clk clock.Clock, timeout time.Duration) (Result, error) {
-	host, port, err := splitHostPort(address)
-	if err != nil {
-		return Result{}, err
-	}
+func Query(ctx context.Context, host string, port uint16, key *auth.Key, clk clock.Clock, timeout time.Duration) (Result, error) {
 	addr, err := resolve(ctx, host, port)
 	if err != nil {
 		return Result{}, err

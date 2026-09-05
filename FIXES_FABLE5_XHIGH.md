@@ -605,3 +605,62 @@ No behaviour change, as the specification allows.
 **Files.** `DESIGN.md` §6.3.
 
 **Verification.** Doc review.
+
+## RF5X-017 — A RATE kiss's poll is not honoured as a new minimum — FIXED
+
+**Changed.** The source keeps `kodMinPoll`, set from a RATE kiss and cleared
+only when re-resolution yields a *different* address. `adaptPoll`'s lower
+bound is now `pollFloor()` = `max(cfg.PollMin, kodMinPoll)`, and the
+reachability-recovery reset uses it too, so a noisy update or a lost server
+can no longer drop the poll below what the server demanded. A demand above
+`PollMax` raises the effective maximum (capped at `discipline.MaxPoll`) with a
+log line, instead of being silently clamped. DENY/RSTR handling is unchanged.
+
+**Files.** `internal/source/ntp.go`, `internal/source/source_test.go`,
+`DESIGN.md` §5.4.
+
+**Verification.** PASS. `TestKissRATEPollIsANewMinimum` feeds a kiss demanding
+poll 8, then a large offset through `adaptPoll`, then a reachability recovery,
+and asserts the poll never drops below 8. `TestKissRATEBeyondPollMax` sends a
+demand of 13 to a source configured `poll_max = 10` and asserts the emitted
+poll is 13.
+
+## RF5X-018 — Unconnected client sockets cost a full timeout per dead server — FIXED
+
+**Changed.** `exchange` uses `net.DialUDP` and `conn.Write` instead of
+`net.ListenUDP` and `WriteToUDPAddrPort`, as `DESIGN.md` §5.4 already
+specified. `ECONNREFUSED` from either the write or the read maps to a new
+`errUnreachable`, which `pollOnce` counts as a miss (with the timeouts, so
+re-resolution still triggers) without waiting. The nonce/origin check, the
+reply source-address check, kernel timestamping and the ephemeral-port
+randomisation are unchanged.
+
+**Files.** `internal/source/ntp.go`, `internal/source/source_test.go`,
+`DESIGN.md` §5.4.
+
+**Verification.** PASS. `TestUnreachablePortFailsFast` queries a port nothing
+is listening on with a 5 s timeout and asserts the error is `errUnreachable`
+and that it arrived in under 100 ms. (It skips rather than fails on a platform
+that does not deliver the ICMP to the socket; on this darwin host it does.)
+
+## RF5X-022 — Two divergent splitHostPort implementations — FIXED
+
+**Changed.** `config.splitHostPort` is exported as
+`config.ParseServerAddress` and is now the only parser. `source.NTPConfig`
+gained `Host`/`Port`, filled by `main.go` from `Server.HostPort()`, and
+`NewNTP` validates them rather than parsing; `source.Query` takes a host and a
+port. `source.splitHostPort` and `containsColon` are deleted. A configuration
+that passed `-check` can therefore no longer fail in `NewNTP`, after the clock
+and the serial devices are already open. Accepted syntax is unchanged —
+config's parser was already the stricter of the two and is what `-check` uses.
+
+**Files.** `internal/config/config.go`, `internal/source/ntp.go`,
+`internal/source/poll.go`, `cmd/carillon/main.go`,
+`internal/source/source_test.go` (table deleted),
+`internal/config/config_test.go`, `internal/server/integration_test.go`.
+
+**Verification.** PASS. `source.TestSplitHostPort` is gone;
+`config.TestHostPort` carries the union of both tables (every case from the
+deleted one was already present or equivalent) and is documented as covering
+the single parser. `TestNewNTPValidation` now checks the empty-host and
+zero-port rejections.
