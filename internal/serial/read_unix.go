@@ -19,7 +19,7 @@ func (p *Port) ReadTimeout(buf []byte, timeout time.Duration) (int, error) {
 		ms = 1
 	}
 	fds := []unix.PollFd{{Fd: int32(p.fd), Events: unix.POLLIN}}
-	n, err := unix.Poll(fds, ms)
+	n, err := p.pollFn()(fds, ms)
 	if err != nil {
 		if errors.Is(err, unix.EINTR) {
 			return 0, ErrTimeout
@@ -32,7 +32,7 @@ func (p *Port) ReadTimeout(buf []byte, timeout time.Duration) (int, error) {
 	if fds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
 		return 0, fmt.Errorf("serial: poll %s: device unavailable (events %#x)", p.path, fds[0].Revents)
 	}
-	n, err = unix.Read(p.fd, buf)
+	n, err = p.readFn()(p.fd, buf)
 	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
 		return 0, ErrTimeout
 	}
@@ -50,4 +50,19 @@ func (p *Port) ReadTimeout(buf []byte, timeout time.Duration) (int, error) {
 		return 0, fmt.Errorf("serial: read %s: %w", p.path, io.EOF)
 	}
 	return n, nil
+}
+
+// pollFn and readFn return the syscall seam, defaulting to the real calls.
+func (p *Port) pollFn() func([]unix.PollFd, int) (int, error) {
+	if p.poll != nil {
+		return p.poll
+	}
+	return unix.Poll
+}
+
+func (p *Port) readFn() func(int, []byte) (int, error) {
+	if p.read != nil {
+		return p.read
+	}
+	return unix.Read
 }
