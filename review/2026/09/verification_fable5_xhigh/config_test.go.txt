@@ -7,8 +7,12 @@ func TestVerification021RejectsExplicitGPSOnlyZeros(t *testing.T) {
 	for _, key := range []string{`baud = 0`, `pps = ""`, `pps_edge = ""`, `pps_offset = 0.0`, `nmea_offset = 0.0`, `sentences = []`} {
 		t.Run(key, func(t *testing.T) {
 			cfg, err := Parse([]byte("[[refclock]]\ntype = \"pps\"\ndevice = \"/dev/pps0\"\n" + key + "\n"))
-			if err == nil { err = Validate(cfg) }
-			if err == nil { t.Fatalf("silently accepted GPS-only key %s on bare PPS", key) }
+			if err == nil {
+				err = Validate(cfg)
+			}
+			if err == nil {
+				t.Fatalf("silently accepted GPS-only key %s on bare PPS", key)
+			}
 		})
 	}
 }

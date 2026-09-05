@@ -84,9 +84,27 @@ func TestVerification005HoldoverStillExpires(t *testing.T) {
 			Valid: true, Offset: 0.001, Delay: 0.002, Dispersion: 1e-6, Jitter: 1e-6,
 			Stratum: 2, Leap: ntp.LeapNone})
 	}
-	for i := 1; i <= 4; i++ { feed(float64(i)) }
-	if s.State() != StateSynced { t.Fatal("setup did not synchronize") }
+	for i := 1; i <= 4; i++ {
+		feed(float64(i))
+	}
+	if s.State() != StateSynced {
+		t.Fatal("setup did not synchronize")
+	}
 	s.Resync(5)
 	s.Tick(16)
-	if s.State() != StateUnsynced { t.Fatal("holdover did not expire") }
+	if s.State() != StateUnsynced {
+		t.Fatal("holdover did not expire")
+	}
+}
+
+// RF5X-031's new prose says a qualified PPS is always the system source.
+// This passing counterexample records the existing preferred-NTP exception.
+func TestVerification031OtherPreferStillWins(t *testing.T) {
+	n := src("ntp", 0, 0.002, Options{Numbering: true, Prefer: true})
+	p := src("pps", 0, 0, Options{PPS: true})
+	p.Stratum, p.Jitter = 0, 1e-6
+	sel := Select([]*SourceState{n, p}, 100, 1)
+	if sel.System != n || p.Status != StatusSurvivor {
+		t.Fatalf("expected the existing preferred-NTP exception, got system=%v PPS=%v", sel.System.Name, p.Status)
+	}
 }

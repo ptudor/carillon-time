@@ -14,7 +14,9 @@ import (
 func TestVerification001ReprimeInvalidatesSelection(t *testing.T) {
 	for _, restart := range []bool{false, true} {
 		name := "four_spikes"
-		if restart { name = "sequence_restart" }
+		if restart {
+			name = "sequence_restart"
+		}
 		t.Run(name, func(t *testing.T) {
 			p, clk := testPPS(t)
 			sys := discipline.New(discipline.Config{Loop: discipline.LoopConfig{
@@ -30,12 +32,22 @@ func TestVerification001ReprimeInvalidatesSelection(t *testing.T) {
 				m := p.accept(pps.Sample{Sequence: seq, Time: base.Add(time.Duration(second)*time.Second + offset)})
 				sys.Update(m)
 			}
-			for i := 1; i <= 16; i++ { feed(uint32(1000+i), i, 0) }
-			if !p.stable || sys.Status(16).SystemSource != "pps0" { t.Fatal("setup did not select locked PPS") }
-			if restart { feed(5, 17, 0) } else {
-				for i := 17; i <= 20; i++ { feed(uint32(1000+i), i, 10*time.Millisecond) }
+			for i := 1; i <= 16; i++ {
+				feed(uint32(1000+i), i, 0)
 			}
-			if p.stable || len(p.window) != 0 { t.Fatal("setup did not reset window") }
+			if !p.stable || sys.Status(16).SystemSource != "pps0" {
+				t.Fatal("setup did not select locked PPS")
+			}
+			if restart {
+				feed(5, 17, 0)
+			} else {
+				for i := 17; i <= 20; i++ {
+					feed(uint32(1000+i), i, 10*time.Millisecond)
+				}
+			}
+			if p.stable || len(p.window) != 0 {
+				t.Fatal("setup did not reset window")
+			}
 			if st := sys.Status(clk.Monotonic()); st.SystemSource == "pps0" {
 				t.Fatalf("PPS remains system source at reach=%03o despite cleared window and stable=false", p.reach)
 			}

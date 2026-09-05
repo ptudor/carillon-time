@@ -20,7 +20,9 @@ type verificationStepClock struct {
 }
 
 func (c *verificationStepClock) Step(d time.Duration) error {
-	if c.duringStep != nil { c.duringStep() }
+	if c.duringStep != nil {
+		c.duringStep()
+	}
 	return c.Fake.Step(d)
 }
 
@@ -30,7 +32,9 @@ func TestVerification002GenerationCoversTheStep(t *testing.T) {
 	clk := &verificationStepClock{Fake: clock.NewFake(time.Unix(1800000000, 0))}
 	src := &scripted{name: "a", clk: clk.Fake}
 	e, err := New(testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}}), clk, quietLog())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	var inFlight discipline.Measurement
 	clk.duringStep = func() {
 		inFlight = good(2)
@@ -40,7 +44,9 @@ func TestVerification002GenerationCoversTheStep(t *testing.T) {
 	clk.Advance(time.Second)
 	m := good(2)
 	m.Source, m.Now, m.At, m.Generation = "a", 1, 1, e.gen.Load()
-	if err := e.handle(e.sys.Update(m), 1); err != nil { t.Fatal(err) }
+	if err := e.handle(e.sys.Update(m), 1); err != nil {
+		t.Fatal(err)
+	}
 	if !e.stale(inFlight) {
 		t.Fatalf("pre-step offset=%v sampled during Step has generation=%d, still current=%d", inFlight.Offset, inFlight.Generation, e.gen.Load())
 	}
@@ -53,16 +59,20 @@ func TestVerification002LeapCheckedBeforeQueuedMeasurement(t *testing.T) {
 	clk := clock.NewFake(boundary.Add(-10 * time.Second))
 	src := &scripted{name: "a", clk: clk}
 	cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
-	cfg.LeapTable = &leap.Table{Expiry: boundary.Add(180*24*time.Hour), Transitions: []leap.Transition{{At: boundary, Leap: ntp.LeapInsert}}}
+	cfg.LeapTable = &leap.Table{Expiry: boundary.Add(180 * 24 * time.Hour), Transitions: []leap.Transition{{At: boundary, Leap: ntp.LeapInsert}}}
 	e, err := New(cfg, clk, quietLog())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	clk.Advance(time.Second)
 	m := good(1)
 	m.Source, m.Now, m.At, m.Generation = "a", 1, 1, e.gen.Load()
 	clk.Advance(10 * time.Second)
 	// Exactly the Engine.Run receive-arm ordering.
 	if !e.stale(m) {
-		if err := e.handle(e.sys.Update(m), m.Now); err != nil { t.Fatal(err) }
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(clk.Steps) != 0 {
 		t.Fatalf("queued pre-leap measurement stepped clock before leap reset: %v", clk.Steps)
@@ -75,19 +85,25 @@ func TestVerification032QueuedMeasurementCannotReviveStoppedSource(t *testing.T)
 	clk := clock.NewFake(time.Unix(1800000000, 0))
 	src := &scripted{name: "a", clk: clk}
 	e, err := New(testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}}), clk, quietLog())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 1; i <= 3; i++ {
 		clk.Advance(time.Second)
 		m := good(0.001)
 		m.Source, m.Now, m.At = "a", clk.Monotonic(), clk.Monotonic()
-		if err := e.handle(e.sys.Update(m), m.Now); err != nil { t.Fatal(err) }
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
 	}
 	clk.Advance(time.Second)
 	queued := good(0.001)
 	queued.Source, queued.Now, queued.At, queued.Generation = "a", 4, 4, e.gen.Load()
 	e.sourceStopped("a", errors.New("port vanished"), time.Second)
 	if !e.stale(queued) {
-		if err := e.handle(e.sys.Update(queued), queued.Now); err != nil { t.Fatal(err) }
+		if err := e.handle(e.sys.Update(queued), queued.Now); err != nil {
+			t.Fatal(err)
+		}
 	}
 	st := e.Status()
 	if st.State != discipline.StateHoldover || st.SystemSource != "" || st.Sources[0].Reach != 0 {
@@ -99,11 +115,19 @@ func TestVerification032QueuedMeasurementCannotReviveStoppedSource(t *testing.T)
 // match the temporary-file pattern. Startup must never delete that file.
 func TestVerification019SweepPreservesConfiguredDrift(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".drift-calibrated")
-	if err := os.WriteFile(path, []byte("12.5\n"), 0600); err != nil { t.Fatal(err) }
+	if err := os.WriteFile(path, []byte("12.5\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now()
-	if err := os.Chtimes(path, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil { t.Fatal(err) }
-	if _, err := New(testConfig(path), clock.NewFake(now), quietLog()); err != nil { t.Fatal(err) }
-	if _, err := os.Stat(path); err != nil { t.Fatalf("startup deleted configured drift file: %v", err) }
+	if err := os.Chtimes(path, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(testConfig(path), clock.NewFake(now), quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("startup deleted configured drift file: %v", err)
+	}
 }
 
 // RF5X-004/011: updates can change the base before the first ticker event.
@@ -111,11 +135,15 @@ func TestVerification019SweepPreservesConfiguredDrift(t *testing.T) {
 // not recorded a tick yet.
 func TestVerification004RestoresBaseBeforeFirstTick(t *testing.T) {
 	clk := clock.NewFake(time.Unix(1800000000, 0))
-	if err := clk.SetFrequency(12.5); err != nil { t.Fatal(err) }
+	if err := clk.SetFrequency(12.5); err != nil {
+		t.Fatal(err)
+	}
 	src := &scripted{name: "a", clk: clk, gap: time.Millisecond,
 		script: []discipline.Measurement{good(0.01), good(0.01), good(0.01)}}
 	e, err := New(testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}}), clk, quietLog())
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.tick = time.Hour
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -123,8 +151,12 @@ func TestVerification004RestoresBaseBeforeFirstTick(t *testing.T) {
 	go func() { done <- e.Run(ctx) }()
 	err = e.Wait(ctx, func(st *Status) bool { return st.Updates >= 3 })
 	cancel()
-	if runErr := <-done; runErr != nil { t.Fatal(runErr) }
-	if err != nil { t.Fatal(err) }
+	if runErr := <-done; runErr != nil {
+		t.Fatal(runErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	last := clk.Frequencies[len(clk.Frequencies)-1]
 	if want := e.Status().Frequency; last != want {
 		t.Fatalf("shutdown before first tick left %.9f ppm; final base is %.9f ppm", last, want)
