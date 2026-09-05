@@ -21,6 +21,16 @@ const (
 	// jitterAverage is ntpd's CLOCK_AVG, the exponential averaging weight
 	// of the clock jitter estimate.
 	jitterAverage = 8
+
+	// maxTickInterval bounds the elapsed time a single Tick will account
+	// for. The engine's ticker can be late — GC, a VM pause, a slow
+	// drift-file write — and the kernel keeps running at the transient for
+	// the whole delay, so the phase must be debited for the real interval
+	// rather than a nominal second. Beyond this the delay is a stall of
+	// unknown length; charging one second is the conservative choice,
+	// because over-debiting the phase leaves a correction that was never
+	// applied believed to be done.
+	maxTickInterval = 2.0
 )
 
 // LoopConfig holds the operator-tunable parts of the loop.
@@ -114,6 +124,9 @@ type Loop struct {
 	tau        float64
 	applied    float64 // frequency word most recently issued
 	haveApply  bool
+	lastTick   float64 // monotonic time of the previous Tick
+	haveTick   bool
+	skipJitter bool // the next update follows a step; lastOffset means nothing
 
 	// Bootstrap frequency measurement state.
 	firstTime   float64
@@ -200,9 +213,19 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 
 	// Clock jitter: exponential average of the offset change.
 	d := math.Max(math.Abs(offset-l.lastOffset), l.cfg.Precision)
-	if l.Updates == 0 {
-		l.Jitter = d
-	} else {
+	switch {
+	case l.Updates == 0:
+		// Seed from the precision floor and average the first sample in,
+		// as ntpd does. Taking the whole initial offset reported 100 ms of
+		// jitter for a 100 ms offset and was still 26 ms out twenty updates
+		// later, which fed carillon_jitter_seconds, carillonctl tracking
+		// and the kernel's esterror.
+		l.Jitter = math.Max(l.cfg.Precision, d/math.Sqrt(jitterAverage))
+	case l.skipJitter:
+		// The previous update was a step, which zeroed lastOffset, so the
+		// difference above describes nothing.
+		l.skipJitter = false
+	default:
 		l.Jitter = math.Sqrt(l.Jitter*l.Jitter + (d*d-l.Jitter*l.Jitter)/jitterAverage)
 	}
 
@@ -237,8 +260,11 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 	l.lastUpdate = now
 	l.tau = tau
 	l.Updates++
-	u.Actions = append(u.Actions, Action{ActionSetFrequency, l.Freq})
-	l.applied, l.haveApply = l.Freq, true
+	// No frequency action here. Issuing the base alone would remove the
+	// phase transient the last Tick applied, pausing the slew until the
+	// next one — about 6 % of the slew capacity with a PPS at poll 4. The
+	// next Tick issues base plus the transient for the new pending phase,
+	// at most one tick away.
 	return u
 }
 
@@ -253,6 +279,7 @@ func (l *Loop) step(offset float64, now float64) UpdateResult {
 	l.firstTime = now
 	l.firstOffset = 0
 	l.slewed = 0
+	l.skipJitter = true
 	return UpdateResult{
 		Actions: []Action{{ActionStep, offset}, {ActionResetFilters, 0}},
 		Stepped: true,
@@ -263,6 +290,7 @@ func (l *Loop) step(offset float64, now float64) UpdateResult {
 // issuing the base frequency plus a one-second transient. When nothing is
 // pending it re-issues the base frequency only if it changed.
 func (l *Loop) Tick(now float64) []Action {
+	dt := l.elapsed(now)
 	if l.Pending == 0 {
 		if !l.haveApply || l.applied != l.Freq {
 			l.applied, l.haveApply = l.Freq, true
@@ -278,13 +306,36 @@ func (l *Loop) Tick(now float64) []Action {
 	}
 	total := clampFreq(l.Freq + adj*1e6)
 	actual := (total - l.Freq) * 1e-6 // what the kernel clamp lets through
-	l.Pending -= actual
-	l.slewed += actual
+	// The transient the previous Tick issued was in the kernel for dt
+	// seconds, not for a nominal one: a late ticker moved the phase by
+	// adj·dt, and debiting only adj over-corrects by adj·(dt−1) — up to
+	// 500 µs per second of lateness during a saturated slew.
+	l.Pending -= actual * dt
+	l.slewed += actual * dt
 	if math.Abs(l.Pending) < 1e-12 {
 		l.Pending = 0
 	}
 	l.applied, l.haveApply = total, true
 	return []Action{{ActionSetFrequency, total}}
+}
+
+// elapsed returns the seconds to charge this tick with, and records now as
+// the accounting point. The first tick of a run is charged one second: there
+// is no previous tick to measure from.
+func (l *Loop) elapsed(now float64) float64 {
+	dt := 1.0
+	if l.haveTick {
+		switch d := now - l.lastTick; {
+		case d < 0:
+			dt = 0
+		case d > maxTickInterval:
+			dt = 1
+		default:
+			dt = d
+		}
+	}
+	l.lastTick, l.haveTick = now, true
+	return dt
 }
 
 // TimeConstant returns the current loop time constant in seconds.

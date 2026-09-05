@@ -85,6 +85,13 @@ type simRun struct {
 	now     float64
 	events  []Event
 	steps   int
+
+	// tickJitter, when non-zero, varies the length of each simulated
+	// second by ±tickJitter to model an engine ticker that is late or
+	// early. True time and the loop's accounting both use the real
+	// interval, so a correct loop is unaffected by it.
+	tickJitter float64
+	tickRNG    *rand.Rand
 }
 
 func (r *simRun) apply(res Result) {
@@ -118,8 +125,12 @@ func (r *simRun) run(seconds int, each func(t float64)) {
 		if each != nil {
 			each(r.now)
 		}
-		r.clk.advance(1)
-		r.now++
+		dt := 1.0
+		if r.tickJitter > 0 {
+			dt += (r.tickRNG.Float64()*2 - 1) * r.tickJitter
+		}
+		r.clk.advance(dt)
+		r.now += dt
 	}
 }
 
@@ -590,7 +601,8 @@ func TestSystemResyncSkipsSettling(t *testing.T) {
 	if sys.State() != StateHoldover {
 		t.Fatalf("state after Resync: %v, want holdover", sys.State())
 	}
-	if st := sys.Update(m(384)); len(st.Actions) == 0 {
+	sys.Update(m(384))
+	if sys.loop.Updates == 0 {
 		t.Fatal("the first post-leap measurement produced no loop update")
 	}
 	if sys.State() != StateSynced {
@@ -598,5 +610,31 @@ func TestSystemResyncSkipsSettling(t *testing.T) {
 	}
 	if st := sys.Status(384); st.Leap != ntp.LeapNone || st.Stratum != 3 {
 		t.Fatalf("post-leap status: %+v", st)
+	}
+}
+
+// TestSimTolerantOfTickJitter covers RF5X-011's second verification step. The
+// engine's ticker can be late, and the kernel keeps running at the phase
+// transient for the whole delay. Once Tick charges the real elapsed time, a
+// ±200 ms jitter on every tick must not change the steady-state accuracy.
+func TestSimTolerantOfTickJitter(t *testing.T) {
+	steady := func(jitter float64) float64 {
+		r := newSim(simConfig(), -50, 0.100, false, newSimSource("a", 1))
+		r.tickJitter = jitter
+		r.tickRNG = rand.New(rand.NewSource(99))
+		r.run(5*3600, nil)
+		if r.sys.State() != StateSynced {
+			t.Fatalf("jitter %v: state %v", jitter, r.sys.State())
+		}
+		return r.rmsOver(3600)
+	}
+	even := steady(0)
+	rough := steady(0.200)
+	t.Logf("steady-state RMS: even ticker %.1f µs, ±200 ms jitter %.1f µs", even*1e6, rough*1e6)
+	if rough > 300e-6 {
+		t.Fatalf("RMS with a jittery ticker %v", rough)
+	}
+	if rough > 2*even+50e-6 {
+		t.Fatalf("tick jitter degraded the RMS from %v to %v", even, rough)
 	}
 }
