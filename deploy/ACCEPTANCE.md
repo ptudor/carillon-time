@@ -566,6 +566,53 @@ nothing while running — settling only happens after a restart or a step — so
 it does not warrant a fourth restart today. Deploy `751c23c` at the next
 natural opportunity, and it will make that restart's settling robust.
 
+## Settling fix, and the gate proving itself — 2026-09-05 14:46–14:51 (UTC)
+
+Deployed `9cb190e` (the RF5X-006 settling fix, `751c23c`) to all three.
+
+It doubled as remediation, because between the previous deployment and this
+one the starvation defect did real damage. `gummi` went **2533 s — 42
+minutes — between consecutive loop updates**, longer than the Allan intercept
+because the stale sample must both age past it *and* lose to a fresher one on
+raw delay. It drifted 18 ms blind, 27 ms by the time it was restarted, and its
+downstreams read the eventual correction as a rate change and integrated it:
+
+| host | true value | reached |
+|---|---|---|
+| `navlisten2026` | ~+10 ppm | **−95.4 ppm** (8 s/day) |
+| `twocom` | ~+6 ppm | **+52.1 ppm** |
+
+**The drift-file gate is what made this recoverable.** Both hosts' files still
+held their settled values, so each restarted correct rather than persisting
+the excursion. The refusals, verbatim:
+
+```
+twocom:        msg="leaving the drift file alone" reason="frequency moved 51.442 ppm
+                 in the last 15m0s, more than the 1.000 ppm the estimate must hold to"
+                 current_ppm=52.05749506890824
+navlisten2026: msg="leaving the drift file alone" reason="frequency moved 105.511 ppm
+                 in the last 15m0s ..." current_ppm=-95.42969409216681
+```
+
+`twocom` restarted on 6.126572 and came up at **+6.127 ppm**;
+`navlisten2026` on 10.066208 and came up at **+10.201 ppm**; `gummi` on
+−15.246936 at **−15.220 ppm**. Without the gate all three would have started
+from the excursion. This is the mechanism the 13:30 entry's "do not restart
+mid-transient" was standing in for, now handled by the daemon.
+
+Each came up carrying the phase it had accumulated — `navlisten2026` +85 ms,
+`gummi` +27 ms, `twocom` −8.8 ms — and slewed it out; no steps anywhere.
+`navlisten2026` reached SYNCED in 2 updates, where before the settling fix it
+had taken 2m18s and a `waitsync 60` failure.
+
+**Outstanding and unfixed:** the starvation itself (`DESIGN.md` §6.3). The
+ranking is what withholds the sample — `Filter.Add` ranks by raw `delay` until
+the Allan intercept, so 38 ms of accumulated dispersion never costs a stale
+sample its place. Ranking by root distance would demote it in about 11 minutes
+instead of 34-plus, but that is a deliberate deviation from RFC 5905 §10 and
+from ntpd, and wants a simulation pass. Until it is fixed, expect this chain
+to repeat.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
