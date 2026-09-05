@@ -1,0 +1,44 @@
+package control
+
+import (
+	"bufio"
+	"io"
+	"log/slog"
+	"net"
+	"testing"
+	"time"
+)
+
+// RF5X-033: net.Pipe has no socket buffer, so an unread small response
+// really blocks. The original unread-waitsync test does not force a write
+// to block and passes even without the deadline.
+func TestVerification033BlockedReplyHasDeadline(t *testing.T) {
+	writer, reader := net.Pipe()
+	defer writer.Close()
+	defer reader.Close()
+	s := &Server{log: slog.New(slog.DiscardHandler)}
+	done := make(chan struct{})
+	go func() { s.reply(writer, Response{Version: "test"}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("blocked reply did not respect the 5-second deadline")
+	}
+}
+
+type verificationWrappedEOF struct{ sent bool }
+
+func (r *verificationWrappedEOF) Read(b []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(b, `{"version":"test"}`), nil
+	}
+	return 0, &net.OpError{Op: "read", Net: "unix", Err: io.EOF}
+}
+
+func TestVerification030WrappedEOFCompletesResponse(t *testing.T) {
+	line, err := readLine(bufio.NewReader(&verificationWrappedEOF{}), 4096)
+	if err != nil || string(line) != `{"version":"test"}` {
+		t.Fatalf("line=%q error=%v", line, err)
+	}
+}

@@ -20,7 +20,9 @@ func TestVerification035CryptoNAKFloodIsBounded(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		if got := h.Handle(req, from("192.0.2.7"), testWall, testMono); len(got) > 0 {
 			replies++
-			if len(got) > len(req) { t.Fatal("amplified reply") }
+			if len(got) > len(req) {
+				t.Fatal("amplified reply")
+			}
 		}
 	}
 	if got := h.Handle(testKey.Append(request(4)), from("192.0.2.7"), testWall, testMono); len(got) != 68 {
