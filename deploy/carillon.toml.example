@@ -231,11 +231,16 @@ iburst  = true
 
 #[stats]
 #dir = "/var/db/carillon/stats"  # Linux: /var/lib/carillon/stats
+#keep_days = 0                   # 0 keeps everything; N removes day
+#                                # directories older than N days at rotation
 #
-# loop.YYYY-MM-DD.tsv     one row per discipline update
-# sources.YYYY-MM-DD.tsv  one row per source per update
-# pps.YYYY-MM-DD.tsv      one row per accepted pulse
-# server.YYYY-MM-DD.tsv   one row per address family per minute, when the
+# Files live under dir/YYYY/MM/DD/ so that no directory collects a year of
+# them and ageing out is a per-day removal:
+#
+# YYYY/MM/DD/loop.tsv     one row per discipline update
+# YYYY/MM/DD/sources.tsv  one row per source per update
+# YYYY/MM/DD/pps.tsv      one row per accepted pulse (86,400 a day)
+# YYYY/MM/DD/server.tsv   one row per address family per minute, when the
 #                         listener is enabled. The counters are cumulative
 #                         since startup, so take differences between rows; a
 #                         value that drops is a restart, not negative traffic.

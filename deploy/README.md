@@ -159,8 +159,11 @@ install -d -o carillon -g carillon -m 0750 /var/lib/carillon/stats
 dir = "/var/lib/carillon/stats"
 ```
 
-Use `/var/db/carillon/stats` on FreeBSD. Files are named `loop.YYYY-MM-DD.tsv`,
-`sources.YYYY-MM-DD.tsv`, and `pps.YYYY-MM-DD.tsv` in UTC.
+Use `/var/db/carillon/stats` on FreeBSD. Files live under a dated hierarchy in
+UTC — `YYYY/MM/DD/loop.tsv`, `YYYY/MM/DD/sources.tsv`, `YYYY/MM/DD/pps.tsv`,
+`YYYY/MM/DD/server.tsv` — so no directory collects a year of them and ageing
+out is a per-day removal. Set `[stats] keep_days` to have carillon do that
+itself; the default of 0 keeps everything.
 
 For a GPS-led stratum-1 host, install a current NIST/IERS
 `leap-seconds.list` and set `daemon.leapfile`. `carillon -check` parses the

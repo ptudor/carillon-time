@@ -664,3 +664,92 @@ config's parser was already the stricter of the two and is what `-check` uses.
 deleted one was already present or equivalent) and is documented as covering
 the single parser. `TestNewNTPValidation` now checks the empty-host and
 zero-port rejections.
+
+## RF5X-020 — Precision measured as the minimum non-zero delta — FIXED
+
+**Changed.** `measurePrecision` now collects the gaps between readings that
+actually *differ* and reports the median, which is what RFC 5905 §7.3 and
+ntpd mean by precision, instead of the smallest difference ever seen. Two
+back-to-back `clock_gettime` calls on a TSC-backed clock can differ by one
+nanosecond, so the minimum reported 2^-30 on any modern host whatever its real
+resolution. Total clock reads are bounded (`precisionMaxReads`) so a
+millisecond-resolution VM clock costs a few milliseconds at startup rather
+than spinning. `ntp.PrecisionFromSeconds` and the `[-30, -6]` clamp are
+unchanged, and a clock that never moves still reports -30.
+
+**Files.** `internal/clock/precision.go`, `internal/clock/precision_test.go`.
+
+**Verification.** PASS. The existing stepping-clock cases (1 µs, 30 ns, 1 ns,
+1 ms) and the frozen-clock case all still hold.
+`TestMeasurePrecisionIsNotTheMinimum` feeds a clock that ticks in microseconds
+but shows a one-nanosecond difference every 50th read and asserts -20, not
+-30. `TestMeasurePrecisionCoarseClockTerminates` checks the read budget.
+Measured on this host: **2^-25**, where the old code reported 2^-30 — the
+review predicted "-25…-23".
+
+## RF5X-021 — Configuration validation gaps — FIXED
+
+**Changed.** (a) `Validate` now fails when `type = "pps"` carries any of
+`baud`, `pps`, `pps_edge`, `pps_offset`, `nmea_offset` or `sentences`, naming
+the key; none of them are defaulted for a bare PPS refclock, so a non-zero
+value can only have been written by the operator, and silently ignoring it
+contradicts the strict-configuration promise. (b) The FreeBSD platform check
+accepts an absolute `pps` path on a `gps` refclock — a second callout tty
+carrying the pulse only, which `main.go` already supports and the Linux check
+already accepts — and runs the `dev.uart.<N>.pps_mode` sysctl check against
+*that* device's unit; the dcd/cts pin check is kept and applies only when a
+pin was named. Existing valid configurations are unaffected.
+
+**Files.** `internal/config/config.go`,
+`internal/config/refclock_check_freebsd.go`,
+`internal/config/config_test.go`.
+
+**Verification.** PASS. Six new `TestValidateRules` cases, one per GPS-only
+key. `TestGPSWithSeparatePPSDeviceValidates` covers (b)'s configuration
+shape; the sysctl half is FreeBSD-only and `GOOS=freebsd go vet` passes, with
+the manual check on `twocom` remaining, as the review notes a fake-sysctl test
+is impractical.
+
+## RF5X-029 — Statistics accumulate in one flat directory with no retention — FIXED
+
+**Changed.** Daily files are written to `<dir>/YYYY/MM/DD/<kind>.tsv` — three
+zero-padded segments, so paths sort lexically and each directory stays small —
+created at rotation. `[stats] keep_days` (default 0 = keep everything,
+validated non-negative) removes day directories older than the limit at
+rotation time, whole UTC days, and prunes the month and year directories it
+empties. TSV columns and the header line are unchanged.
+
+**Files.** `internal/stats/writer.go`, `internal/stats/writer_test.go`,
+`internal/config/config.go`, `cmd/carillon/main.go`,
+`deploy/carillon.toml.example`, `deploy/README.md`, `DESIGN.md` §12.
+
+**Verification.** PASS. The existing write and rotation tests were moved to
+the dated paths. `TestRecorderPrunesExpiredDays` plants a day outside
+`keep_days = 1` and one inside it and asserts only the expired one goes, with
+today's file written.  `TestRecorderKeepsEverythingByDefault` asserts
+`keep_days = 0` removes nothing.
+
+---
+
+## Session checkpoint — 2026-09-05
+
+Findings addressed so far, in the review's suggested fix order: RF5X-001,
+004, 002 (with 012 **skipped**), 005/010/006/034/036, 003 (Linux half; FreeBSD
+half **skipped**) and 009, 008/023/024/035, 007, 011/025, then the Lows
+013, 014, 015, 016, 017, 018, 019, 020, 021, 022, 026, 027, 028, 029, 030, 031.
+
+**Still to do:** RF5X-032 (a source whose goroutine exits should be marked
+unreachable and restarted with backoff, not deleted from status) and RF5X-033
+(no deadline on the final `wg.Wait()`; `control.Server.reply` needs a write
+deadline). Nothing else from the review is outstanding.
+
+`go vet ./...` passes for darwin, linux and freebsd; `go test -race ./...`
+passes on darwin.
+
+**Note on an unrelated flake.** `source.TestReResolveAfterTimeouts` failed once
+during this work with *9 misses without re-resolving*. It is a race in the
+test, not in the daemon and not one of the review's findings: a reply from
+server A that was already in flight when the test stopped A answering resets
+the daemon's consecutive-timeout counter, while the test keeps counting misses
+cumulatively. The same logic is present at the baseline commit `85353ae`;
+40 repeats of the test and 12 full-suite runs are clean on both.
