@@ -1,0 +1,97 @@
+package discipline
+
+import (
+	"fmt"
+	"math"
+	"testing"
+
+	"carillon/internal/ntp"
+)
+
+func TestTakeoverFilterBounds(t *testing.T) {
+	for _, poll := range []float64{16, 64, 256, 512, 1024} {
+		t.Run(fmt.Sprint(poll), func(t *testing.T) {
+			f := NewFilter(1e-6)
+			f.Add(0, .020, 1e-6, 1)
+			for i := 1; i <= 8; i++ {
+				now := 1 + float64(i)*poll
+				out, ok := f.Add(.010, .025, 1e-6, now)
+				if ok {
+					t.Logf("first fresh estimate after %.0f s, chosen age %.0f s", now-1, now-out.At)
+					return
+				}
+			}
+			t.Fatal("no estimate after eight arrivals")
+		})
+	}
+	f := NewFilter(1e-6)
+	f.Add(0, .020, 1e-6, 1)
+	out, ok := f.Add(.010, .025, 1e-6, 2534)
+	if !ok || out.At != 2534 {
+		t.Fatalf("ordinary fresh packet failed to displace >2048 s sample: %+v, %v", out, ok)
+	}
+}
+
+// Keep the same successful arrival schedule as the spacing test, but let
+// the real eight-stage filter select historical observations. Symmetric
+// delay variation adds no offset bias, isolating the age of the observation.
+func TestTakeoverDelayedFeedback(t *testing.T) {
+	for _, poll := range []int8{4, 6, 8} {
+		for _, oneWay := range []bool{false, true} {
+			for _, rise := range []float64{50e-6, 1e-3} {
+				t.Run(fmt.Sprintf("poll%d/asymmetric%v/rise%.2fms", poll, oneWay, rise*1e3), func(t *testing.T) {
+					cfg := simConfig()
+					cfg.Loop.StepLimit = 0
+					sys := New(cfg, 15.4, true)
+					sys.AddSource("a", Options{Numbering: true})
+					clk := &simClock{drift: -15.4, local: -.010, freq: 15.4}
+					f := NewFilter(1e-6)
+					period := int(math.Ldexp(1, int(poll)))
+					var peakFreq, peakOffset, maxAge, tailSq float64
+					var updates, index int
+					for sec := 1; sec <= 12*3600; sec++ {
+						clk.advance(1)
+						now := float64(sec)
+						if (sec-1)%period == 0 {
+							excess := float64(index%128) * rise
+							index++
+							offset := clk.offset()
+							if oneWay {
+								offset += excess / 2
+							}
+							out, ok := f.Add(offset, .020+excess, 2e-6, now)
+							m := Measurement{Source: "a", Now: now, Poll: poll, Reach: 0xff, Valid: ok}
+							if ok {
+								m.At = out.At
+								m.Offset = out.Offset
+								m.Delay = out.Delay
+								m.Dispersion = out.Dispersion
+								m.Jitter = out.Jitter
+								m.Stratum = 2
+								m.Leap = ntp.LeapNone
+								m.Precision = -20
+								maxAge = math.Max(maxAge, now-out.At)
+								updates++
+							}
+							sys.Update(m)
+						}
+						for _, a := range sys.Tick(now).Actions {
+							if a.Kind == ActionSetFrequency {
+								clk.freq = a.Value
+							}
+						}
+						peakFreq = math.Max(peakFreq, math.Abs(sys.Frequency()-15.4))
+						peakOffset = math.Max(peakOffset, math.Abs(clk.offset()))
+						if sec > 11*3600 {
+							tailSq += clk.offset() * clk.offset()
+						}
+					}
+					t.Logf("updates=%d max selected age=%.0fs peak frequency error=%.3fppm peak true offset=%.3fms final-hour RMS=%.3fms final frequency error=%.3fppm", updates, maxAge, peakFreq, peakOffset*1e3, math.Sqrt(tailSq/3600)*1e3, sys.Frequency()-15.4)
+					if !oneWay && (math.Sqrt(tailSq/3600) > 1e-3 || math.Abs(sys.Frequency()-15.4) > .5) {
+						t.Error("a correctly seeded clock with unbiased observations did not settle")
+					}
+				})
+			}
+		}
+	}
+}
