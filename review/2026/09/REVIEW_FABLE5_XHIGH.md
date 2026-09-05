@@ -647,3 +647,797 @@ add a listener test that requests `256 << 20` on loopback and asserts
 `Listen` succeeds on every platform and `ReceiveBuffers()[0] > 0`. On
 `twocom`: set `recv_buffer = 4194304` with default `maxsockbuf`, confirm the
 daemon starts and logs the granted size.
+
+---
+
+## RF5X-010 — The SETTLING counter is not reset by a second step inside the startup window
+
+**Severity:** Low
+
+**Location:** `internal/discipline/system.go` — `reselect()` lines 312–318
+(`u.Stepped` branch calls `setState(StateSettling)`), `setState()` lines
+232–241 (returns early when the state is unchanged, so `settled` keeps its
+value).
+
+**Problem:** After a first step the state is SETTLING with `settled = 0`. A
+good update makes `settled = 1`. A second step (allowed while `Updates <
+StepLimit`) calls `setState(StateSettling)`, which is a no-op because the
+state is already SETTLING, so `settled` stays 1 and SYNCED is declared after
+two post-step updates instead of the three §6.5 specifies.
+
+**Evidence (Verified):** scratch test in package `discipline`:
+
+```
+update offset=+2.000 stepped=true  state=settling settled=0
+update offset=+0.001 stepped=false state=settling settled=1
+update offset=+2.000 stepped=true  state=settling settled=1   <- not reset
+update offset=+0.001 stepped=false state=settling settled=2
+update offset=+0.001 stepped=false state=synced   settled=3
+```
+
+**Fix specification:** In the `u.Stepped` branch set `s.settled = 0`
+explicitly before `setState`. If RF5X-006 replaces the counter, make sure the
+replacement's "since last step" reference is reset on every step, not only
+on the first. Must not change: `SettleUpdates` default.
+
+**Verification:** Promote the scratch test; assert `State == StateSettling`
+after the fourth update and SYNCED only after the fifth.
+
+---
+
+## RF5X-011 — `Loop.Tick` assumes exactly one second per tick, and `Update` drops the slew transient for one second
+
+**Severity:** Low
+
+**Location:** `internal/discipline/loop.go` — `Tick()` lines 258–272
+(`Pending -= actual` assumes the transient was applied for exactly 1 s;
+`now` is ignored); `Update()` line 225 emits `SetFrequency(l.Freq)` (base
+only) so the transient issued by the previous `Tick` is removed until the
+next `Tick`. `internal/engine/engine.go` line 261 (`time.NewTicker(e.tick)`).
+
+**Problem:** The engine ticker can be late (GC, VM pause, a slow drift-file
+write, a `handle()` that blocks in `Observe`); the kernel keeps running at
+`base + adj` for the whole delay while `Pending` is only debited for one
+second, so the phase is over-corrected by `adj × (delay − 1 s)` — up to
+500 µs per second of lateness during a saturated slew. Separately, each
+`Update` writes the base frequency, pausing the slew for up to one second per
+update; harmless at poll 6, but with a PPS at poll 4 and a step-less
+1 s ticker it removes ~6 % of the slew capacity.
+
+**Fix specification:** Pass the real elapsed time into the slew accounting:
+`Tick(now)` computes `dt = now − lastTick` (clamped to `[0, 2 s]`; anything
+larger is logged as a stall and treated as 1 s), debits `Pending -= actual ×
+dt` and `slewed += actual × dt`. Have `Update` emit `Freq + adj` (the
+current transient) or emit nothing and let the next `Tick` apply the new base.
+Must not change: the ±`MaxSlewPPM` and ±500 ppm clamps; the exponential
+approach (`TestLoopTickSlew` expects 1/e after τ ticks — keep that with
+`dt = 1`).
+
+**Verification:** Add a loop test that calls `Tick` with `now` advancing by
+3 s and asserts `Pending` is debited by `3 × adj`; run the simulation with a
+random tick jitter of ±200 ms and assert the RMS is unchanged.
+
+---
+
+## RF5X-012 — Filter dispersion ignores unfilled stages, so a single sample is fully trusted
+
+**Severity:** Low
+
+**Location:** `internal/discipline/filter.go` — `Add()` lines 119–129: the
+dispersion sum runs over `len(order)` = `f.n` populated stages only. RFC 5905
+§10 (and ntpd `clock_filter`) initialise all eight stages at `MAXDISP` and
+sum `Σ ε_i · 2^-(i+1)` over all eight, so a filter with one sample has
+dispersion ≈ ε/2 + 16 · (1/4 + … + 1/256) ≈ 7.9 s until it fills.
+`TestFilterSingleSample` asserts the current 0.0005.
+
+**Problem:** A source's first sample gets a root distance of a few ms
+instead of several seconds, so (a) it is an immediate candidate with full
+weight in the intersection and combine, (b) the very first loop update — and
+therefore the step decision — can rest on one packet from one server, and (c)
+with several sources the earliest replier dominates. This is what makes
+RF5X-002 bite at startup. The design's "first correction within ~10 s"
+target does not require this: with `iburst` the filter has four samples in
+6 s, at which point the RFC dispersion is already ~1 s and falling.
+
+**Fix specification:** Treat absent stages as `MaxDispersion` in the
+dispersion sum (loop over `FilterStages`, using `MaxDispersion` for
+`i >= n`), exactly as RFC 5905. If the faster start is wanted, gate it
+elsewhere (e.g. require `Filter.Len() >= 2` before a *step*, see RF5X-002
+item 5) rather than by misreporting dispersion. Update
+`TestFilterSingleSample`/`TestFilterDispersionAges` expectations. Must not
+change: the jitter computation, the staleness rule, `Output.Samples`.
+
+**Verification:** New filter test asserting one-sample dispersion ≈ 7.9 s
+and four-sample dispersion ≈ 1 s; `TestSimConvergesFromUnknownFrequency`
+must still converge (it will, the sim source uses `iburst`-like cadence).
+
+---
+
+## RF5X-013 — NMEA reader would spin if `read(2)` returns 0 bytes without an error
+
+**Severity:** Low (**Needs investigation**)
+
+**Location:** `internal/serial/read_unix.go` — `ReadTimeout()` lines 34–41
+returns `n == 0, nil` on EOF; `internal/refclock/nmea.go` — `Run()` lines
+171–182 treats that as a successful read, `consume` does nothing, and the
+loop immediately calls `ReadTimeout` again, where `poll(2)` returns
+readable-at-EOF at once.
+
+**Problem:** On Linux a `CLOCAL` tty never returns EOF, and a USB detach
+surfaces as `POLLHUP`/`POLLERR` (handled). On FreeBSD a detached `ucom`
+should return `ENXIO` from `ttydev_read` (handled). If either kernel ever
+returns a plain 0-byte read (some USB-serial drivers on Linux do return 0
+once after a hangup before `EIO`), the loop is a hot 100 % CPU spin with no
+log line, which on the GPS host is also the PPS host.
+
+**Fix specification:** In `ReadTimeout`, treat `n == 0 && err == nil` as
+`io.EOF` wrapped in a `serial:` error so `NMEA.Run` takes the `reopen` path.
+Add a test using a pipe whose write end is closed.
+
+**Verification:** Unit test with `os.Pipe()`; on hardware, unplug a USB GPS
+and confirm `GPS serial device unavailable` followed by reopen, with no CPU
+spike.
+
+---
+
+## RF5X-014 — `SIGHUP` is not handled, so `kill -HUP` terminates the daemon without a clean shutdown
+
+**Severity:** Low
+
+**Location:** `cmd/carillon/main.go` line 350 (`signal.NotifyContext(...,
+SIGINT, SIGTERM)`); no other `signal` use anywhere. Design: `DESIGN.md` §9
+"`SIGHUP` is not a reload (restart is cheap…)", §16 D11.
+
+**Problem:** Go's default action for an unhandled `SIGHUP` is to exit the
+process immediately. An operator who sends `HUP` expecting a reload (or a
+no-op, as the design implies) gets an abrupt exit: no drift file write, the
+slew transient left in the kernel (RF5X-004), sockets closed by the OS. Under
+`daemon(8)` a terminal hangup on an interactively started instance has the
+same effect.
+
+**Fix specification:** Either `signal.Ignore(syscall.SIGHUP)` with a log
+line the first time it arrives, or add it to `NotifyContext` so it is a
+graceful stop. Document the choice in the rc.d/systemd comments
+(`reload` → restart). Must not change: `SIGTERM`/`SIGINT` handling.
+
+**Verification:** Start the daemon in a test harness, send `SIGHUP`, assert
+it either keeps running or exits 0 with the drift file written.
+
+---
+
+## RF5X-015 — `omitempty` on `time.Time` fields does nothing, so the JSON carries year-1 timestamps the design says should be absent
+
+**Severity:** Low
+
+**Location:** `internal/control/protocol.go` lines 66 (`LastPulse`), 73
+(`LastSentence`), 199 (`LeapExpiry`), 237 (`LastRx`); the same structs are
+embedded verbatim in `/api/v1/status` by `internal/monitor/model.go`.
+Compare lines 115–116, where `LastRequest`/`LastServed` were correctly made
+pointers with a comment explaining why.
+
+**Problem:** `encoding/json` never omits a zero struct, so a source that has
+never received a reply serialises `"last_rx": "0001-01-01T00:00:00Z"`, a
+daemon without a leap file emits `"leapfile_expires": "0001-01-01T00:00:00Z"`,
+and `RefTime`/`Now` likewise. `DESIGN.md` §10.2/§10.3 say absent-rather-than-
+zero is the convention and the schema is `carillon.status.v1`, so clients
+written against the doc will parse year 1 as a real timestamp (the iPhone
+client mentioned in §10.3 would show "last reply: 2025 years ago").
+`carillonctl` already guards with `IsZero()`, which is why nobody noticed.
+
+**Fix specification:** Change those four fields (and `Tracking.RefTime`) to
+`*time.Time` using the existing `optionalTime` helper, or add
+`MarshalJSON` on a small `optionalTime` type. This is an additive-compatible
+change under the v1 rule only if clients tolerate the field disappearing;
+since the documented contract is "absent", do it now before external
+clients exist. Must not change: field names.
+
+**Verification:** Extend `TestServerRoundTrip`/`TestSnapshotOf` to decode
+into `map[string]any` and assert the keys are absent for a fresh engine.
+
+---
+
+## RF5X-016 — Clustering stops at a fixed 3 survivors, not at `min_survivors` as `DESIGN.md` §6.3 and the example config say
+
+**Severity:** Low (documentation/behaviour drift)
+
+**Location:** `internal/discipline/select.go` — `cluster()` line 375
+(`for len(surv) > ClusterMin`, `ClusterMin = 3` at line 19); `Select()` line
+232 uses `minSurvivors` only to decide whether a system source is declared.
+`DESIGN.md` §6.3 ("… and more than `min_survivors` (default 1; set 3 on a
+host with many upstreams) remain") and `deploy/carillon.toml.example` line
+233 ("Smallest number of sources the cluster algorithm keeps").
+
+**Problem:** The code follows RFC 5905 (`NMIN = 3`), which is the right
+choice, but the design and the example describe a different knob: with the
+documented `min_survivors = 3` and only two upstreams the daemon never
+synchronises, and with the default 1 the reader expects clustering to be
+able to reduce to one survivor, which it never does. The design text also
+says the discard rule compares against "that survivor's own jitter" while the
+code (and RFC) use the minimum peer jitter.
+
+**Fix specification:** Fix the documents: §6.3 should say clustering keeps at
+least 3 (RFC `NMIN`) and that `min_survivors` is the number of survivors
+required before a system source is chosen; the example's comment likewise.
+No code change. **Verification:** doc review.
+
+---
+
+## RF5X-017 — A `RATE` kiss's poll is not honoured as a new minimum
+
+**Severity:** Low
+
+**Location:** `internal/source/ntp.go` — `handleKiss()` lines 337–345 sets
+`n.poll = max(poll+1, pkt.Poll)` clamped to `[PollMin, PollMax]`; `hit()` line
+402 then calls `adaptPoll`, which may lower the poll again when `|θ| ≥ 4ψ`.
+Design: `DESIGN.md` §5.4 "honour the packet's poll field as the new minimum".
+
+**Problem:** After a RATE kiss the next noisy update can step the poll back
+below what the server demanded, producing another RATE, and so on — the
+client oscillates at the server's limit instead of backing off. When the
+server's demand exceeds `PollMax` it is silently clamped, so the client keeps
+violating it. RFC 8633 §5.4 expects clients to honour the KoD poll.
+
+**Fix specification:** Keep a per-source `kodMinPoll` (reset only on
+re-resolution); make `adaptPoll`'s lower bound `max(cfg.PollMin, kodMinPoll)`;
+if the demanded poll exceeds `PollMax`, raise the effective maximum to it
+and log once. Must not change: DENY/RSTR handling.
+
+**Verification:** Extend `TestKissRATE`: after the kiss, feed a reply with a
+large offset and assert the poll does not drop below the kiss value.
+
+---
+
+## RF5X-018 — Client sockets are unconnected, so a dead server costs a 2 s timeout per poll instead of an immediate `ECONNREFUSED`
+
+**Severity:** Low
+
+**Location:** `internal/source/ntp.go` — `exchange()` line 559
+(`net.ListenUDP(network, nil)`) and 584 (`WriteToUDPAddrPort`). Design:
+`DESIGN.md` §5.4 "a fresh UDP socket per request … *connected* to the server
+address".
+
+**Problem:** ICMP port-unreachable errors are only delivered to connected UDP
+sockets. With an unconnected socket every poll to a host that is up but not
+running NTP (the exact case in the acceptance log: `gummi` down for a day)
+waits the full timeout, the source goroutine spends 2 s of every poll
+blocked, `iburst` takes 8 s to fail instead of milliseconds, and the log
+throttle had to be invented to cope with the volume. `sameEndpoint` filtering
+is still needed for the connected case only when the server replies from a
+different address, which the design says to drop anyway.
+
+**Fix specification:** Use `net.DialUDP(network, nil, remote)` and
+`conn.Write`; keep the `from` check via `ReadMsgUDPAddrPort` (a connected
+socket still reports the peer). Map `ECONNREFUSED` to a distinct
+`errUnreachable` that counts as a miss without waiting. Must not change: the
+nonce/origin check, kernel timestamping (`sockts.Enable` works on a connected
+socket), the ephemeral-port randomisation.
+
+**Verification:** `TestQueryTimeout` against a closed loopback port must now
+return quickly with the new error; add a test asserting `< 100 ms`.
+
+---
+
+## RF5X-019 — Crash between `CreateTemp` and `Rename` leaves `.drift-*` files that accumulate forever
+
+**Severity:** Low
+
+**Location:** `internal/engine/engine.go` — `writeDrift()` lines 178–209.
+
+**Problem:** A SIGKILL or power loss during the hourly write leaves a
+`.drift-NNNN` file in `/var/db/carillon`; nothing ever removes them. Harmless
+individually, but the directory is also the stats directory's parent on both
+hosts and a year of unclean shutdowns leaves clutter that `-check` will not
+explain.
+
+**Fix specification:** On startup (in `initialFrequency` or `New`), glob
+`filepath.Join(dir, ".drift-*")` and remove matches older than a minute, at
+DEBUG. Must not change: the atomic write itself.
+
+**Verification:** Unit test that plants a stale temp file and asserts it is
+gone after `New`.
+
+---
+
+## RF5X-020 — Precision is measured as the minimum non-zero delta, which reports 2^-30 on any modern host and makes every downstream floor unrealistic
+
+**Severity:** Low
+
+**Location:** `internal/clock/precision.go` — `measurePrecision()` lines
+18–29. Consumers: `discipline.NewFilter(precision)` jitter floor,
+`LoopConfig.Precision` jitter floor, `exchange()` negative-delay tolerance
+(`ntp.go` line 652), the packet `Precision` field.
+
+**Problem:** Two back-to-back `clock_gettime` reads on a TSC-backed clock can
+differ by 1 ns, so the loop finds `minDelta = 1 ns` → `-30` regardless of the
+actual ~20–50 ns read cost or the µs-level real resolution of a VM clock.
+RFC 5905 §7.3/ntpd measure the *time to read the clock* (the typical
+increment), not the smallest observed difference. A `-30` precision makes the
+filter jitter floor 1 ns, the loop's popcorn threshold `3·max(jitter, 1 ns)`,
+and the negative-delay tolerance 2 ns; it also advertises a resolution to
+clients that no host has. Both deployed hosts log `precision_log2` at startup
+so the current values can be checked.
+
+**Fix specification:** Measure like ntpd: loop until the clock changes, take
+the delta between successive *changes*, repeat `precisionSamples` times and
+use the median (or mean) rather than the minimum; keep the `[-30, -6]` clamp.
+Must not change: `ntp.PrecisionFromSeconds` and the clamp range.
+
+**Verification:** Existing `TestMeasurePrecision` cases (stepping clocks)
+still hold with the median; on hosts expect around `-25`…`-23` instead of
+`-30`.
+
+---
+
+## RF5X-021 — Configuration validation gaps: GPS-only keys accepted on `type = "pps"`, and FreeBSD `-check` rejects a separate PPS tty that the daemon would use
+
+**Severity:** Low
+
+**Location:** `internal/config/config.go` — `Validate()` lines 545–557
+(`pps` type validates only `edge`/`offset`); `internal/config/
+refclock_check_freebsd.go` lines 18–25 (`gps` with `HasPPS()` requires
+`dcd`/`cts`); `cmd/carillon/main.go` lines 218–221 (any absolute `pps` path
+is opened as its own device on every platform).
+
+**Problem:** (a) `[[refclock]] type = "pps"` with `baud = 9600` or
+`nmea_offset = 0.15` is accepted and the keys silently ignored, contradicting
+the strict-config promise (§9 "unknown keys are errors"). (b) On FreeBSD a
+`gps` block with `pps = "/dev/cuau1"` (a second callout tty carrying PPS
+only, which `main.go` supports and which is the natural wiring for a USB
+GPS plus a UART PPS) fails `-check` with "must be dcd or cts", while on Linux
+the same block passes. The design (§5.3) says only that the *same* tty is used
+on FreeBSD; it does not forbid a separate one.
+
+**Fix specification:** (a) In `Validate`, fail when `Type == "pps"` and any of
+`Baud`, `PPS`, `PPSEdge`, `PPSOffset`, `NMEAOffset`, `Sentences` is set.
+(b) In the FreeBSD check, accept an absolute `pps` path, run the `pps_mode`
+sysctl check against *that* device's unit instead of `Device`, and keep the
+pin check for `dcd`/`cts`. Must not change: existing valid configs.
+
+**Verification:** Add validate cases for (a); for (b) a FreeBSD-tagged test
+with a fake sysctl is impractical — cover with a table test on the path
+selection and document the manual check.
+
+---
+
+## RF5X-022 — Two divergent `splitHostPort` implementations
+
+**Severity:** Low (maintainability, with one behaviour gap)
+
+**Location:** `internal/config/config.go` lines 418–470 and
+`internal/source/poll.go` lines 64–93.
+
+**Problem:** `config` validates addresses with one parser and `source`
+re-parses the same string with another. They disagree on `"[2001:db8::1]x"`
+(config rejects, source rejects via `net.SplitHostPort`) and would drift on
+future changes; `NewNTP` can therefore fail at *startup* for an address
+`-check` accepted, exiting with `exitUsage` after the clock and devices are
+already open. Today the two agree on every case in both test tables only by
+construction.
+
+**Fix specification:** Export one parser (e.g. `config.ParseServerAddress`
+returning `(host, port)`) and have `source.NewNTP` take host and port rather
+than the raw string, so a config that passed `-check` cannot fail in
+`NewNTP`. Must not change: accepted syntax.
+
+**Verification:** Delete one test table, keep the union of cases on the
+survivor.
+
+---
+
+## RF5X-023 — `versions` histogram and `last_request` are recorded before rate limiting and authentication
+
+**Severity:** Low (metric semantics)
+
+**Location:** `internal/server/responder.go` — `Handle()` lines 184–185,
+before the limiter at 187 and the MAC check at 198. `DESIGN.md` §10.4
+describes `carillon_server_client_version_total` as "accepted requests by
+client protocol version" and `last_request` as "last valid client request".
+
+**Problem:** A request that is then rate-limited or fails `require_key` is
+still counted in the version histogram and refreshes `last_request`, so a
+spoofed flood shows up as accepted-version traffic and `last_request`
+advances while nothing is being served. Not a partition breaker (those are
+the `result` counters) but it makes the histogram misleading exactly during
+the abuse it is meant to characterise.
+
+**Fix specification:** Move both increments after the auth checks, next to
+`served`; or rename the metric help text to "requests that passed the ACL".
+Must not change: metric names.
+
+**Verification:** Extend `TestVersionHistogram` with a rate-limited request
+and assert the histogram is unchanged.
+
+---
+
+## RF5X-024 — IPv6 rate limiting is per /128, so one /64 holder has unlimited fresh buckets
+
+**Severity:** Low
+
+**Location:** `internal/server/ratelimit.go` — `allow()` keys on the full
+address (line 60 `addr.Unmap()`).
+
+**Problem:** Every residential IPv6 customer controls at least a /64; each
+new source address gets a fresh `rate_burst` of tokens and an LRU slot. A
+single host can therefore draw `rate_burst` replies per address indefinitely
+and churn the `max_clients` table, evicting real clients. ntpd's MRU list
+and chrony's client log have the same weakness, but chrony documents it and
+this daemon is being pointed at the pool with `2000::/3`.
+
+**Fix specification:** Key IPv6 buckets on the /64 prefix (`addr.Prefix(64)`)
+and IPv4 on the /32; expose the v6 prefix length as `[serve]
+rate_limit_v6_prefix` (default 64). The clients gauge then counts /64s for
+v6, which should be said in the metric help. Must not change: the v4
+behaviour, the KoD throttle.
+
+**Verification:** Handler test: 20 addresses in one /64 with `rate_burst = 8`
+must share one bucket.
+
+---
+
+## RF5X-025 — The loop's first-update jitter equals the whole initial offset, inflating reported jitter for ~30 updates
+
+**Severity:** Low
+
+**Location:** `internal/discipline/loop.go` — `Update()` lines 187–192
+(`lastOffset` is 0 on the first update, so `d = |offset|` and `Jitter = d`).
+
+**Problem:** A 100 ms initial offset makes `Jitter` start at 100 ms and decay
+by 7/8 in variance per update: still 26 ms after 20 updates. It feeds
+`carillon_jitter_seconds`, `carillonctl tracking`, the kernel `esterror`, and
+the popcorn gate (which only arms when SYNCED, so the practical effect is
+cosmetic and on `esterror`). ntpd seeds `clock_jitter` from precision and
+averages the first sample in, giving ~35 ms in the same case, and steps do not
+update it at all.
+
+**Fix specification:** On the first update set `Jitter = max(precision,
+d/√8)` (i.e. run the same exponential average from the precision floor), and
+skip the jitter update on the update that follows a step (`lastOffset` is
+meaningless then). Must not change: the averaging constant.
+
+**Verification:** Loop test asserting first-update jitter ≈ 35 ms for a
+100 ms offset.
+
+---
+
+## RF5X-026 — A PPS sequence counter that goes backwards produces a 4-billion-slot gap
+
+**Severity:** Low
+
+**Location:** `internal/refclock/pps.go` — `accept()` lines 270–285 and
+`accountSequence()` lines 367–389 (`delta := s.Sequence - p.previousSeq`
+unsigned; `misses := int(delta - 1)`; `p.slots += additional`;
+`r.Gaps += uint64(misses)`).
+
+**Problem:** `reopen()` clears `havePrevious`, so an ordinary device reopen is
+safe, but a kernel-side counter reset without a reopen (Linux `pps_ldisc`
+re-attached by `ldattach` restarting, a `/dev/ppsN` recreated under the
+same name, a FreeBSD `PPS_IOC_DESTROY`/`CREATE` by another process on the
+same tty) yields `delta ≈ 2^32`, `misses ≈ 4.29e9`, `Gaps` jumps by that
+much (a monotonic Prometheus counter that will never look right again),
+`slots` overflows the emit cadence, and the interval check rejects the
+sample as a glitch anyway.
+
+**Fix specification:** If `delta > 3600` (an hour of missed pulses is a
+device restart, not a gap), treat it like a reopen: reset `havePrevious`,
+window and slots, count one `Glitches`, log once. Must not change: normal gap
+accounting.
+
+**Verification:** Unit test feeding sequence 1000 then 5 and asserting
+`Gaps` unchanged and `Glitches` incremented.
+
+---
+
+## RF5X-027 — systemd unit grants write access to all of `/run`
+
+**Severity:** Low
+
+**Location:** `deploy/systemd/carillon.service` line 48
+(`ReadWritePaths=/var/lib/carillon /run`) together with line 37
+(`RuntimeDirectory=carillon`).
+
+**Problem:** `RuntimeDirectory=` already makes `/run/carillon` writable under
+`ProtectSystem=strict`; listing `/run` opens every other daemon's runtime
+directory to a compromised carillon. Nothing in the code writes outside
+`/run/carillon` (control socket) and `/var/lib/carillon` (drift, stats).
+
+**Fix specification:** `ReadWritePaths=/var/lib/carillon` only. Verify on
+`gummi` that the control socket is still created (it is, via
+`RuntimeDirectory`). Must not change: `RuntimeDirectoryMode`.
+
+**Verification:** `systemctl restart carillon && carillonctl version`.
+
+---
+
+## RF5X-028 — Documentation uses a routable placeholder hostname
+
+**Severity:** Low
+
+**Location:** `deploy/README.md` lines 275–276; `deploy/ACCEPTANCE.md` lines
+323–324 (`carillon query … server.example.net`, including the authenticated
+form with `-keys`).
+
+**Problem:** `example.net` resolves. The house rule for anything an operator
+may paste with credentials is RFC 2606 `.invalid`; the authenticated example
+sends a real CMAC (not the key) to whatever answers, which is harmless but
+the rule is the rule and `DESIGN.md` already uses `home.tunnel.invalid`.
+
+**Fix specification:** Replace with `server.invalid`. **Verification:** grep.
+
+---
+
+## RF5X-029 — Statistics files accumulate in one flat directory with no retention
+
+**Severity:** Low
+
+**Location:** `internal/stats/writer.go` — `file()` lines 250–280 creates
+`<kind>.<day>.tsv` in `Dir` and nothing deletes anything.
+
+**Problem:** Four files a day (`loop`, `sources`, `pps`, `server`) is ~1,500
+files a year in `/var/db/carillon/stats`; `sources.tsv` writes one row per
+source per loop update and `pps.tsv` one per pulse (86,400/day). Over a
+multi-year soak this is tens of GB with no age-out and no per-day directory
+to `rm -rf`, which is the failure mode the house `YYYY/MM/DD` convention
+exists to avoid.
+
+**Fix specification:** Write into `Dir/YYYY/MM/DD/<kind>.tsv` (create the
+directories at rotation) and add `[stats] keep_days` (default 0 = keep
+forever) that removes day directories older than the limit at rotation time.
+Update `deploy/README.md` and the example. Must not change: TSV columns or
+the header line.
+
+**Verification:** `TestRecorderRotatesAtUTCMidnight` extended to check the
+directory layout and that a planted old day is removed when `keep_days = 1`.
+
+---
+
+## RF5X-030 — `readLine` compares `err.Error() == "EOF"`
+
+**Severity:** Low
+
+**Location:** `internal/control/client.go` line 130.
+
+**Problem:** String-comparing an error works for `io.EOF` today but breaks
+for any wrapped EOF (`net` wraps read errors in `*net.OpError` on some
+paths), turning a complete unterminated response into "reading response:
+EOF". Use `errors.Is(err, io.EOF)`.
+
+**Fix specification:** One-line change; add `io` import.
+**Verification:** existing control tests.
+
+---
+
+## RF5X-031 — A non-prefer PPS becomes the system source by sorting on stratum 0, contrary to §6.3
+
+**Severity:** Low
+
+**Location:** `internal/discipline/select.go` — `synch()` line 145 (stratum
+dominates), `Select()` lines 227 and 255–257 (`survivors[0]` when no prefer).
+Design: `DESIGN.md` §6.3 says the PPS override applies to a PPS that is
+"also `prefer`"; otherwise "the survivor with the smallest λ".
+
+**Problem:** A qualified PPS has stratum 0 and a tiny distance, so it always
+sorts first and becomes the system source even with `prefer = false`; the
+combined offset is then a distance-weighted mean dominated by the PPS
+anyway. The visible consequences are that the loop's time constant follows
+the PPS poll (4–7) rather than the numbering source's, that the advertised
+refid is `PPS` at stratum 1 for a source the operator did not mark
+`prefer`, and that `noselect`-less "monitor" PPS configurations are
+impossible. This matches ntpd's behaviour for a refclock, so it may be
+intended; the design should say so.
+
+**Fix specification:** Either document that a qualified PPS is always the
+system source unless `noselect`, or exclude non-prefer PPS sources from the
+system-source choice (they still contribute to combine). No behaviour
+change is required; pick one and write it down.
+
+**Verification:** doc review, or a `select_test.go` case if the second
+option is chosen.
+
+---
+
+## RF5X-032 — A source whose goroutine exits is deleted from status instead of shown unreachable
+
+**Severity:** Low
+
+**Location:** `internal/engine/engine.go` — `sourceExited()` lines 291–308
+(`delete(e.sources, name)` and `sys.RemoveSource`). Design: `DESIGN.md` §14
+"Serial device vanishes → source goroutine exits with error; engine marks
+unreachable; reopen retried with backoff".
+
+**Problem:** In practice no production source returns from `Run` (all three
+reopen internally), so the path is only reachable from tests. If it ever
+fires, the source disappears from `carillonctl sources`, `/api/v1/status`,
+and every per-source metric series (Prometheus sees the series vanish
+rather than reach dropping to 0), and there is no restart. Either the design
+or the code should change; the cheaper is the design, plus making the
+engine restart a source that returns an error with backoff, since that is
+what §14 promises.
+
+**Fix specification:** Keep the source registered with reach 0 and a
+`LastError`, restart `Run` after a backoff (1 s doubling to 1 min), and log
+each attempt. Must not change: the `Source` interface.
+
+**Verification:** `TestEngineSourceExitRemovesIt` becomes
+"…MarksItUnreachableAndRestarts".
+
+---
+
+## RF5X-033 — Shutdown has no deadline; a stuck auxiliary goroutine hangs exit
+
+**Severity:** Low
+
+**Location:** `cmd/carillon/main.go` lines 395–398 (`eng.Run`, `stopStats`,
+`stop`, `wg.Wait()` with no timeout). Design: `DESIGN.md` §12 "`main` waits
+with a 5 s deadline".
+
+**Problem:** `control.Server.handle` writes replies without a deadline for a
+`waitsync` with `timeout = 0` (`conn.SetDeadline(time.Time{})` at
+`server.go` line 137); a client that connected, sent `waitsync`, and stopped
+reading holds `s.wg` open and `main` never exits, so `service carillon
+stop` hangs until `daemon(8)`/systemd's `TimeoutStopSec` kills it — after
+which the drift file has already been written (that happens before
+`wg.Wait`), but RF5X-004's base-frequency restore, once added, would be
+skipped.
+
+**Fix specification:** Wrap the final `wg.Wait()` in a 5 s deadline
+(`select` on a done channel and `time.After`), log which component did not
+stop, and exit anyway. Give `reply()` a write deadline of a few seconds.
+Must not change: the drift write ordering.
+
+**Verification:** Control test that opens a `waitsync 0` connection and never
+reads; daemon shutdown must complete within 6 s.
+
+---
+
+## RF5X-034 — Refid `HOLD` is advertised after a panic refusal, not only after holdover expiry
+
+**Severity:** Low (cosmetic, but it misleads diagnosis)
+
+**Location:** `internal/discipline/system.go` — `Status()` lines 383–391
+(`StateUnsynced` with `haveUpdate` → `KissHOLD`); `reselect()` line 307 sets
+`StateUnsynced` on `PanicRefused`. Design: `DESIGN.md` §7.4 (`HOLD` after
+holdover expiry).
+
+**Problem:** A host whose offset exceeds `panic` answers with refid `HOLD`,
+which the design and ntpd/chrony users read as "was synced, lost sources",
+sending the operator to look at network reachability instead of at a
+wildly wrong clock.
+
+**Fix specification:** Track the reason (`unsyncedReason`) and advertise
+`INIT` before any update, `HOLD` after holdover expiry, and a new `PANC`
+(or reuse ntpd's `STEP`? no — use a new code) after a panic refusal;
+document it in §7.4. **Verification:** `TestSimPanicRefused` asserts the
+refid.
+
+---
+
+## RF5X-035 — A request carrying a MAC with an unknown key id is answered unauthenticated instead of with a crypto-NAK
+
+**Severity:** Low (interoperability)
+
+**Location:** `internal/server/responder.go` — `Handle()` lines 198–207:
+an unknown `mac.KeyID` leaves `replyKey == nil` and the request is served
+with a 48-byte reply. `DESIGN.md` §7.2 step 8 says "if the key id is known,
+verify", which the code follows.
+
+**Problem:** ntpd and chrony answer a request they cannot authenticate with
+a crypto-NAK (48-byte header plus a 4-byte zero key id, which `ntp.Decode`
+already recognises on the client side). An ntpd/chrony client configured
+with a key the server does not have currently gets a plain reply, which it
+drops as "unauthenticated" with no explanation, whereas a NAK tells it (and
+`ntpq -p`) that the *key* is the problem. The NAK is 52 bytes against a
+68-byte request, so the length invariant holds.
+
+**Fix specification:** When `mac != nil && !mac.IsCryptoNAK()` and the key id
+is unknown (or the MAC fails), reply with the header plus a zero key id,
+count `bad_auth`, and keep the reply unauthenticated. Must not change: the
+reply-length invariant (add a fuzz assertion that a NAK is only sent when the
+request was ≥ 52 bytes).
+
+**Verification:** Handler test: unknown key id → 52-byte reply whose trailer
+decodes as `IsCryptoNAK()`.
+
+---
+
+## RF5X-036 — "preferred source is not usable" is logged at ERROR on every start
+
+**Severity:** Low (log noise)
+
+**Location:** `internal/discipline/select.go` line 233 (`PreferLost =
+preferConfigured` whenever there is no survivor); `internal/discipline/
+system.go` lines 267–274; `internal/engine/engine.go` line 398 (ERROR).
+
+**Problem:** Before the prefer source's first reply there are no survivors,
+so `PreferLost` flips true and the engine logs an ERROR at every daemon
+start, then INFO "preferred source is back in charge" a few seconds later.
+An operator alerting on ERROR lines gets a false page per restart.
+
+**Fix specification:** Do not report `PreferLost` until the prefer source has
+been reachable at least once (or until any source has become a survivor);
+log the transition at WARN, not ERROR, when it happens within the first
+poll interval. Must not change: the `prefer_lost` status field semantics
+once running.
+
+**Verification:** `TestSimPreferLost` asserts no `EventPreferLost` before the
+first survivor.
+
+---
+
+# Summary
+
+| ID | Severity | Area | Title | Status |
+|---|---|---|---|---|
+| RF5X-001 | Critical | refclock/pps | Spike gate rejects every pulse once the loop slews; window never refreshes; PPS lost until restart | Verified |
+| RF5X-002 | High | engine, source, discipline | Measurements queued before a step/leap are applied after it; double step | Verified |
+| RF5X-003 | High | server | Directed-broadcast destinations answered; FreeBSD replies from a broadcast source | Verified (code); wire proof pending |
+| RF5X-004 | High | engine | Shutdown leaves the slew transient (up to ±500 ppm) in the kernel | Verified |
+| RF5X-005 | Medium | engine, discipline | Leap transition → HOLDOVER → SETTLING; server LI=3 for three loop updates | Verified |
+| RF5X-006 | Medium | discipline | SETTLING counts filter updates; restarted server unsynced for minutes | Operational evidence |
+| RF5X-007 | Medium | discipline | Qualified prefer PPS bypasses intersection; wrong edge undetected | Needs investigation (hardware) |
+| RF5X-008 | Medium | server | Rate limit before MAC check starves the authenticated association | Code |
+| RF5X-009 | Medium | server, deploy | `recv_buffer` > `kern.ipc.maxsockbuf` aborts startup on FreeBSD | Needs investigation (twocom) |
+| RF5X-010 | Low | discipline | `settled` not reset by a second step | Verified |
+| RF5X-011 | Low | discipline | `Tick` assumes 1 s; `Update` drops the transient | Code |
+| RF5X-012 | Low | discipline | Filter dispersion ignores empty stages (RFC deviation) | Code |
+| RF5X-013 | Low | serial, refclock | Zero-byte read would spin the NMEA loop | Needs investigation |
+| RF5X-014 | Low | cmd | `SIGHUP` unhandled → abrupt exit | Code |
+| RF5X-015 | Low | control, monitor | `omitempty` on `time.Time` emits year-1 timestamps | Code |
+| RF5X-016 | Low | docs | Cluster floor is 3, not `min_survivors` | Doc |
+| RF5X-017 | Low | source | RATE kiss poll not a new minimum | Code |
+| RF5X-018 | Low | source | Unconnected client socket; no ICMP unreachable | Code |
+| RF5X-019 | Low | engine | `.drift-*` temp files after a crash | Code |
+| RF5X-020 | Low | clock | Precision measured as min delta → 2^-30 | Code |
+| RF5X-021 | Low | config | GPS keys accepted on `pps`; FreeBSD check rejects a separate PPS tty | Code |
+| RF5X-022 | Low | config, source | Two `splitHostPort` implementations | Code |
+| RF5X-023 | Low | server | Version histogram counted before rate limit/auth | Code |
+| RF5X-024 | Low | server | IPv6 rate limiting per /128 | Code |
+| RF5X-025 | Low | discipline | First-update jitter equals the whole offset | Code |
+| RF5X-026 | Low | refclock | Backwards PPS sequence → 4e9-slot gap | Code |
+| RF5X-027 | Low | deploy | systemd `ReadWritePaths=/run` | Config |
+| RF5X-028 | Low | docs | `server.example.net` placeholder | Doc |
+| RF5X-029 | Low | stats | Flat directory, no retention | Code |
+| RF5X-030 | Low | control | `err.Error() == "EOF"` | Code |
+| RF5X-031 | Low | discipline, docs | Non-prefer PPS always system source | Doc/code |
+| RF5X-032 | Low | engine | Exited source deleted rather than marked unreachable | Code |
+| RF5X-033 | Low | cmd, control | No shutdown deadline | Code |
+| RF5X-034 | Low | discipline | `HOLD` refid after panic refusal | Code |
+| RF5X-035 | Low | server | No crypto-NAK for unknown key id | Code |
+| RF5X-036 | Low | discipline, engine | Prefer-lost ERROR on every start | Code |
+
+Counts: Critical 1, High 3, Medium 5, Low 27.
+
+# Suggested fix order
+
+The order accounts for shared code paths so that a later fix does not have to
+re-touch an earlier one.
+
+1. **RF5X-001** (PPS spike gate). Self-contained in `refclock/pps.go`; blocks
+   the pending live PPS acceptance. Do it first and re-run the hardware
+   probe.
+2. **RF5X-004** (base frequency on exit). Five lines in `engine.Run`; no
+   dependencies; protects every restart done for the fixes below.
+3. **RF5X-002** (measurement generation). Touches `Measurement`, all three
+   sources, the engine and `System.Update`; do it before any other change to
+   `System` so RF5X-005/006/010 are built on the new contract. Include
+   RF5X-012 (filter dispersion) in the same change set, since together they
+   define what a "first sample" is worth.
+4. **RF5X-005, RF5X-010, RF5X-006** (state machine), in that order, in
+   `system.go`; they share `reselect()`/`settled`. Update `DESIGN.md` §6.5
+   once for all three. RF5X-034 and RF5X-036 are small edits in the same
+   file and can ride along.
+5. **RF5X-003** (directed broadcast) and **RF5X-009** (FreeBSD `SO_RCVBUF`):
+   both in `server` platform code, independent of the discipline work; can be
+   done in parallel with step 4. RF5X-023, RF5X-024, RF5X-035 are further
+   `responder.go`/`ratelimit.go` edits best batched with RF5X-008.
+6. **RF5X-008** (auth before limiter for `require_key`), then the batched
+   server Lows above.
+7. **RF5X-007** (PPS agreement check) after step 4 has settled the state
+   machine, since it adds a new falseticker path through `reselect`.
+8. **RF5X-011, RF5X-025** (loop) — independent of the above but easiest to
+   validate once the simulation gains the PPS case from step 1.
+9. Remaining Lows in any order: RF5X-013, 014, 015, 017, 018, 019, 020, 021,
+   022, 026, 027, 028, 029, 030, 031, 032, 033, 016.
+
+After steps 1–4, repeat `deploy/ACCEPTANCE.md`'s checklist on both hosts and
+add the live PPS run; after step 5, re-run the six-datagram counter proof
+plus one broadcast-destination datagram.
