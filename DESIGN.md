@@ -234,26 +234,57 @@ valid candidate left, becomes the system source and steps the clock a second
 time by the same amount in the opposite direction. The same window exists
 *inside* one exchange, whose T1 is before a step and T4 after it.
 
-So the engine owns a **generation** counter (`atomic.Uint64`, starting at 1)
-which it increments before every clock step and before every leap-transition
-reset. Each source reads it when it *starts* a sample — an NTP source before
-T1, a PPS source before the fetch that will return the edge, an NMEA source at
-the `$` that fixes the arrival timestamp — and reads it again before the
-sample is used:
+So the engine owns a **generation** counter (`atomic.Uint64`), the clock
+*epoch*. It carries two states:
 
-- if it changed, the sample is dropped: it does not enter the source's filter
-  or window, reach is updated (the server did answer, the edge did happen),
-  the `Stale` counter is incremented, and the emitted `Measurement` is
-  `Valid = false`;
-- otherwise the `Measurement` carries that generation, and the engine drops
-  any measurement whose generation is behind its own — the remaining window,
-  where the bump happened after the source's last look but before the engine
-  dequeued the measurement.
+- **Even values are settled epochs.** The first is 2.
+- **An odd value means a discontinuity is executing right now** — a clock step,
+  or the source reset that follows a leap second — and no clock reading taken
+  while it is in progress can be trusted.
+
+The engine increments once *before* the operation and once *after*, so the
+whole discontinuity is bracketed by an odd counter. Incrementing only before
+the syscall was not enough: it left the counter at its new, apparently settled
+value while the clock was still moving, so a source that started a sample in
+that window labelled a pre-step observation with the post-step epoch and
+defeated the check entirely. The completing increment runs even when the
+operation fails, so a refused step cannot leave acquisition permanently in
+progress.
+
+Each source reads the epoch when it *starts* a sample — an NTP source before
+T1, a PPS source before the fetch that will return the edge, an NMEA source
+around the clock read that fixes the arrival timestamp, not later at byte
+framing — and reads it again before the sample is used:
+
+- if it changed, **or if it is odd**, the sample is dropped: it does not enter
+  the source's filter or window, reach is updated (the server did answer, the
+  edge did happen), the `Stale` counter is incremented, and the emitted
+  `Measurement` is `Valid = false`;
+- otherwise the `Measurement` carries that epoch, and the engine admits it only
+  when it is still exactly the current settled epoch — closing the remaining
+  window, where the change happened after the source's last look but before the
+  engine dequeued the measurement.
 
 `Measurement.Generation = 0` means the source does not stamp and is never
 treated as stale. Stale drops are counted per source and surface as
 `carillon_source_events_total{result="stale"}` and the `stale` field of
 `carillonctl sources`.
+
+**Processing time.** A measurement carries two timestamps: `At`, the time of
+the observation, and `Now`, which the engine *re-establishes at consumption*
+from its own monotonic clock rather than taking the producer's enqueue-time
+reading. That clock never decreases. A buffered or cross-source measurement
+can otherwise arrive after a newer tick and move global time backwards,
+understating candidate ages, restarting timeouts that have already expired,
+and making the published uptime and root uncertainty regress while the real
+clock advances.
+
+**Ordering against discontinuities.** A leap boundary is detected and
+processed *before* a queued measurement is admitted and before any correction
+action is evaluated. An observation spanning the boundary is wrong by exactly
+one second, and resetting the sources afterwards cannot undo a step the loop
+has already asked for; the epoch bump that accompanies the reset is what makes
+such an observation recognisably stale.
 
 Per-source config common to all types: `prefer` and `noselect`. There is no
 per-source weight; combining is by root distance (§6.3).
@@ -434,6 +465,31 @@ binary's build date is rejected and logged as *suspected GPS week rollover*
 (1024-week rollovers: 1999-08, 2019-04, 2038-11). The build date is embedded
 via `debug.ReadBuildInfo` (`vcs.time`) with an `-ldflags -X` override for
 non-VCS builds.
+
+**Chronology and eras.** Each accepted sentence must be *after* the last one
+and no more than an hour ahead of it: a receiver reporting once a second
+cannot legitimately advance further. Anything else — a repeat, a replay, or a
+jump too large to be normal progression — is refused **and is not committed to
+the watermark**. A single checksum-valid glitch dating a sentence in 2099 used
+to become the watermark before the engine had accepted or refused the
+correction, after which every later correct timestamp was silently dropped and
+recovery needed a daemon restart.
+
+A genuinely new era — a receiver replaced, or one that has corrected itself —
+is still adoptable: it proves itself with four consecutive, self-consistent
+sentences, at which point the window built in the old era is dropped and the
+new era becomes the watermark. That is bounded repeated evidence, not an open
+door, and the build-date guard above still rejects week-rollover dates.
+Re-priming re-establishes ordering too, so a window reset, a device
+replacement or a successful reconnect starts from no watermark rather than
+carrying the old device's era for ever.
+
+**Freshness.** Losing reach drops the offset window. One fresh sentence must
+not be able to requalify a mostly historical window and stamp its median as
+current: the host may have slewed or drifted during the outage, making that
+estimate wrong *and* falsely precise. A gap wider than the reach register does
+the same even when no timeout tick intervened. Ordinary short packet loss does
+not: the window survives until reach actually empties.
 
 **NMEA measurement:** `θ = sentence_time − arrival_time + nmea_offset`,
 `Dispersion` = robust σ of the last 16 sentences (tens of ms), `Numbering =
@@ -855,10 +911,32 @@ as unhealthy; JSON and metrics expose the expiry and leap provenance. An
 expired file remains loaded so the failure is observable rather than turning
 silently into a different authority policy.
 
+Survivor leap consensus is **published as soon as it is accepted**, not only
+after the system source contributes a new filter output. A warning announced
+by the other survivors while the system source's own lowest-delay winner is
+unchanged used to be ignored entirely, because the majority was recomputed
+below the early returns in `reselect`. A bare PPS still does not vote: an edge
+carries no calendar information, so its numbering sources decide.
+
+Both authorities have a **boundary**, and both reset boundary-spanning
+evidence exactly once when the kernel applies the leap. With a `leapfile` the
+file says when the transition is. Without one — the supported
+upstream-authoritative topology — the boundary implied by a survivor-majority
+warning is the end of the current UTC day, tracked from the moment the warning
+appears and dropped if it is withdrawn. Crossing either boundary resets the
+sources under a bracketed epoch (§5.1) and runs `Resync`, which keeps the
+previously-synchronized host serving rather than dropping to SETTLING.
+
 `leap_mode = "kernel"` (v1 only): on the last day of June or December with a
 pending leap, set `STA_INS`/`STA_DEL` at 00:00 UTC; the kernel performs the
 insertion at midnight; the flag is cleared and the PPS/NMEA filters are reset
-afterwards because the PPS seconds numbering shifts by one. A `"slew"` mode
+afterwards because the PPS seconds numbering shifts by one.
+
+NMEA carries no leap warning and cannot represent the leap second itself:
+`23:59:60` has no distinct `time.Time`, so a sentence carrying it is refused
+rather than being normalised into the following midnight and misdating that
+second's measurement. Second 60 at any other minute is malformed. Losing one
+sentence per leap second costs nothing at a 16-sample window. A `"slew"` mode
 (spread the second over a window, chrony-style) is future work (§15).
 
 ---
@@ -1466,10 +1544,29 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   a bounded 1.5 s `PPS_FETCH`, which shifts reach on a missing pulse and also
   bounds shutdown latency; a vanished device is reopened with backoff. NMEA
   reads use `poll(2)` with a 500 ms bound; a `gps` refclock uses one source
-  goroutine for NMEA and, when enabled, one for PPS. Should a source's `Run`
-  return anyway, the engine keeps it registered, reports it with reach 0 and
-  the returned error as its `LastError`, and restarts it after a backoff of
-  one second doubling to one minute (§14). Forgetting the source instead
+  goroutine for NMEA and, when enabled, one for PPS.
+
+  A **hard device error is reported before the reconnect loop is entered**,
+  not after it succeeds: the refclock emits reach 0 with the estimate
+  explicitly invalidated, and clears its window, sequence and framing state so
+  the replacement device has to prime and qualify from scratch. Otherwise the
+  engine hears nothing at all while the opener keeps failing, and a
+  disconnected PPS stays system source — or a pre-outage NMEA estimate keeps
+  numbering a live pulse — indefinitely. `LastError` keeps explaining the
+  outage throughout. Every *local* reset that revokes an estimate carries that
+  invalidation, including a run of rejected pulses and a PPS sequence restart:
+  an ordinary invalid measurement deliberately *retains* the previous
+  estimate, so an unlocked refclock with nonzero reach would otherwise stay
+  selected on a window it no longer has.
+
+  Should a source's `Run` return anyway, the engine keeps it registered,
+  reports it with reach 0 and the returned error as its `LastError`, and
+  restarts it after a backoff of one second doubling to one minute (§14). The
+  measurements that source had already queued are dropped at that point —
+  lifecycle events and measurements travel on different channels, so a stop
+  can otherwise be overtaken by an older valid sample that revives a dead
+  source — its estimate is revoked, and the recorded failure survives until
+  the restarted run actually delivers something. Forgetting the source instead
   would make it disappear from `carillonctl sources`, `/api/v1/status` and
   every per-source metric series, where Prometheus sees the series vanish
   rather than reach drop to zero.

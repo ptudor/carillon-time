@@ -457,3 +457,116 @@ func TestAstra6DropQueuedPreservesOtherSources(t *testing.T) {
 		t.Fatalf("dropped %d of the stopped source's measurements, want 3", e.staleDrops["a"])
 	}
 }
+
+// TestAstra6FilelessLeapBoundaryResets covers the second half of RA6X-022.
+// The only boundary reset was conditional on a LeapTable, so the supported
+// upstream-authoritative topology never reset its samples or epoch after the
+// kernel applied a leap, and could carry the warning until some later update
+// happened to clear it.
+func TestAstra6FilelessLeapBoundaryResets(t *testing.T) {
+	for _, dir := range []struct {
+		name string
+		leap ntp.Leap
+	}{{"insert", ntp.LeapInsert}, {"delete", ntp.LeapDelete}} {
+		t.Run(dir.name, func(t *testing.T) {
+			// Ten seconds before the end of a UTC day.
+			boundary := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+			clk := clock.NewFake(boundary.Add(-10 * time.Second))
+			gen := new(atomic.Uint64)
+			src := &scripted{name: "up", clk: clk, gen: gen.Load}
+			cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+			cfg.Generation = gen
+			// No LeapTable: the survivors are the authority.
+			e, err := New(cfg, clk, quietLog())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.cfg.LeapTable != nil {
+				t.Fatal("this case must run without a leapfile")
+			}
+
+			feed := func(li ntp.Leap) {
+				clk.Advance(time.Second)
+				m := good(0.001)
+				m.Source, m.Leap = "up", li
+				m.Now, m.At = clk.Monotonic(), clk.Monotonic()
+				m.Generation = gen.Load()
+				if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := 0; i < 3; i++ {
+				feed(dir.leap)
+			}
+			if st := e.Status(); st.Leap != dir.leap {
+				t.Fatalf("the survivors' warning was not published: %v", st.Leap)
+			}
+			if e.pendingLeap.IsZero() {
+				t.Fatal("no pending boundary was tracked for a fileless leap warning")
+			}
+			resets := src.resets.Load()
+			epoch := gen.Load()
+
+			// Cross the boundary. The kernel applies the leap; the daemon
+			// must reset boundary-spanning evidence exactly once.
+			clk.Advance(boundary.Sub(clk.TrueTime()) + time.Second)
+			now := e.processing(clk.Monotonic())
+			e.crossLeap(now)
+			if src.resets.Load() != resets+1 {
+				t.Fatalf("sources reset %d times across the boundary, want 1", src.resets.Load()-resets)
+			}
+			if gen.Load() != epoch+2 {
+				t.Fatalf("epoch %d -> %d, want a bracketed change", epoch, gen.Load())
+			}
+			if !source.StableEpoch(gen.Load()) {
+				t.Fatal("the epoch is still in progress after the leap reset")
+			}
+			if len(clk.Steps) != 0 {
+				t.Fatalf("crossing a fileless leap boundary stepped the clock: %v", clk.Steps)
+			}
+			// Once only.
+			e.crossLeap(e.processing(clk.Monotonic()))
+			if src.resets.Load() != resets+1 {
+				t.Fatalf("the boundary was processed twice: %d resets", src.resets.Load()-resets)
+			}
+		})
+	}
+}
+
+// TestAstra6FilelessLeapWarningClears checks a withdrawn warning drops the
+// pending boundary rather than leaving one armed for ever.
+func TestAstra6FilelessLeapWarningClears(t *testing.T) {
+	boundary := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(boundary.Add(-10 * time.Second))
+	src := &scripted{name: "up", clk: clk}
+	cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := func(li ntp.Leap) {
+		clk.Advance(time.Second)
+		m := good(0.001)
+		m.Source, m.Leap = "up", li
+		m.Now, m.At = clk.Monotonic(), clk.Monotonic()
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		feed(ntp.LeapInsert)
+	}
+	if e.pendingLeap.IsZero() {
+		t.Fatal("no pending boundary was tracked")
+	}
+	feed(ntp.LeapNone)
+	if !e.pendingLeap.IsZero() {
+		t.Fatalf("a withdrawn warning left a boundary armed at %v", e.pendingLeap)
+	}
+	resets := src.resets.Load()
+	clk.Advance(boundary.Sub(clk.TrueTime()) + time.Second)
+	e.crossLeap(e.processing(clk.Monotonic()))
+	if src.resets.Load() != resets {
+		t.Fatal("a withdrawn warning still produced a boundary reset")
+	}
+}
