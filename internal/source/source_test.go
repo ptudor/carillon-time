@@ -99,6 +99,7 @@ func testKey() *auth.Key {
 func newPoller(t *testing.T, srv *fakeServer, cfg NTPConfig, sleeps int) *NTP {
 	t.Helper()
 	cfg.Address = srv.addr.String()
+	cfg.Host, cfg.Port = srv.addr.Addr().String(), srv.addr.Port()
 	if cfg.Name == "" {
 		cfg.Name = "test"
 	}
@@ -230,6 +231,81 @@ func TestKissRATE(t *testing.T) {
 	info := n.Info()
 	if info.Kiss != 1 || info.Denied {
 		t.Fatalf("info %+v", info)
+	}
+}
+
+// TestKissRATEPollIsANewMinimum covers RF5X-017. RFC 8633 §5.4 makes the
+// kiss's poll a new minimum, not a one-off bump: without that, the next noisy
+// update lets adaptPoll drop straight back below what the server demanded,
+// earning another kiss, and the client oscillates at the server's limit
+// instead of backing off. Driven directly, with no Run goroutine, because
+// the poller's state belongs to that goroutine.
+func TestKissRATEPollIsANewMinimum(t *testing.T) {
+	n, err := NewNTP(NTPConfig{Name: "s", Address: "h", Host: "h", Port: 123, PollMin: 6, PollMax: 10},
+		clock.ReadOnly(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.handleKiss(&kissError{code: "RATE", pkt: ntp.Packet{Poll: 8}})
+	if n.poll != 8 || n.pollFloor() != 8 {
+		t.Fatalf("poll %d floor %d after a RATE kiss demanding 8", n.poll, n.pollFloor())
+	}
+	// A large offset wants a shorter poll; the demand must hold it back.
+	n.poll = adaptPoll(n.poll, 1.0, 1e-6, n.pollFloor(), n.cfg.PollMax)
+	if n.poll < 8 {
+		t.Fatalf("poll dropped to %d below the demanded 8", n.poll)
+	}
+	// Losing and regaining reachability must not undo it either.
+	n.reach = 0
+	n.hit(exchangeResult{Packet: ntp.Packet{Stratum: 2, Leap: ntp.LeapNone, Precision: -20}})
+	if n.poll < 8 {
+		t.Fatalf("poll reset to %d on recovery, below the demanded 8", n.poll)
+	}
+}
+
+// TestKissRATEBeyondPollMax covers the other half of RF5X-017: a demand
+// longer than poll_max was silently clamped, so the client kept violating it.
+func TestKissRATEBeyondPollMax(t *testing.T) {
+	srv := newFakeServer(t, func(req ntp.Packet, _ []byte) []byte {
+		return reply(req, func(p *ntp.Packet) {
+			p.Stratum = 0
+			p.ReferenceID = ntp.KissRATE
+			p.Poll = 13
+		})
+	})
+	n := newPoller(t, srv, NTPConfig{PollMin: 6, PollMax: 10}, 0)
+	out, stop := run(t, n)
+	defer stop()
+
+	if m := next(t, out); m.Poll != 13 {
+		t.Fatalf("poll %d, want the demanded 13 even though poll_max was 10", m.Poll)
+	}
+}
+
+// TestUnreachablePortFailsFast covers RF5X-018. An unconnected socket never
+// sees the ICMP port-unreachable, so a host that is up but not running NTP
+// cost the full timeout on every poll.
+func TestUnreachablePortFailsFast(t *testing.T) {
+	// A port nothing is listening on: bind one and close it.
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := c.LocalAddr().(*net.UDPAddr).AddrPort()
+	c.Close()
+
+	ctx := context.Background()
+	start := time.Now()
+	_, err = Query(ctx, addr.Addr().String(), addr.Port(), nil, clock.ReadOnly(), 5*time.Second)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a closed port must not answer")
+	}
+	if !errors.Is(err, errUnreachable) {
+		t.Skipf("this platform did not deliver ICMP port-unreachable to the socket: %v", err)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("took %v to notice a closed port; the timeout was 5 s", elapsed)
 	}
 }
 
@@ -417,7 +493,7 @@ func TestReResolveAfterTimeouts(t *testing.T) {
 		return reply(req, func(p *ntp.Packet) { p.ReferenceID = refB })
 	})
 
-	n, err := NewNTP(NTPConfig{Name: "pool", Address: "ntp.test", Timeout: 100 * time.Millisecond},
+	n, err := NewNTP(NTPConfig{Name: "pool", Address: "ntp.test", Host: "ntp.test", Port: 123, Timeout: 100 * time.Millisecond},
 		clock.ReadOnly(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewNTP: %v", err)
@@ -490,7 +566,7 @@ func TestQuery(t *testing.T) {
 	srv := newFakeServer(t, plain)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	r, err := Query(ctx, srv.addr.String(), nil, clock.ReadOnly(), 500*time.Millisecond)
+	r, err := Query(ctx, srv.addr.Addr().String(), srv.addr.Port(), nil, clock.ReadOnly(), 500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -505,7 +581,7 @@ func TestQuery(t *testing.T) {
 	kiss := newFakeServer(t, func(req ntp.Packet, _ []byte) []byte {
 		return reply(req, func(p *ntp.Packet) { p.Stratum = 0; p.ReferenceID = ntp.KissRATE })
 	})
-	if _, err := Query(ctx, kiss.addr.String(), nil, clock.ReadOnly(), 500*time.Millisecond); err == nil {
+	if _, err := Query(ctx, kiss.addr.Addr().String(), kiss.addr.Port(), nil, clock.ReadOnly(), 500*time.Millisecond); err == nil {
 		t.Fatal("kiss must be an error")
 	} else {
 		var ke *kissError
@@ -518,7 +594,7 @@ func TestQuery(t *testing.T) {
 func TestQueryTimeout(t *testing.T) {
 	silent := newFakeServer(t, func(ntp.Packet, []byte) []byte { return nil })
 	ctx := context.Background()
-	_, err := Query(ctx, silent.addr.String(), nil, clock.ReadOnly(), 100*time.Millisecond)
+	_, err := Query(ctx, silent.addr.Addr().String(), silent.addr.Port(), nil, clock.ReadOnly(), 100*time.Millisecond)
 	if !errors.Is(err, errTimeout) {
 		t.Fatalf("error %v", err)
 	}
@@ -551,52 +627,26 @@ func TestAdaptPoll(t *testing.T) {
 	}
 }
 
-func TestSplitHostPort(t *testing.T) {
-	cases := []struct {
-		in   string
-		host string
-		port uint16
-		err  bool
-	}{
-		{"host", "host", 123, false},
-		{"host:1234", "host", 1234, false},
-		{"192.0.2.1", "192.0.2.1", 123, false},
-		{"192.0.2.1:123", "192.0.2.1", 123, false},
-		{"[2001:db8::1]", "2001:db8::1", 123, false},
-		{"[2001:db8::1]:1234", "2001:db8::1", 1234, false},
-		{"2001:db8::1", "2001:db8::1", 123, false},
-		{"", "", 0, true},
-		{"host:0", "", 0, true},
-		{"host:notaport", "", 0, true},
-		{":123", "", 0, true},
-	}
-	for _, c := range cases {
-		h, p, err := splitHostPort(c.in)
-		if (err != nil) != c.err {
-			t.Errorf("%q: err=%v", c.in, err)
-			continue
-		}
-		if !c.err && (h != c.host || p != c.port) {
-			t.Errorf("%q: got %s:%d want %s:%d", c.in, h, p, c.host, c.port)
-		}
-	}
-}
-
 func TestNewNTPValidation(t *testing.T) {
 	clk := clock.ReadOnly()
-	if _, err := NewNTP(NTPConfig{Address: ""}, clk, nil); err == nil {
-		t.Error("empty address accepted")
+	// NewNTP no longer parses; it is handed the already-validated host and
+	// port by config.ParseServerAddress, and rejects an unset pair.
+	if _, err := NewNTP(NTPConfig{Address: "h", Port: 123}, clk, nil); err == nil {
+		t.Error("empty host accepted")
 	}
-	if _, err := NewNTP(NTPConfig{Address: "h", PollMin: 8, PollMax: 4}, clk, nil); err == nil {
+	if _, err := NewNTP(NTPConfig{Address: "h", Host: "h"}, clk, nil); err == nil {
+		t.Error("zero port accepted")
+	}
+	if _, err := NewNTP(NTPConfig{Address: "h", Host: "h", Port: 123, PollMin: 8, PollMax: 4}, clk, nil); err == nil {
 		t.Error("inverted poll range accepted")
 	}
-	if _, err := NewNTP(NTPConfig{Address: "h", Key: &auth.Key{ID: 1, Secret: []byte("short")}}, clk, nil); err == nil {
+	if _, err := NewNTP(NTPConfig{Address: "h", Host: "h", Port: 123, Key: &auth.Key{ID: 1, Secret: []byte("short")}}, clk, nil); err == nil {
 		t.Error("short key accepted")
 	}
-	if _, err := NewNTP(NTPConfig{Address: "h"}, nil, nil); err == nil {
+	if _, err := NewNTP(NTPConfig{Address: "h", Host: "h", Port: 123}, nil, nil); err == nil {
 		t.Error("nil clock accepted")
 	}
-	n, err := NewNTP(NTPConfig{Address: "h"}, clk, nil)
+	n, err := NewNTP(NTPConfig{Address: "h", Host: "h", Port: 123}, clk, nil)
 	if err != nil || n.Name() != "h" || n.cfg.PollMin != 6 || n.cfg.PollMax != 10 || n.cfg.Timeout != defaultTimeout {
 		t.Errorf("defaults: %v %+v", err, n.cfg)
 	}

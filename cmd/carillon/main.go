@@ -156,9 +156,16 @@ func runDaemon(args []string) int {
 			k := keys[s.Key]
 			key = &k
 		}
+		host, port, err := s.HostPort()
+		if err != nil {
+			log.Error("server", "name", s.Name, "error", err)
+			return exitUsage
+		}
 		src, err := source.NewNTP(source.NTPConfig{
 			Name:       s.Name,
 			Address:    s.Address,
+			Host:       host,
+			Port:       port,
 			Key:        key,
 			IBurst:     s.IBurst,
 			PollMin:    int8(s.PollMin),
@@ -646,9 +653,15 @@ func runQuery(args []string) int {
 		key = &k
 	}
 
+	host, port, err := config.ParseServerAddress(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "carillon query: %v\n", err)
+		return exitUsage
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+5*time.Second)
 	defer cancel()
-	res, err := source.Query(ctx, fs.Arg(0), key, clock.ReadOnly(), *timeout)
+	res, err := source.Query(ctx, host, port, key, clock.ReadOnly(), *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "carillon query: %v\n", err)
 		return exitRuntime

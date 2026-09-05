@@ -245,6 +245,11 @@ func TestServerDefaults(t *testing.T) {
 	}
 }
 
+// TestHostPort covers ParseServerAddress, the *only* parser for an upstream
+// address (RF5X-022). The source package used to re-parse the same string
+// with a second implementation, so a configuration -check accepted could
+// still fail when the source was constructed, with the clock and the serial
+// devices already open. The cases below are the union of both old tables.
 func TestHostPort(t *testing.T) {
 	cases := []struct {
 		in   string
