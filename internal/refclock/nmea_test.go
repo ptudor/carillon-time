@@ -58,10 +58,10 @@ func TestNMEAFramingAnchorsAtDollarRead(t *testing.T) {
 	n, _, _ := testNMEA(t)
 	stamp := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	line := sentence("GNZDA,120000.00,23,08,2026,00,00") + "\r\n"
-	if got := n.consume([]byte("noise"+line[:8]), stamp.Add(100*time.Millisecond), 1); len(got) != 0 {
+	if got := n.consume([]byte("noise"+line[:8]), stamp.Add(100*time.Millisecond), 1, 0); len(got) != 0 {
 		t.Fatalf("partial sentence emitted: %+v", got)
 	}
-	got := n.consume([]byte(line[8:]), stamp.Add(300*time.Millisecond), 1.2)
+	got := n.consume([]byte(line[8:]), stamp.Add(300*time.Millisecond), 1.2, 0)
 	if len(got) != 1 || math.Abs(got[0].Offset-0.05) > 1e-12 {
 		t.Fatalf("framed measurement: %+v", got)
 	}

@@ -557,8 +557,14 @@ func TestEngineStepsOnceWithTwoSources(t *testing.T) {
 	if len(clk.Steps) != 1 {
 		t.Fatalf("steps applied to the clock: %v (want exactly one)", clk.Steps)
 	}
-	if got := gen.Load(); got != 2 {
-		t.Fatalf("generation %d, want 2 (one step)", got)
+	// A discontinuity is bracketed: one increment before the syscall and
+	// one after, so one step advances the counter from source.FirstEpoch
+	// (2) to 4. See the epoch protocol in internal/source.
+	if got := gen.Load(); got != source.FirstEpoch+2 {
+		t.Fatalf("generation %d, want %d (one bracketed step)", got, source.FirstEpoch+2)
+	}
+	if !source.StableEpoch(gen.Load()) {
+		t.Fatal("the epoch must be settled again once the step has finished")
 	}
 	// Which of the two guards fired depends on the interleaving: if the
 	// second source had already read the old generation, its measurement is
@@ -577,8 +583,8 @@ func TestEngineDropsStaleMeasurement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := gen.Load(); got != 1 {
-		t.Fatalf("generation starts at %d, want 1", got)
+	if got := gen.Load(); got != source.FirstEpoch {
+		t.Fatalf("generation starts at %d, want %d", got, source.FirstEpoch)
 	}
 	gen.Store(4)
 	if !e.stale(discipline.Measurement{Source: "a", Generation: 3}) {
@@ -587,11 +593,14 @@ func TestEngineDropsStaleMeasurement(t *testing.T) {
 	if e.stale(discipline.Measurement{Source: "a", Generation: 4}) {
 		t.Fatal("a current measurement must not be dropped")
 	}
+	if !e.stale(discipline.Measurement{Source: "a", Generation: 5}) {
+		t.Fatal("a measurement stamped ahead of the engine must be dropped")
+	}
 	if e.stale(discipline.Measurement{Source: "a", Generation: 0}) {
 		t.Fatal("an unstamped measurement must not be dropped")
 	}
-	if e.staleDrops["a"] != 1 {
-		t.Fatalf("stale drops %d, want 1", e.staleDrops["a"])
+	if e.staleDrops["a"] != 2 {
+		t.Fatalf("stale drops %d, want 2", e.staleDrops["a"])
 	}
 }
 

@@ -333,12 +333,21 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 	var bogus *bogusError
 	switch {
 	case err == nil:
-		if now := n.generation(); now != gen {
+		// The sample is usable only if the epoch was the same settled value
+		// before and after the exchange. An unchanged but *odd* epoch means
+		// a discontinuity was executing throughout, so T1 and T4 straddle
+		// an unknown discontinuity even though the counter did not move
+		// (RA6X-006). Generation 0 means the engine does not stamp epochs.
+		now := n.generation()
+		switch {
+		case now != gen:
 			// The clock was stepped between T1 and T4: the offset and the
 			// delay are both wrong by the step. Reachability is real, so
 			// record the reply, but keep the sample out of the filter.
 			n.discardStale(now)
-		} else {
+		case now != 0 && !StableEpoch(now):
+			n.discardStale(now)
+		default:
 			s = n.hit(res)
 		}
 	case ctx.Err() != nil:

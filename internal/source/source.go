@@ -16,6 +16,35 @@ import (
 	"carillon/internal/ntp"
 )
 
+// Clock epochs.
+//
+// The engine publishes an epoch counter that every source stamps on the
+// measurements it emits, so a sample computed against a clock reading that
+// has since been discarded can be recognised and dropped. A single "bump the
+// counter before the syscall" scheme is not enough: it leaves the counter at
+// its new value while the discontinuity is still executing, so a source that
+// starts a sample in that window labels a pre-step observation with the
+// post-step epoch and defeats the whole check (RA6X-006).
+//
+// The counter therefore carries two states. Even values are *settled*
+// epochs. An odd value means a discontinuity — a clock step, or the source
+// reset after a leap second — is executing right now, and no reading taken
+// while it is in progress can be trusted. The engine increments once before
+// the operation and once after, so the whole discontinuity is bracketed by
+// an odd counter and every settled epoch is even.
+//
+// A sample is usable only when the epoch was the same settled value before
+// and after it was taken, and is still that value when the engine consumes
+// it. Zero means "this source does not stamp epochs" and is never produced
+// by a running engine, whose first settled epoch is FirstEpoch.
+const FirstEpoch uint64 = 2
+
+// StableEpoch reports whether g is a settled clock epoch: an epoch in which
+// no discontinuity was in progress. Zero is not settled — it is the
+// unstamped sentinel — so callers that accept unstamped samples must test
+// for it separately.
+func StableEpoch(g uint64) bool { return g != 0 && g%2 == 0 }
+
 // Source is a producer of clock measurements.
 type Source interface {
 	// Name returns the configured name of the source.

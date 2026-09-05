@@ -735,14 +735,16 @@ func TestGenerationBumpDiscardsReply(t *testing.T) {
 // a pre-step one from a post-step one.
 func TestGenerationStampedOnMeasurements(t *testing.T) {
 	gen := new(atomic.Uint64)
-	gen.Store(7)
+	// A settled epoch: even values are settled, odd ones mean a
+	// discontinuity is executing. See the epoch protocol in source.go.
+	gen.Store(8)
 	srv := newFakeServer(t, plain)
 	n := newPoller(t, srv, NTPConfig{Generation: gen.Load}, 0)
 	out, stop := run(t, n)
 	defer stop()
 
 	m := next(t, out)
-	if !m.Valid || m.Generation != 7 {
-		t.Fatalf("measurement %+v, want valid with generation 7", m)
+	if !m.Valid || m.Generation != 8 {
+		t.Fatalf("measurement %+v, want valid with generation 8", m)
 	}
 }
