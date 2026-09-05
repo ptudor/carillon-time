@@ -324,6 +324,13 @@ func (s *System) reselect(now float64) Result {
 	}
 	s.sel = sel
 
+	// Protocol metadata the survivors agree on is published as soon as it
+	// is accepted, not only after the system source contributes a new
+	// filter output. A leap warning announced by other survivors while the
+	// system source's own winner is unchanged used to be ignored entirely,
+	// because this assignment sat below the early returns (RA6X-022).
+	s.leap = majorityLeap(sel.Survivors)
+
 	if sel.System == nil {
 		s.sysName = ""
 		switch s.state {
@@ -410,7 +417,6 @@ func (s *System) reselect(now float64) Result {
 	s.refID = sys.SourceRefID
 	s.rootDelay = sys.RootDelay + sys.Delay
 	s.rootDisp = sys.RootDisp + sys.Dispersion + sel.Jitter
-	s.leap = majorityLeap(sel.Survivors)
 	s.lastUpdate = now
 	s.haveUpdate = true
 	return res

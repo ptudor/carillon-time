@@ -22,6 +22,16 @@ const (
 	nmeaPoll        = int8(4)
 	nmeaWindow      = 16
 	nmeaReadTimeout = 500 * time.Millisecond
+
+	// nmeaEraJump is the largest forward step in receiver-reported time that
+	// is still ordinary progression rather than a change of era. A receiver
+	// reporting once a second cannot legitimately advance by an hour between
+	// two sentences.
+	nmeaEraJump = time.Hour
+
+	// nmeaEraConfirm is how many consecutive, self-consistent sentences a
+	// disagreeing era must produce before it is believed.
+	nmeaEraConfirm = 4
 )
 
 type serialReader interface {
@@ -82,19 +92,29 @@ type NMEA struct {
 	resetRequested atomic.Bool
 	info           atomic.Pointer[source.Info]
 
-	reach       uint8
-	offsets     []float64
-	lags        []float64
-	line        []byte
-	lineWall    time.Time
-	lineMono    float64
-	lineGen     uint64
-	staleSeen   uint64
-	haveLine    bool
-	haveSlot    bool
-	slotAt      float64
-	lastStamp   time.Time
-	lastZDASeen float64
+	reach    uint8
+	offsets  []float64
+	lags     []float64
+	line     []byte
+	lineWall time.Time
+	lineMono float64
+	lineGen  uint64
+
+	// eraCandidate and eraCount accumulate evidence for a receiver time era
+	// that disagrees with lastStamp. See chronologyOK.
+	eraCandidate time.Time
+	eraCount     int
+
+	// pendingInvalidate is armed by resetWindow and carried on the next
+	// emitted measurement, so the selector drops the estimate this source
+	// no longer has.
+	pendingInvalidate bool
+	staleSeen         uint64
+	haveLine          bool
+	haveSlot          bool
+	slotAt            float64
+	lastStamp         time.Time
+	lastZDASeen       float64
 }
 
 // NewNMEA validates cfg and opens the receiver before any source goroutine is
@@ -224,8 +244,16 @@ func (n *NMEA) Run(ctx context.Context, out chan<- discipline.Measurement) error
 				return nil
 			}
 		default:
+			// A hard device error is a loss, not a quiet receiver: report it
+			// before disappearing into the reconnect loop, or an old NMEA
+			// estimate keeps numbering a live PPS while the GPS is
+			// unplugged (RA6X-004).
 			n.updateInfo(func(i *source.Info, _ *source.RefclockInfo) { i.LastError = err.Error() })
 			n.log.Warn("GPS serial device unavailable", "error", err)
+			n.deviceLost()
+			if !n.emit(ctx, out, n.emptyMeasurement()) {
+				return nil
+			}
 			if err := n.reopen(ctx); err != nil {
 				// Cancellation is a clean stop, not a source failure.
 				if ctx.Err() != nil {
@@ -235,6 +263,19 @@ func (n *NMEA) Run(ctx context.Context, out chan<- discipline.Measurement) error
 			}
 		}
 	}
+}
+
+// deviceLost revokes everything derived from a device that has gone away:
+// reach empties, the estimate is invalidated, and the framing, slot and
+// chronology state is cleared so the replacement device has to prime from
+// scratch. LastError is left as the caller set it, so health keeps explaining
+// the outage while the reconnect loop runs.
+func (n *NMEA) deviceLost() {
+	n.reach = 0
+	n.haveLine, n.haveSlot = false, false
+	n.lastZDASeen = 0
+	n.resetWindow()
+	n.updateInfo(func(i *source.Info, _ *source.RefclockInfo) { i.Reach = 0 })
 }
 
 // reopen closes the current reader and retries the opener with exponential
@@ -371,7 +412,7 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 	} else if n.accepts("ZDA") && n.lastZDASeen != 0 && mono-n.lastZDASeen < 2.5 {
 		return discipline.Measurement{}, false
 	}
-	if !n.lastStamp.IsZero() && !s.Timestamp.After(n.lastStamp) {
+	if !n.chronologyOK(s.Timestamp) {
 		return discipline.Measurement{}, false
 	}
 	if now := n.generation(); n.lineGen != 0 && now != n.lineGen {
@@ -384,8 +425,6 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 		n.log.Info("discarding a sentence that spans a clock step", "count", n.staleSeen, "generation", now)
 		return discipline.Measurement{}, false
 	}
-	n.lastStamp = s.Timestamp
-
 	// time.Time.Sub saturates at ±(1<<63 - 1) ns rather than reporting an
 	// overflow, so a sentence dated far enough from the local clock would
 	// yield an offset of about ±292 years that reads like a real
@@ -396,11 +435,19 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 		return discipline.Measurement{}, false
 	}
 	offset := lag.Seconds() + n.cfg.Offset
+
+	// Reach and freshness are updated before this sample joins the window,
+	// so a sentence arriving after a long gap drops the historical window
+	// and then primes the fresh one, rather than being appended to a window
+	// that is discarded a moment later (RA6X-019).
+	n.noteArrival(mono)
+	n.lastStamp = s.Timestamp
+	n.eraCandidate, n.eraCount = time.Time{}, 0
+
 	n.appendValue(&n.offsets, offset)
 	median, mad := medianMAD(n.offsets)
 	sigma := mad * 1.4826
 	precision := ntp.Log2Seconds(n.clk.Precision())
-	n.noteArrival(mono)
 
 	if pulse := n.cfg.Pulse.latest(); !pulse.IsZero() {
 		sentenceLag := arrival.Sub(pulse).Seconds()
@@ -451,12 +498,83 @@ func (n *NMEA) noteArrival(now float64) {
 		n.reach |= 1
 		return
 	}
+	// A sentence after a long gap skips the slots itself, with no tick in
+	// between. Freshness is lost here just as surely as it is on a timeout,
+	// so the window has to go before this sentence is counted (RA6X-019).
+	if slots >= reachBits {
+		n.staleWindow("a gap longer than the reach register")
+	}
 	shiftReach(&n.reach, slots)
 	n.reach |= 1
 	if slots > 1 {
 		n.addTimeouts(slots - 1)
 	}
 	n.slotAt = now
+}
+
+// chronologyOK is the anti-replay watermark. GPS time advances at 1 Hz, so a
+// sentence is in sequence when it is after the last accepted one and no more
+// than nmeaEraJump ahead of it.
+//
+// Anything else — a repeat, a replay, or a jump too large to be normal
+// progression — is refused, and crucially is *not* committed to the
+// watermark. A single checksum-valid glitch dating a sentence in 2099 used to
+// become the watermark before the engine had accepted or refused the
+// correction, after which every later correct timestamp was silently dropped
+// and recovery needed a daemon restart (RA6X-020).
+//
+// A genuinely new era — a receiver replaced, or one that has corrected itself
+// after a week rollover — still has to be adoptable. It proves itself with
+// nmeaEraConfirm consecutive, self-consistent sentences, at which point the
+// window built in the old era is dropped and the new era becomes the
+// watermark. That is bounded repeated evidence, not an open door: an
+// arbitrary old replay has to sustain a consistent 1 Hz sequence to be
+// believed, and the build-date guard still rejects week-rollover dates.
+func (n *NMEA) chronologyOK(stamp time.Time) bool {
+	if n.lastStamp.IsZero() {
+		return true
+	}
+	if stamp.After(n.lastStamp) && stamp.Sub(n.lastStamp) <= nmeaEraJump {
+		n.eraCandidate, n.eraCount = time.Time{}, 0
+		return true
+	}
+	if !n.noteEra(stamp) {
+		return false
+	}
+	n.log.Warn("NMEA time era changed; adopting it after corroboration",
+		"previous", n.lastStamp.UTC().Format(time.RFC3339), "now", stamp.UTC().Format(time.RFC3339),
+		"sentences", n.eraCount)
+	n.staleWindow("the receiver's time era changed")
+	return true
+}
+
+// noteEra accumulates evidence for a timestamp era that disagrees with the
+// current watermark and reports whether enough consecutive, self-consistent
+// sentences have corroborated it.
+func (n *NMEA) noteEra(stamp time.Time) bool {
+	consistent := !n.eraCandidate.IsZero() &&
+		stamp.After(n.eraCandidate) &&
+		stamp.Sub(n.eraCandidate) <= nmeaEraJump
+	if consistent {
+		n.eraCount++
+	} else {
+		n.eraCount = 1
+	}
+	n.eraCandidate = stamp
+	return n.eraCount >= nmeaEraConfirm
+}
+
+// staleWindow drops an observation window that no longer describes the
+// receiver, so requalification needs the ordinary minimum of fresh accepted
+// sentences rather than one sentence joining a historical majority. Ordinary
+// short packet loss does not reach it: the window survives until reach
+// actually empties.
+func (n *NMEA) staleWindow(reason string) {
+	if len(n.offsets) == 0 {
+		return
+	}
+	n.resetWindow()
+	n.log.Info("NMEA window dropped after losing freshness", "reason", reason)
 }
 
 func (n *NMEA) tick(now float64) (discipline.Measurement, bool) {
@@ -471,6 +589,14 @@ func (n *NMEA) tick(now float64) (discipline.Measurement, bool) {
 	shiftReach(&n.reach, slots)
 	n.slotAt += float64(slots)
 	n.addTimeouts(slots)
+	if n.reach == 0 {
+		// Every sample in the window predates the outage. One fresh
+		// sentence must not be able to requalify a mostly historical
+		// window and stamp its median as current: the host may have slewed
+		// or drifted meanwhile, making that estimate wrong and falsely
+		// precise (RA6X-019). PPS does the same on an unreachable fetch.
+		n.staleWindow("no sentence within the reach register")
+	}
 	n.updateInfo(func(i *source.Info, _ *source.RefclockInfo) {
 		i.Reach = n.reach
 		i.LastError = "NMEA timeout"
@@ -501,10 +627,23 @@ func (n *NMEA) appendValue(dst *[]float64, value float64) {
 	*dst = append(*dst, value)
 }
 
+// resetWindow empties the offset and lag windows and arms an invalidation.
+// Every local reset revokes the estimate the selector is holding, so the next
+// measurement has to say so rather than leaving a stale median in place
+// (RA6X-005, RA6X-019).
 func (n *NMEA) resetWindow() {
+	n.pendingInvalidate = true
+	// Re-priming re-establishes timestamp ordering too. The watermark
+	// belongs to the window's era: retaining it across a reset, a device
+	// replacement or a successful reconnect is what made a single bad date
+	// unrecoverable (RA6X-020).
+	n.lastStamp = time.Time{}
+	n.eraCandidate, n.eraCount = time.Time{}, 0
 	n.offsets = n.offsets[:0]
+	n.lags = n.lags[:0]
 	n.updateInfo(func(_ *source.Info, r *source.RefclockInfo) {
 		r.WindowSamples, r.WindowJitter, r.Stable = 0, 0, false
+		r.MeasuredLag, r.LagSamples = 0, 0
 	})
 }
 
@@ -516,6 +655,11 @@ func (n *NMEA) emptyMeasurement() discipline.Measurement {
 }
 
 func (n *NMEA) emit(ctx context.Context, out chan<- discipline.Measurement, m discipline.Measurement) bool {
+	if n.pendingInvalidate {
+		// Carry exactly one invalidation per reset.
+		m.Invalidate = true
+		n.pendingInvalidate = false
+	}
 	select {
 	case out <- m:
 		return true

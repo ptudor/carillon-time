@@ -139,8 +139,33 @@ func parseNMEAClock(raw string) (hour, minute, second, nsec int, fractional bool
 	if err != nil || second > 60 {
 		return 0, 0, 0, 0, false, errors.New("second is invalid")
 	}
+	if second == 60 {
+		// UTC second 60 is a leap second, and time.Time cannot represent it
+		// distinctly: time.Date normalises 23:59:60 into the following
+		// midnight. Accepting it would silently produce an ordinary sample
+		// dated one second late, colliding with the real next second in the
+		// duplicate watermark. RMC validated its calendar date before the
+		// normalisation and so let it through, while ZDA validated the
+		// normalised date and rejected it — the same instant treated two
+		// different ways (RA6X-042).
+		//
+		// Both are now refused. Losing one sentence per leap second costs
+		// nothing: the offset window is 16 samples deep, the reach register
+		// tolerates a gap, and the kernel applies the leap itself while the
+		// engine handles the boundary (RA6X-007).
+		if hour == 23 && minute == 59 {
+			return 0, 0, 0, 0, false, errors.New("leap second 23:59:60 has no representable instant")
+		}
+		return 0, 0, 0, 0, false, errors.New("second 60 outside a leap-second boundary")
+	}
 	if frac == "" {
 		return hour, minute, second, 0, false, nil
+	}
+	// Validate the whole fractional field before truncating to the supported
+	// precision: cutting it first let ".123456789abc" through as 123456789
+	// nanoseconds.
+	if _, err := parseDigits(frac); err != nil {
+		return 0, 0, 0, 0, false, errors.New("fraction is invalid")
 	}
 	if len(frac) > 9 {
 		frac = frac[:9]

@@ -3,6 +3,8 @@ package discipline
 import (
 	"fmt"
 	"testing"
+
+	"carillon/internal/ntp"
 )
 
 // TestAstra6NeverStepIncludesPanicStartup is the review's RA6X-011 probe.
@@ -121,4 +123,97 @@ func TestAstra6StepPolicyCrossProduct(t *testing.T) {
 
 func label(limit int, atStartup, first bool, offset string) string {
 	return fmt.Sprintf("limit=%d/panic_at_startup=%v/first=%v/%s", limit, atStartup, first, offset)
+}
+
+// TestAstra6LeapUpdatesWithoutSystemFeedback is the review's RA6X-022 probe.
+// The survivor leap majority was recomputed only after a nonignored loop
+// update from the *system* source, so a warning announced by other survivors
+// while the system source's own filter winner was unchanged was ignored.
+func TestAstra6LeapUpdatesWithoutSystemFeedback(t *testing.T) {
+	s := New(simConfig(), 0, true)
+	s.AddSource("a", Options{Numbering: true, Prefer: true})
+	s.AddSource("b", Options{Numbering: true})
+	s.AddSource("c", Options{Numbering: true})
+	m := Measurement{Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone}
+	for _, name := range []string{"a", "b", "c"} {
+		m.Source = name
+		s.Update(m)
+	}
+	m.Now = 2
+	m.At = 2
+	m.Leap = ntp.LeapInsert
+	for _, name := range []string{"b", "c"} {
+		m.Source = name
+		s.Update(m)
+	}
+	if s.leap != ntp.LeapInsert {
+		t.Fatalf("2/3 survivors announce insertion, system still LI=%v", s.leap)
+	}
+}
+
+// TestAstra6LeapConsensusCases covers the rest of RA6X-022's list at the
+// selection level: an unchanged system winner, only non-system sources
+// changing LI, both directions, and a bare PPS not voting.
+func TestAstra6LeapConsensusCases(t *testing.T) {
+	build := func(t *testing.T) *System {
+		t.Helper()
+		s := New(simConfig(), 0, true)
+		s.AddSource("a", Options{Numbering: true, Prefer: true})
+		s.AddSource("b", Options{Numbering: true})
+		s.AddSource("c", Options{Numbering: true})
+		m := Measurement{Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone}
+		for _, name := range []string{"a", "b", "c"} {
+			m.Source = name
+			s.Update(m)
+		}
+		return s
+	}
+	announce := func(s *System, at float64, li ntp.Leap, names ...string) {
+		m := Measurement{Now: at, At: at, Valid: true, Reach: 255, Poll: 6, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: li}
+		for _, name := range names {
+			m.Source = name
+			s.Update(m)
+		}
+	}
+
+	t.Run("deletion", func(t *testing.T) {
+		s := build(t)
+		announce(s, 2, ntp.LeapDelete, "b", "c")
+		if s.leap != ntp.LeapDelete {
+			t.Fatalf("LI %v, want delete", s.leap)
+		}
+	})
+
+	t.Run("a minority does not carry", func(t *testing.T) {
+		s := build(t)
+		announce(s, 2, ntp.LeapInsert, "b")
+		if s.leap != ntp.LeapNone {
+			t.Fatalf("one of three survivors carried the vote: LI %v", s.leap)
+		}
+	})
+
+	t.Run("a warning clears without system feedback", func(t *testing.T) {
+		s := build(t)
+		announce(s, 2, ntp.LeapInsert, "b", "c")
+		if s.leap != ntp.LeapInsert {
+			t.Fatalf("setup LI %v", s.leap)
+		}
+		announce(s, 3, ntp.LeapNone, "b", "c")
+		if s.leap != ntp.LeapNone {
+			t.Fatalf("the warning was not cleared: LI %v", s.leap)
+		}
+	})
+
+	t.Run("a bare PPS does not vote it down", func(t *testing.T) {
+		s := New(simConfig(), 0, true)
+		s.AddSource("gps", Options{Numbering: true, Prefer: true})
+		s.AddSource("pps0", Options{PPS: true})
+		m := Measurement{Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapInsert, Source: "gps"}
+		s.Update(m)
+		m = Measurement{Now: 1, At: 1, Valid: true, Reach: 255, Poll: 4, Delay: 0, Jitter: 1e-7, Stratum: 0, Leap: ntp.LeapNone, Source: "pps0"}
+		s.Update(m)
+		if s.leap != ntp.LeapInsert {
+			t.Fatalf("a PPS with no calendar information voted down the warning: LI %v", s.leap)
+		}
+	})
 }

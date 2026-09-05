@@ -158,6 +158,11 @@ type Engine struct {
 	lastLeapWall   time.Time
 	lastFileLeap   ntp.Leap
 
+	// pendingLeap is the UTC boundary a survivor-majority leap warning
+	// implies, used when no leapfile is configured. Zero when no warning is
+	// active.
+	pendingLeap time.Time
+
 	gen        *atomic.Uint64
 	staleDrops map[string]uint64
 
@@ -725,11 +730,14 @@ func (e *Engine) noteSourceAlive(name string) {
 // sample a source starts while the reset runs is not labelled with the new
 // epoch either.
 func (e *Engine) crossLeap(now float64) {
-	if e.cfg.LeapTable == nil {
-		return
-	}
 	wall := e.clk.Now()
-	if !e.cfg.LeapTable.Crossed(e.lastLeapWall, wall) {
+	var crossed bool
+	if e.cfg.LeapTable != nil {
+		crossed = e.cfg.LeapTable.Crossed(e.lastLeapWall, wall)
+	} else {
+		crossed = e.crossedAnnouncedLeap(wall)
+	}
+	if !crossed {
 		e.lastLeapWall = wall
 		return
 	}
@@ -746,6 +754,43 @@ func (e *Engine) crossLeap(now float64) {
 		e.logEvent(ev)
 	}
 	e.log.Warn("leap transition crossed; source filters reset", "at", wall.UTC().Format(time.RFC3339Nano))
+}
+
+// crossedAnnouncedLeap is the boundary detector for the upstream-authoritative
+// path, where there is no leapfile to consult. A survivor-majority warning
+// says a leap happens at the end of the current UTC day; the kernel applies
+// it, and the daemon has to reset boundary-spanning evidence exactly once
+// when it does. Without this the supported fileless topology never reset its
+// samples or generation after a leap and could carry the warning until some
+// later update happened to clear it (RA6X-022).
+func (e *Engine) crossedAnnouncedLeap(wall time.Time) bool {
+	if e.pendingLeap.IsZero() || e.lastLeapWall.IsZero() {
+		return false
+	}
+	if e.lastLeapWall.Before(e.pendingLeap) && !wall.Before(e.pendingLeap) {
+		e.pendingLeap = time.Time{}
+		return true
+	}
+	return false
+}
+
+// notePendingLeap tracks the UTC boundary a survivor-majority warning implies.
+// It is only used when no leapfile is configured; with one, the file is the
+// authority for when the transition happens.
+func (e *Engine) notePendingLeap(warning ntp.Leap, wall time.Time) {
+	if e.cfg.LeapTable != nil {
+		return
+	}
+	if warning != ntp.LeapInsert && warning != ntp.LeapDelete {
+		e.pendingLeap = time.Time{}
+		return
+	}
+	if e.pendingLeap.IsZero() {
+		utc := wall.UTC()
+		e.pendingLeap = time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+		e.log.Warn("leap warning announced by the survivors", "leap", warning.String(),
+			"at", e.pendingLeap.Format(time.RFC3339))
+	}
 }
 
 // handle applies actions, logs events, refreshes the kernel status and
@@ -801,6 +846,7 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 	}
 	st := e.sys.Status(now)
 	wall := e.clk.Now()
+	e.notePendingLeap(st.Leap, wall)
 	if e.cfg.LeapTable != nil {
 		indicator := e.cfg.LeapTable.Indicator(wall)
 		if indicator != e.lastFileLeap {

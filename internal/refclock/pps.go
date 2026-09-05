@@ -107,7 +107,12 @@ type PPS struct {
 	stable        bool
 	haveEverPulse bool
 	rejectRun     int
-	staleSeen     uint64
+
+	// pendingInvalidate is armed by resetWindow and carried on the next
+	// emitted measurement, so the selector drops the estimate this source
+	// no longer has.
+	pendingInvalidate bool
+	staleSeen         uint64
 }
 
 // NewPPS validates cfg and opens its kernel PPS device. Opening at daemon
@@ -260,8 +265,16 @@ func (p *PPS) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 				return nil
 			}
 		default:
+			// A hard device error is a loss, not a missed pulse: report it
+			// before disappearing into the reconnect loop, or the engine
+			// hears nothing at all while the device is gone and a
+			// disconnected PPS stays system source indefinitely (RA6X-004).
 			p.updateInfo(func(i *source.Info, r *source.RefclockInfo) { i.LastError = err.Error() })
 			p.log.Warn("PPS device unavailable", "error", err)
+			p.deviceLost()
+			if !p.emit(ctx, out, p.emptyMeasurement()) {
+				return nil
+			}
 			if err := p.reopen(ctx); err != nil {
 				return err
 			}
@@ -280,6 +293,19 @@ func (p *PPS) discardStale(now uint64) {
 	p.resetWindow()
 	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) { i.Stale++ })
 	p.log.Info("discarding a pulse that spans a clock step", "count", p.staleSeen, "generation", now)
+}
+
+// deviceLost revokes everything derived from a device that has gone away:
+// reach empties, the estimate is invalidated, and the sequence and window
+// state is cleared so the replacement device has to prime and qualify from
+// scratch. LastError is left as the caller set it, so health keeps explaining
+// the outage while the reconnect loop runs.
+func (p *PPS) deviceLost() {
+	p.reach = 0
+	p.pendingMisses = 0
+	p.havePrevious = false
+	p.resetWindow()
+	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) { i.Reach = 0 })
 }
 
 func (p *PPS) reopen(ctx context.Context) error {
@@ -531,6 +557,13 @@ func (p *PPS) emit(ctx context.Context, out chan<- discipline.Measurement, m dis
 	m.Now = p.clk.Monotonic()
 	m.Reach = p.reach
 	m.Poll = p.poll
+	if p.pendingInvalidate {
+		// Carry exactly one invalidation per reset: the estimate the
+		// selector holds for this source is gone until the window primes
+		// again.
+		m.Invalidate = true
+		p.pendingInvalidate = false
+	}
 	if !m.Valid {
 		// Nothing was measured, so nothing is tied to a clock reading.
 		m.Generation = p.generation()
@@ -543,7 +576,14 @@ func (p *PPS) emit(ctx context.Context, out chan<- discipline.Measurement, m dis
 	}
 }
 
+// resetWindow empties the offset window and arms an invalidation: every local
+// reset here revokes the estimate the selector is holding, so the next
+// measurement must say so. Reporting the reset only through reach left the
+// previous estimate valid in SourceState, and an unlocked PPS with a nonzero
+// reach stayed selected on the strength of a window it no longer has
+// (RA6X-005).
 func (p *PPS) resetWindow() {
+	p.pendingInvalidate = true
 	p.window = p.window[:0]
 	p.windowSeq = p.windowSeq[:0]
 	p.intervals = p.intervals[:0]
@@ -709,8 +749,12 @@ func adaptPoll(poll int8, offset, jitter float64, min, max int8) int8 {
 	return poll
 }
 
+// reachBits is the width of the reach register both refclocks keep: eight
+// slots, so a gap of eight or more empties it.
+const reachBits = 8
+
 func shiftReach(reach *uint8, n int) {
-	if n >= 8 {
+	if n >= reachBits {
 		*reach = 0
 		return
 	}
