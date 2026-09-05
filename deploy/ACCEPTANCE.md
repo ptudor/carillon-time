@@ -418,58 +418,73 @@ reports it — not merely for its state to read `synced`. On this LAN that is
 about ten minutes after the upstream restarts, or one `holdover_max`-free
 poll interval after its offset settles, whichever is longer.
 
-### Observation, not a finding: `mu` runs to 1–2× tau, and the integrator feels it
+### Why the frequency moved, and what was actually wrong
 
 `gummi` did the same thing on its own account — −15.42 ppm from its drift file
-to +1.72 ppm — while its offset came down from 10.2 ms to 445 µs. Both hosts
-recovered (`twocom` turned around at 13:25 and was back to +29.27 ppm by
-13:30; `gummi`'s offset closed to 445 µs by the same time), so the loops are
-stable. But the size of the excursion is worth writing down, because the
-intervals explain it:
+to +1.72 ppm — while its offset came down from 10.2 ms and overshot to
+−2.8 ms. Both hosts recovered.
 
-| host | between loop updates (`mu`) | poll | tau = 4·2^poll | ratio |
-|---|---|---|---|---|
-| `gummi` | 448 s | 6 | 256 s | 1.75 |
-| `gummi` | 255 s | 6 | 256 s | 1.0 |
-| `twocom` | 128 s | 4 | 64 s | 2.0 |
-| `twocom` | 257 s | 5 | 128 s | 2.0 |
+**A first explanation, written here on the day, was wrong**, and is recorded
+because it was wrong in a way worth not repeating. It said the cause was
+`mu`, the interval the frequency integration uses, running to one or two
+times `tau`: a loop update happens only when the clock filter yields a new
+lowest-delay sample, which is uncorrelated with the poll interval that sets
+`tau`, so the step `theta·mu/(4·tau²)` gets large. The arithmetic was right —
+`twocom`'s 13:19:45 update really did convert 2.5 ms into 17 ppm in one step —
+but the conclusion did not follow. A closed-loop reproduction
+(`TestLoopConvergesWhateverTheUpdateSpacing`) sweeps `mu` from 0.06·tau to
+2·tau against a 15.4 ppm drift and a 10 ms offset:
 
-The frequency integrator is `freq += theta · min(mu, 2048) / (4·tau²)`, a
-discrete approximation of a continuous integrator that is only well behaved
-for `mu` well under `tau`. At `mu = 2·tau` the step is `theta/(2·tau)` —
-half the standing phase error converted to frequency in a single update. That
-is exactly what the 13:19:45 row on `twocom` is: 2.5 ms of offset became
-17 ppm of frequency in one step.
+```
+mu =    16 s (0.06 tau): peak |freq-true|  6.92 ppm, final offset -0.000 ms
+mu =   256 s (1.00 tau): peak |freq-true|  4.01 ppm, final offset +0.000 ms
+mu =   512 s (2.00 tau): peak |freq-true|  2.63 ppm, final offset +0.000 ms
+```
 
-`mu` is the time since the last *loop update*, and a loop update happens only
-when the clock filter yields a new lowest-delay sample — which is uncorrelated
-with the poll interval that sets `tau`. So `mu` is not bounded by `tau` in any
-way, and on a quiet LAN it routinely runs to several times it. `min(mu, 2048)`
-clamps at the Allan intercept, which is about the frequency estimate's
-validity, not about the integrator's stability margin.
+Every spacing converges to the correct frequency, and the peak excursion
+*falls* as `mu` grows, because the phase slew removes most of the offset
+between sparse updates and the next update integrates a smaller theta. Sparse
+updates are not the problem.
 
-**This is not new and was not changed here** — the integration formula is
-untouched by the 2026-09-05 work, and RF5X-006 noticed the same filter gate
-but only addressed what it did to the SETTLING state machine, not what it does
-to the integrator. It is not one of the review's 36 findings. What changed is
-that a host now *serves* through the transient, with an honest root dispersion
-(~28 ms on `twocom` at the widest) rather than sitting unsynced for fifteen
-minutes. Whether an honest 28 ms bound beats LI=3 for a quarter of an hour is
-a judgement call, but clients now see the former.
+The phase slew was verified against the live host too, from `Pending slew`
+sampled every 45 s on `twocom` during the transient: the decay implies
+`tau = 126.9 s` against a theoretical `4·2^5 = 128 s`. The loop is doing
+exactly what §6.4 says.
 
-Worth a look in a future review: bounding `mu` by `tau` in the frequency
-integration, or deriving `tau` from the observed update interval rather than
-from the poll.
+**What actually happened** is simpler and is not a defect. `gummi` restarted
+with ~10 ms of phase and spent fifteen minutes slewing it out, which means its
+clock was deliberately running about 17 ppm fast for that whole period.
+`twocom` is locked to `gummi`. A PLL locked to a source that changes rate must
+follow it — that is what a PLL is for — so `twocom` moved its own frequency by
+a comparable amount, and unwound once `gummi` stopped. `gummi`'s own swing has
+a second contributor: its system source changed from `fedora-0` (67 ms delay)
+to `fedora-2` (19 ms), and path asymmetry between two pool servers that far
+apart moves the measured offset by milliseconds.
 
-Practical note meanwhile: the drift file is written hourly and at shutdown, so
-**do not restart a host during this transient** — it would persist a frequency
-that is tens of ppm from the host's true value and start the next run from
-there. All three drift files still held their pre-restart values at 13:30
-(`gummi` −15.418, `twocom` +6.127, `navlisten2026` +9.403); the first hourly
-write lands around 14:16 UTC, by which time both excursions had converged.
+### The real defect: the drift file persisted the transient
 
-Rollback: `.prev` on all three is the version each was running before —
-`1410eae` on `gummi`, `2700bc7` on `twocom` and `navlisten2026`.
+None of the above is worth changing. What *was* worth changing is that
+`maybeWriteDrift` wrote `sys.Frequency()` — the instantaneous value — hourly
+and at shutdown, with no test of whether it meant anything. So a restart or an
+hourly tick landing inside a transient persisted a frequency the host does not
+need, and the next start began from it and produced the same excursion again.
+The first advice written here, "do not restart a host mid-transient", is not
+operational guidance; it is a defect wearing a hat.
+
+The engine now keeps the last `[engine] drift_stable_window` (default 15 min)
+of base-frequency readings and writes the drift file only while that history
+spans the window and its spread is within `drift_stable_spread` (default
+1 ppm). Otherwise it keeps what is on disk — by construction the last estimate
+that did hold still — and logs why, at INFO on the shutdown path where an
+operator will want to see it. A stale drift file costs one convergence the
+loop performs anyway; a persisted transient costs the same convergence *and*
+starts it from the wrong place.
+
+Measured against the real numbers: `twocom` went 6.13 → 32.28 ppm inside four
+minutes, a spread of 26 ppm against a 1 ppm gate, so nothing would have been
+written. In steady state it sat at +6.127 ppm for days, a spread well under
+0.1 ppm, so the hourly write proceeds normally. The regression test drives the
+engine into a 61 ppm excursion and asserts the file keeps its earlier value.
 
 ## Repeatable checklist
 

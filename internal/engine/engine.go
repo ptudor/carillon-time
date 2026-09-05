@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,16 @@ const (
 	sourceRestartMax = time.Minute
 )
 
+// Defaults for the drift-file stability gate. The drift file exists to give
+// the next start a good frequency, and a value the loop is still moving
+// through is worse than a stale one: the loop corrects a stale start on its
+// own, but a persisted transient starts the next run wrong and invites the
+// same transient again.
+const (
+	defaultDriftStableWindow = 15 * time.Minute
+	defaultDriftStableSpread = 1.0 // ppm
+)
+
 // SourceSpec pairs a source with its discipline options.
 type SourceSpec struct {
 	Source  source.Source
@@ -51,6 +62,13 @@ type Config struct {
 	// DriftInterval is how often the drift file is rewritten; zero means
 	// hourly.
 	DriftInterval time.Duration
+
+	// DriftStableWindow and DriftStableSpread gate that rewrite: the
+	// frequency must have stayed inside a band of DriftStableSpread ppm for
+	// DriftStableWindow before it is worth persisting. Zero selects the
+	// defaults.
+	DriftStableWindow time.Duration
+	DriftStableSpread float64
 
 	Sources []SourceSpec
 
@@ -123,6 +141,16 @@ type Engine struct {
 	// sourceErrors holds the reason a source's goroutine is not running,
 	// overlaid on its own Info snapshot until it is running again.
 	sourceErrors map[string]string
+
+	// freqHistory is the recent base frequency, for the drift-file gate.
+	freqHistory    []freqSample
+	driftSkipShown bool
+}
+
+// freqSample is one reading of the loop's base frequency.
+type freqSample struct {
+	at  float64 // monotonic seconds
+	ppm float64
 }
 
 // New builds an engine. It loads the initial frequency (drift file, then the
@@ -133,6 +161,12 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 	}
 	if cfg.DriftInterval <= 0 {
 		cfg.DriftInterval = time.Hour
+	}
+	if cfg.DriftStableWindow <= 0 {
+		cfg.DriftStableWindow = defaultDriftStableWindow
+	}
+	if cfg.DriftStableSpread <= 0 {
+		cfg.DriftStableSpread = defaultDriftStableSpread
 	}
 	freq, known, origin := initialFrequency(cfg.DriftFile, clk, log)
 	log.Info("initial frequency", "ppm", freq, "known", known, "from", origin)
@@ -546,6 +580,7 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 		e.lastLoopUpdate = st.LastUpdate
 		e.refWall = e.clk.Now()
 	}
+	e.noteFrequency(now, st.Frequency)
 	if err := e.syncKernel(&st); err != nil {
 		return err
 	}
@@ -656,6 +691,49 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 	}
 }
 
+// noteFrequency records the base frequency for the drift-file stability gate,
+// keeping only the last DriftStableWindow of history.
+func (e *Engine) noteFrequency(now, ppm float64) {
+	e.freqHistory = append(e.freqHistory, freqSample{at: now, ppm: ppm})
+	// Keep the newest sample at or before the cut, so the retained history
+	// spans the whole window rather than starting inside it.
+	cut := now - e.cfg.DriftStableWindow.Seconds()
+	drop := 0
+	for drop+1 < len(e.freqHistory) && e.freqHistory[drop+1].at <= cut {
+		drop++
+	}
+	if drop > 0 {
+		e.freqHistory = append(e.freqHistory[:0], e.freqHistory[drop:]...)
+	}
+}
+
+// frequencySettled reports whether the frequency estimate has held still long
+// enough to be worth persisting, and if not, why.
+//
+// A PLL locked to an upstream that is itself slewing follows that upstream's
+// rate — correctly, that is what a PLL is for — so the frequency word can sit
+// tens of ppm away from the host's own crystal error for as long as the
+// upstream takes to settle. Writing that to the drift file makes the next
+// start begin from a frequency nothing on this host needs, which produces the
+// same excursion again. Requiring the estimate to have stopped moving costs a
+// stale file at worst, and the loop corrects a stale start by itself.
+func (e *Engine) frequencySettled(now float64) (bool, string) {
+	window := e.cfg.DriftStableWindow.Seconds()
+	if len(e.freqHistory) == 0 || now-e.freqHistory[0].at < window {
+		return false, fmt.Sprintf("less than %s of frequency history", e.cfg.DriftStableWindow)
+	}
+	lo, hi := e.freqHistory[0].ppm, e.freqHistory[0].ppm
+	for _, f := range e.freqHistory[1:] {
+		lo = math.Min(lo, f.ppm)
+		hi = math.Max(hi, f.ppm)
+	}
+	if spread := hi - lo; spread > e.cfg.DriftStableSpread {
+		return false, fmt.Sprintf("frequency moved %.3f ppm in the last %s, more than the %.3f ppm the estimate must hold to",
+			spread, e.cfg.DriftStableWindow, e.cfg.DriftStableSpread)
+	}
+	return true, ""
+}
+
 // maybeWriteDrift writes the drift file when the frequency is trustworthy
 // and either the interval has elapsed or the daemon is shutting down.
 func (e *Engine) maybeWriteDrift(now float64, final bool) {
@@ -665,6 +743,19 @@ func (e *Engine) maybeWriteDrift(now float64, final bool) {
 	if !final && e.lastDriftWrite != 0 && now-e.lastDriftWrite < e.cfg.DriftInterval.Seconds() {
 		return
 	}
+	if settled, why := e.frequencySettled(now); !settled {
+		// Keep what is already on disk: it is the last estimate that did
+		// hold still, which is a better start than one caught in motion.
+		if final {
+			e.log.Info("leaving the drift file alone", "reason", why,
+				"current_ppm", e.sys.Frequency(), "path", e.cfg.DriftFile)
+		} else if !e.driftSkipShown {
+			e.log.Info("deferring the drift file write", "reason", why, "path", e.cfg.DriftFile)
+			e.driftSkipShown = true
+		}
+		return
+	}
+	e.driftSkipShown = false
 	if err := writeDrift(e.cfg.DriftFile, e.sys.Frequency()); err != nil {
 		if !e.driftErrShown {
 			e.log.Warn("cannot write drift file", "path", e.cfg.DriftFile, "error", err)

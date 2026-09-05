@@ -286,12 +286,14 @@ func runDaemon(args []string) int {
 			HoldoverMax:   cfg.Discipline.HoldoverMax,
 			SettleUpdates: cfg.Discipline.SettleUpdates,
 		},
-		DriftFile:  cfg.Daemon.DriftFile,
-		Sources:    specs,
-		LeapTable:  leapTable,
-		Version:    buildinfo.Version,
-		Observe:    observe,
-		Generation: generation,
+		DriftFile:         cfg.Daemon.DriftFile,
+		DriftStableWindow: time.Duration(cfg.Daemon.DriftStableSeconds * float64(time.Second)),
+		DriftStableSpread: cfg.Daemon.DriftStableSpreadPPM,
+		Sources:           specs,
+		LeapTable:         leapTable,
+		Version:           buildinfo.Version,
+		Observe:           observe,
+		Generation:        generation,
 	}, clk, log)
 	if err != nil {
 		log.Error("engine", "error", err)

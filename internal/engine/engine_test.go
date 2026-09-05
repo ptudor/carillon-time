@@ -91,6 +91,9 @@ func testConfig(drift string, srcs ...SourceSpec) Config {
 		DriftFile: drift,
 		Sources:   srcs,
 		Version:   "test",
+		// The scripted source advances the fake clock 64 s per measurement,
+		// so 100 s of monotonic history is a couple of measurements.
+		DriftStableWindow: 100 * time.Second,
 	}
 }
 
@@ -627,5 +630,94 @@ func TestEngineSweepsStaleDriftTemporaries(t *testing.T) {
 	}
 	if _, err := os.Stat(drift); err != nil {
 		t.Fatalf("the drift file itself must survive: %v", err)
+	}
+}
+
+// TestEngineDoesNotPersistAMovingFrequency is the drift-file stability gate.
+// A PLL locked to an upstream that is itself slewing follows that upstream's
+// rate — correctly — so the frequency word can sit tens of ppm from the
+// host's own crystal error until the upstream settles. Persisting that makes
+// the next start begin from a frequency nothing on this host needs, and
+// produces the same excursion again. It must keep the older, settled value.
+func TestEngineDoesNotPersistAMovingFrequency(t *testing.T) {
+	dir := t.TempDir()
+	drift := filepath.Join(dir, "drift")
+	if err := os.WriteFile(drift, []byte("6.125000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clk := clock.NewFake(time.Now())
+	// Offsets large enough, and spaced far enough apart, that the loop walks
+	// the frequency a long way: this is the shape of the twocom transient.
+	src := &scripted{name: "a", clk: clk, gap: 20 * time.Millisecond, script: []discipline.Measurement{
+		good(0.05), good(0.05), good(0.05), good(0.05), good(0.05), good(0.05),
+	}}
+	cfg := testConfig(drift, SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	cfg.DriftStableWindow = 100 * time.Second
+	cfg.DriftStableSpread = 1.0
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	if err := e.Wait(ctx, func(s *Status) bool { return s.Updates >= 5 }); err != nil {
+		t.Fatalf("never reached five updates: %v", err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	moved := e.Status().Frequency
+	if math.Abs(moved-6.125) <= cfg.DriftStableSpread {
+		t.Fatalf("the frequency only moved to %v ppm; this test needs it to move further than %v",
+			moved, cfg.DriftStableSpread)
+	}
+	v, err := readDrift(drift)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 6.125 {
+		t.Fatalf("drift file overwritten with %v while the frequency was in motion at %v ppm; "+
+			"it must keep the last settled value 6.125", v, moved)
+	}
+}
+
+// TestEngineFrequencySettledGate covers the gate directly: not enough
+// history, too much movement, and steady.
+func TestEngineFrequencySettledGate(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	cfg := testConfig("")
+	cfg.DriftStableWindow = 100 * time.Second
+	cfg.DriftStableSpread = 1.0
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	e.noteFrequency(0, 10)
+	if ok, why := e.frequencySettled(50); ok || !strings.Contains(why, "frequency history") {
+		t.Fatalf("50 s of history must not settle: ok=%v why=%q", ok, why)
+	}
+	for at := 0.0; at <= 200; at += 10 {
+		e.noteFrequency(at, 10+at/500) // 0.4 ppm across the whole run
+	}
+	if ok, why := e.frequencySettled(200); !ok {
+		t.Fatalf("a steady frequency must settle: %q", why)
+	}
+	e.noteFrequency(210, 40) // a 30 ppm jump
+	if ok, why := e.frequencySettled(210); ok || !strings.Contains(why, "frequency moved") {
+		t.Fatalf("a moving frequency must not settle: ok=%v why=%q", ok, why)
+	}
+	// Once the jump ages out of the window it settles again.
+	for at := 220.0; at <= 340; at += 10 {
+		e.noteFrequency(at, 40)
+	}
+	if ok, why := e.frequencySettled(340); !ok {
+		t.Fatalf("steady at the new value must settle again: %q", why)
 	}
 }

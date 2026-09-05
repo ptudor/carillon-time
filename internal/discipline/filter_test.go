@@ -110,3 +110,44 @@ func TestFilterRingWraps(t *testing.T) {
 		t.Fatalf("len %d", f.Len())
 	}
 }
+
+// TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands documents the
+// starvation a minimum-delay filter allows, observed live on 2026-09-05.
+//
+// Add reports updated = false whenever the lowest-delay sample in the
+// register is one already reported, so an early sample that happens to have
+// the best delay withholds every later one until AllanIntercept demotes it.
+// System's loop-update gate keys on the same thing, so the discipline loop is
+// not run at all for that whole period — whatever the clock is doing
+// meanwhile. On `gummi` that was ten minutes and about 7 ms; the bound below
+// is worse.
+func TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands(t *testing.T) {
+	f := NewFilter(1e-6)
+	const poll = 256.0 // seconds; poll 8
+
+	// One unusually fast reply, then a long run of ordinary ones.
+	if _, ok := f.Add(0.001, 0.010, 1e-4, poll); !ok {
+		t.Fatal("the first sample must update")
+	}
+	lastAccepted, maxGap := poll, 0.0
+	for i := 2; i <= 12; i++ {
+		now := float64(i) * poll
+		if _, ok := f.Add(0.001+float64(i)*1e-3, 0.030, 1e-4, now); ok {
+			if gap := now - lastAccepted; gap > maxGap {
+				maxGap = gap
+			}
+			lastAccepted = now
+		}
+	}
+	t.Logf("longest run with no filter update: %.0f s (%.1f min) at poll 8", maxGap, maxGap/60)
+	t.Logf("at the 17 ppm gummi was carrying, that is %.0f ms of uncorrected time error",
+		maxGap*17e-6*1e3)
+	if maxGap < 4*poll {
+		t.Fatalf("expected a long withholding run, got %.0f s", maxGap)
+	}
+	// AllanIntercept is what finally breaks the deadlock, so the run is
+	// bounded by it rather than by the ring depth.
+	if maxGap < AllanIntercept*0.9 {
+		t.Fatalf("expected the run to last until the Allan intercept, got %.0f s", maxGap)
+	}
+}

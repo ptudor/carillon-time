@@ -307,3 +307,58 @@ func TestLoopBootstrapFrequency(t *testing.T) {
 		t.Fatalf("freq %v want ≈50", l.Freq)
 	}
 }
+
+// TestLoopConvergesWhateverTheUpdateSpacing pins down something that looks
+// alarming and is not. A loop update happens only when the clock filter
+// yields a new lowest-delay sample, which is uncorrelated with the poll
+// interval that sets tau, so `mu` — the interval the frequency integration
+// uses — routinely runs to one or two times tau on a quiet path. That makes
+// individual integration steps large (`theta·mu/(4·tau²)`), and after a
+// restart the frequency word can visibly walk tens of ppm.
+//
+// It converges anyway, and the peak excursion does not grow with mu: the
+// phase slew removes most of the offset between sparse updates, so the next
+// update integrates a smaller theta. Checked here from 0.06·tau to 2·tau
+// against a 15.4 ppm drift and a 10 ms initial offset, which is the shape of
+// a real restart.
+func TestLoopConvergesWhateverTheUpdateSpacing(t *testing.T) {
+	const drift, offset0 = -15.4, 0.010
+	tau := 4 * math.Ldexp(1, 6) // poll 6
+	for _, spacing := range []float64{16, 64, 128, 256, 448, 512} {
+		cfg := loopCfg()
+		cfg.StepLimit = 0 // slew everything; the integrator is what is under test
+		l := NewLoop(cfg, -drift, true)
+		clk := &simClock{drift: drift, local: -offset0}
+		apply := func(acts []Action) {
+			for _, a := range acts {
+				if a.Kind == ActionSetFrequency {
+					clk.freq = a.Value
+				}
+			}
+		}
+		peak, next := 0.0, 0.0
+		for s := 0; s < 7200; s++ {
+			now := float64(s)
+			if now >= next {
+				apply(l.Update(clk.offset(), 6, now, true, true).Actions)
+				next = now + spacing
+			}
+			apply(l.Tick(now))
+			if d := math.Abs(l.Freq - -drift); d > peak {
+				peak = d
+			}
+			clk.advance(1)
+		}
+		t.Logf("mu = %5.0f s (%.2f tau): peak |freq-true| %5.2f ppm, final offset %+.3f ms, freq %+.2f ppm",
+			spacing, spacing/tau, peak, clk.offset()*1e3, l.Freq)
+		if math.Abs(l.Freq - -drift) > 0.5 {
+			t.Errorf("mu = %.0f s: converged to %v ppm, want about %v", spacing, l.Freq, -drift)
+		}
+		if math.Abs(clk.offset()) > 1e-4 {
+			t.Errorf("mu = %.0f s: final offset %v", spacing, clk.offset())
+		}
+		if peak > 12 {
+			t.Errorf("mu = %.0f s: peak excursion %v ppm", spacing, peak)
+		}
+	}
+}
