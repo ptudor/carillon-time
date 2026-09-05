@@ -80,3 +80,38 @@ func TestListenRejectsEmptyAddresses(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// TestListenAcceptsAnOversizedReceiveBuffer covers RF5X-009: FreeBSD refuses
+// an SO_RCVBUF above kern.ipc.maxsockbuf with ENOBUFS instead of clamping it
+// the way Linux does, so the example configuration's 4 MB request stopped the
+// daemon starting. The listener must halve the request until the kernel
+// accepts it and carry on serving time.
+func TestListenAcceptsAnOversizedReceiveBuffer(t *testing.T) {
+	s, err := Listen(ServiceConfig{
+		Listen: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:0")},
+		Handler: Config{
+			Allow:        []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+			RateLimitPPS: 8,
+			RateBurst:    16,
+			KoD:          true,
+			Status:       testStatus,
+			Now:          time.Now,
+			Stats:        &Stats{},
+		},
+		Log:        slog.New(slog.DiscardHandler),
+		RecvBuffer: 256 << 20,
+	})
+	if err != nil {
+		t.Fatalf("Listen with an oversized receive buffer: %v", err)
+	}
+	defer s.Close()
+	if got := s.ReceiveBuffers(); len(got) != 1 || got[0] <= 0 {
+		t.Fatalf("effective receive buffers %v", got)
+	}
+}
+
+func TestRecvBufferSysctlNamesAKnob(t *testing.T) {
+	if RecvBufferSysctl() == "" {
+		t.Fatal("no sysctl name to point the operator at")
+	}
+}

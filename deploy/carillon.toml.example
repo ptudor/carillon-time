@@ -163,9 +163,14 @@ iburst  = true
 #   recv_buffer    The kernel default is a few hundred packets of headroom
 #                  (208 KB on Linux, 42 KB on FreeBSD). A busy pool server
 #                  outruns that in a burst, and the loss is invisible except
-#                  as clients that never got an answer. The kernel clamps the
-#                  request to net.core.rmem_max (Linux) or kern.ipc.maxsockbuf
-#                  (FreeBSD); the size actually granted is logged at startup.
+#                  as clients that never got an answer. Linux clamps the
+#                  request to net.core.rmem_max silently. FreeBSD REFUSES a
+#                  request above kern.ipc.maxsockbuf (default about 1.86 MB)
+#                  with ENOBUFS rather than clamping it, so raise that sysctl
+#                  first: carillon halves the request until the kernel takes
+#                  it and warns, but you get the buffer you asked for only
+#                  after the sysctl is raised. The size actually granted is
+#                  logged at startup.
 #                  On Linux carillon_server_kernel_drops_total counts what was
 #                  lost anyway; FreeBSD has no per-socket count, so watch
 #                  netstat -sp udp there instead.

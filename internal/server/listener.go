@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -16,6 +17,24 @@ import (
 )
 
 const serverOOBSize = 256
+
+// minRecvBuffer is the floor the halving retry in setReadBuffer stops at. It
+// mirrors config.MinRecvBuffer, which config validates recv_buffer against;
+// config imports this package, so the constant cannot be imported back.
+const minRecvBuffer = 64 << 10
+
+// RecvBufferSysctl names the kernel knob that caps SO_RCVBUF on this OS, for
+// error messages and for -check to point at.
+func RecvBufferSysctl() string {
+	switch runtime.GOOS {
+	case "linux":
+		return "net.core.rmem_max"
+	case "freebsd":
+		return "kern.ipc.maxsockbuf"
+	default:
+		return "the kernel socket-buffer limit"
+	}
+}
 
 // ServiceConfig configures a set of NTP UDP listeners.
 type ServiceConfig struct {
@@ -107,8 +126,8 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 			"listen", addr, "error", err)
 	}
 	if recvBuffer > 0 {
-		if err := conn.SetReadBuffer(recvBuffer); err != nil {
-			return fail("server: listen %s: receive buffer of %d bytes: %w", addr, recvBuffer, err)
+		if err := setReadBuffer(conn, recvBuffer, addr, log); err != nil {
+			return fail("%w", err)
 		}
 	}
 	effective, err := receiveBufferSize(raw)
@@ -123,6 +142,39 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 	l := &udpListener{addr: actual, network: network, conn: conn, handler: h, log: log.With("listen", actual)}
 	l.recvBuffer = effective
 	return l, nil
+}
+
+// setReadBuffer asks for want bytes of SO_RCVBUF, halving the request until
+// the kernel accepts it.
+//
+// Linux clamps SO_RCVBUF to net.core.rmem_max silently, so the request always
+// succeeds and the granted size is read back afterwards. FreeBSD does not
+// clamp: sbreserve_locked returns 0 when the request exceeds sb_max_adj
+// (kern.ipc.maxsockbuf, default 2 MB adjusted to about 1.86 MB) and
+// setsockopt fails with ENOBUFS. The example configuration's public block
+// asks for 4 MB, so copying it to a FreeBSD host with default sysctls used to
+// stop the daemon starting. Serving time with a smaller buffer and a warning
+// naming the sysctl to raise is better than not serving time.
+func setReadBuffer(conn *net.UDPConn, want int, addr netip.AddrPort, log *slog.Logger) error {
+	var lastErr error
+	for size := want; size >= minRecvBuffer; size /= 2 {
+		err := conn.SetReadBuffer(size)
+		if err == nil {
+			if size != want {
+				log.Warn("receive buffer request was refused; using a smaller one",
+					"listen", addr, "requested", want, "granted_request", size,
+					"hint", RecvBufferSysctl()+" must be raised before a larger buffer can be granted",
+					"error", lastErr)
+			}
+			return nil
+		}
+		lastErr = err
+		if !errors.Is(err, syscall.ENOBUFS) && !errors.Is(err, syscall.EINVAL) {
+			break
+		}
+	}
+	return fmt.Errorf("server: listen %s: receive buffer of %d bytes (down to %d): raise %s: %w",
+		addr, want, minRecvBuffer, RecvBufferSysctl(), lastErr)
 }
 
 // ReceiveBuffers returns each listener's effective SO_RCVBUF in bytes, in the
@@ -204,6 +256,14 @@ func (l *udpListener) serve(ctx context.Context) error {
 			c.oversize.Add(1)
 			continue
 		}
+		// FreeBSD reports a broadcast or multicast delivery in the flags
+		// word. Answering one would put an illegal source address on the
+		// reply — which FreeBSD accepts — and turn a single forged datagram
+		// into a reply from every server on the segment.
+		if martianReceiveFlags(flags) {
+			c.martian.Add(1)
+			continue
+		}
 		received := l.handler.now()
 		if ts, ok := sockts.Parse(oob[:oobn]); ok {
 			received = ts
@@ -217,8 +277,8 @@ func (l *udpListener) serve(ctx context.Context) error {
 		// A request addressed to a broadcast or multicast group would need an
 		// illegal source address on the reply, and one such datagram would ask
 		// every host on the subnet to answer at once.
-		dst, replyOOB := destination(oob[:oobn], l.network)
-		if martianDestination(dst) {
+		dst, replyOOB, martian := destination(oob[:oobn], l.network)
+		if martian || martianDestination(dst) {
 			c.martian.Add(1)
 			continue
 		}

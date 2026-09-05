@@ -781,9 +781,16 @@ request it received.
 
 `recv_buffer` sets `SO_RCVBUF` on each socket. The kernel default is a few
 hundred packets of headroom (≈208 KB on Linux, ≈42 KB on FreeBSD), which a
-busy public server outruns in a burst; the kernel clamps the request to
-`net.core.rmem_max` or `kern.ipc.maxsockbuf`, so the size actually granted is
-read back and logged. Linux is additionally asked for `SO_RXQ_OVFL`, whose
+busy public server outruns in a burst. **Linux clamps** the request to
+`net.core.rmem_max` silently. **FreeBSD refuses** it: `sbreserve_locked`
+returns 0 when the request exceeds `sb_max_adj` (`kern.ipc.maxsockbuf`,
+default 2 MB adjusted to ≈1.86 MB) and `setsockopt` fails with `ENOBUFS`, so
+the 4 MB the example configuration recommends for a public host would stop
+the daemon starting. The listener therefore halves the request until the
+kernel accepts it, down to a 64 KB floor, warning once with the name of the
+sysctl to raise; only a refusal at the floor is fatal. Either way the size
+actually granted is read back and logged, and `-check` warns on FreeBSD
+whenever `recv_buffer` is set. Linux is additionally asked for `SO_RXQ_OVFL`, whose
 per-datagram cumulative counter of receive-queue overflows is folded into
 `kernel_drops` (§10.4) — without it a server that cannot keep up is
 indistinguishable from a quiet one. FreeBSD has no per-socket equivalent;
@@ -812,7 +819,23 @@ good against bad traffic adds up (§10.4):
 2. Destination. A request addressed to a broadcast or multicast group would
    need an illegal source address on the reply, and one datagram sent to a
    directed broadcast would ask every host on the subnet to answer at once →
-   drop, count `martian`.
+   drop, count `martian`. The unspecified address, the limited broadcast
+   address `255.255.255.255` and any multicast group are rejected by address.
+   A **directed** broadcast (`192.168.1.255`) cannot be recognised from the
+   address alone without knowing the subnet, so on Linux it is caught by
+   comparing the two halves of `IP_PKTINFO`: `ipi_addr` is the header
+   destination, `ipi_spec_dst` the local address, and they are equal only for
+   a unicast request. The reply's source is always built from `ipi_spec_dst`,
+   never `ipi_addr`. (A host with asymmetric routing, where the reply would
+   leave by a different interface than the request arrived on, is refused
+   too; that is the same conservative trade ntpd makes.) **FreeBSD reports
+   only the header destination** (`IP_RECVDSTADDR`) with no local-address
+   companion, and has no `MSG_BCAST`/`MSG_MCAST` receive flags — those are
+   NetBSD/OpenBSD — so the directed-broadcast case is *not yet* handled
+   there. It matters more on FreeBSD than on Linux, because
+   `in_pcbbind_setup` accepts a broadcast address as local and the reply
+   actually leaves the host with a broadcast source. See RF5X-003 in
+   `FIXES_FABLE5_XHIGH.md`.
 3. Decode. Shorter than 48 bytes, or a malformed extension field or MAC
    trailer → drop, count `malformed`. Version 0 or above 4 → drop, count
    `bad_version`; versions 1–4 are accepted and the reply carries the

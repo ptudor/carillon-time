@@ -242,3 +242,71 @@ unchanged, and the engine still logs a genuine loss at ERROR.
 **Verification.** PASS. `TestSimPreferLost` asserts no `EventPreferLost`
 before the first survivor; with the gate removed it fails with *1 prefer-lost
 events before the first survivor at t=64*.
+
+## RF5X-003 — Directed-broadcast requests answered — PARTLY FIXED (Linux), FreeBSD half SKIPPED
+
+**Changed (items 2–5).** `destination()` now returns a third result, `martian`.
+On Linux it compares the two halves of `IP_PKTINFO`: `ipi_addr` is the header
+destination and `ipi_spec_dst` the local address, equal only for a unicast
+request; a directed broadcast has the broadcast address in the first and the
+interface address in the second, and is now dropped and counted `martian`
+before decoding. The reply's control message is built from `ipi_spec_dst`, not
+`ipi_addr`, so a non-local source can never be put on a reply. IPv6 has no
+broadcast and multicast was already covered. The existing `martianDestination`
+address checks are untouched, no new `result` label was added, and the reply
+source-address selection for unicast on multi-homed hosts is unchanged. A
+per-OS `martianReceiveFlags(flags)` hook was added next to `enablePacketInfo`
+and is wired into `serve()`.
+
+**Item 1 (FreeBSD) SKIPPED: the specification names constants FreeBSD does not
+have.** The fix says to treat `flags & (unix.MSG_BCAST | unix.MSG_MCAST)` as
+martian. `MSG_BCAST` and `MSG_MCAST` are NetBSD/OpenBSD constants (`0x100` /
+`0x200`); `golang.org/x/sys/unix` defines them in `zerrors_netbsd_*.go` and
+`zerrors_openbsd_*.go` and in **no** FreeBSD file — x/sys generates these
+directly from the system headers, so FreeBSD does not define them and does not
+report broadcast delivery in `msg_flags`. `GOOS=freebsd go build` fails with
+`undefined: unix.MSG_BCAST`. FreeBSD's `IP_RECVDSTADDR` gives only the header
+destination, with no local-address companion to compare against, so the Linux
+technique does not carry over either. Recognising a *directed* broadcast there
+needs a different mechanism — enumerating the interfaces' broadcast addresses
+at listen time, say — which is a design choice this finding does not
+authorise. `martianReceiveFlags` on FreeBSD is an honest no-op with a comment
+saying so. **This leaves the more serious half of the finding open**: the
+review's own analysis is that on FreeBSD the reply actually leaves the host
+with a broadcast source, whereas on Linux the send merely fails.
+
+**Files.** `internal/server/pktinfo_linux.go`, `pktinfo_freebsd.go`,
+`pktinfo_other.go`, `listener.go`, `pktinfo_linux_test.go` (new),
+`DESIGN.md` §7.2.
+
+**Verification.** PARTIAL. `TestDestinationRejectsDirectedBroadcast` and
+`TestDestinationUnicastRepliesFromTheLocalAddress` build a hand-made
+`IP_PKTINFO` control message with `Addr != Spec_dst` and assert the martian
+result, and that a unicast reply's source comes from `Spec_dst`. They are
+`//go:build linux` and **compile** here (`GOOS=linux go test -c` passes) but
+cannot be **run** on this darwin host — they need `gummi`. `go vet` passes for
+darwin, linux and freebsd. The wire proof (one 48-byte mode-3 datagram to the
+subnet broadcast, `carillonctl serverstats` showing `martian`, `tcpdump`
+showing no reply) remains a target-host step.
+
+## RF5X-009 — recv_buffer above kern.ipc.maxsockbuf aborts FreeBSD startup — FIXED
+
+**Changed.** `listenOne` calls a new `setReadBuffer`, which asks for the
+configured size and, on `ENOBUFS` or `EINVAL`, halves the request until the
+kernel accepts it, down to a 64 KB floor (`minRecvBuffer`, mirroring
+`config.MinRecvBuffer`; `config` imports `server`, so it cannot be imported
+back). A reduced grant logs once at WARN naming the sysctl to raise via a new
+`server.RecvBufferSysctl()`; only a refusal at the floor is fatal. `-check`
+gained a matching warning whenever `recv_buffer` is set on FreeBSD. The
+effective-size read-back and logging, and the Linux behaviour, are unchanged.
+
+**Files.** `internal/server/listener.go`, `internal/server/listener_test.go`,
+`internal/config/config.go` (cross-reference comment), `cmd/carillon/main.go`,
+`DESIGN.md` §7.1, `deploy/carillon.toml.example`.
+
+**Verification.** PASS on darwin. `TestListenAcceptsAnOversizedReceiveBuffer`
+asks for 256 MB on loopback and requires `Listen` to succeed with a positive
+effective buffer. The FreeBSD-specific path (an actual `ENOBUFS` from
+`sbreserve_locked`) cannot be exercised here — `twocom` with
+`recv_buffer = 4194304` and default sysctls is the remaining step, per the
+review.
