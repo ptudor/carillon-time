@@ -316,8 +316,21 @@ seconds — add an NTP server or use a gps refclock*.
 - `seq` must be `prev + 1`; a gap shifts the reach register by the number of
   missed pulses and resets nothing else.
 - `ts - prev_ts` must be within 1 s ± 100 ms (glitch / double pulse).
-- `|θ - median(window)| ≤ max(5·MAD(window), 1 µs)` once the window has ≥ 4
-  samples (spike rejection).
+- Spike rejection, once the window has ≥ 4 samples: fit a least-squares line
+  through the last 8 accepted offsets (x = sequence number, so a gap is
+  accounted for) and require
+  `|θ − predicted| ≤ max(5·MAD(residuals), 1 µs) + max_slew_ppm·1e-6·Δseq`,
+  with `Δseq` clamped to 8 pulses. The line, not a median, is the reference
+  because while the PPS is the system source the loop is slewing the very
+  clock that timestamps the pulses: every edge moves by up to
+  `max_slew_ppm` per second, and a median of past offsets is exactly as stale
+  as the correction being applied. Comparing against a frozen median rejects
+  the whole train and, because a rejected sample never enters the window,
+  never recovers.
+- Because a rejected sample cannot refresh the window, a run of 4 consecutive
+  rejections (spike or glitch) drops the window and re-primes it from the
+  following pulses, and a fetch timeout drops it whenever reach is zero — not
+  only on the transition into unreachable.
 
 **Filter.** A ring of the last `2^poll` accepted samples. Every `2^poll`
 seconds the source emits one `Measurement` with `Offset = median`,
