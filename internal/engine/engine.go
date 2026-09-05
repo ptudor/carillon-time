@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,26 @@ const maxKernelError = 16 * time.Second
 // errFrequencyRefused marks a fatal error that came from SetFrequency
 // itself, so the shutdown path knows not to make the same call again.
 var errFrequencyRefused = errors.New("kernel refused a frequency change")
+
+// ErrPanicRefused is returned by Run when the discipline refused a correction
+// beyond the panic threshold. DESIGN.md §6.6 makes that fatal: the daemon
+// logs the offset and exits nonzero rather than serving or slewing nonsense,
+// and the service manager's restart backoff makes it visible. It used to be
+// an ordinary event and a state change, after which Run carried on applying
+// corrections and ticks (RA6X-012).
+var ErrPanicRefused = errors.New("offset exceeds the panic threshold; refusing to correct the clock")
+
+// Shutdown bounds. The engine restores the clock before either of these, so
+// neither can leave a slew transient in the kernel; they only bound how long
+// a stuck component delays the exit.
+const (
+	// driftWriteDeadline bounds the final, best-effort drift write.
+	driftWriteDeadline = 2 * time.Second
+
+	// sourceDrainDeadline bounds the wait for source goroutines to honour
+	// cancellation.
+	sourceDrainDeadline = 5 * time.Second
+)
 
 // minDriftUpdates is how many accepted loop updates must span the stability
 // window before the frequency estimate is worth persisting. Two is enough to
@@ -98,15 +119,30 @@ type Config struct {
 	// tests whose sources do not stamp.
 	Generation *atomic.Uint64
 
-	// Observe receives each immutable status snapshot after publication. It
-	// must return promptly; optional statistics use a bounded non-blocking
-	// queue so disk I/O never enters the clock-discipline path.
+	// Observe receives each immutable status snapshot after publication.
+	//
+	// It runs on the engine goroutine, which is the only caller of the clock
+	// actuator, so it **must not block**: anything it waits on — a lock, a
+	// full channel, a disk — stops ticks, measurement handling and status
+	// publication, and the NTP listener then answers from a frozen snapshot.
+	// The statistics recorder is the model to follow: a bounded queue with a
+	// non-blocking send that drops and counts rather than waiting. The
+	// served-status age limit in cmd/carillon bounds the damage if an
+	// observer breaks this rule, but it is not a substitute for keeping it
+	// (RA6X-044).
 	Observe func(*Status)
 }
 
 // Status is the engine's immutable snapshot.
 type Status struct {
 	discipline.Status
+
+	// PublishedMono is the engine's monotonic processing time when this
+	// snapshot was taken. Consumers use it to tell a current snapshot from
+	// one the engine has stopped refreshing; wall time cannot, because a
+	// daemon whose job is to step the wall clock has no monotonic guarantee
+	// there (RA6X-044, RA6X-053).
+	PublishedMono float64
 
 	// Now is the clock reading when the snapshot was taken; RefTime is the
 	// clock reading at the last loop update (zero if none).
@@ -161,7 +197,6 @@ type Engine struct {
 	procNow        float64
 	haveProcNow    bool
 	lastDriftWrite float64
-	driftErrShown  bool
 	lastLeapWall   time.Time
 	lastFileLeap   ntp.Leap
 
@@ -189,6 +224,13 @@ type Engine struct {
 	freqSource     string
 	freqSteps      int
 	driftSkipShown bool
+
+	// drift is the persistence worker, created on the first write.
+	drift *driftWriter
+
+	// running names the source goroutines that have not returned, so a
+	// bounded shutdown can say which one is stuck.
+	running sync.Map
 }
 
 // freqSample is one reading of the loop's base frequency, together with the
@@ -447,8 +489,10 @@ func (e *Engine) Run(ctx context.Context) error {
 	for _, name := range e.order {
 		spec := e.sources[name]
 		wg.Add(1)
+		e.running.Store(name, struct{}{})
 		go func(name string, s source.Source) {
 			defer wg.Done()
+			defer e.running.Delete(name)
 			e.runSource(ctx, name, s)
 		}(name, spec.Source)
 	}
@@ -497,10 +541,44 @@ loop:
 		}
 	}
 	cancel()
-	wg.Wait()
+	// Restore the clock *before* waiting on anything else. The engine owns
+	// the actuator and no source can influence it once the loop has left,
+	// so a stuck driver or a wedged filesystem must not be able to hold the
+	// kernel at a phase-slew transient — up to ±500 ppm, 43 s/day — until a
+	// service manager gives up and kills the process (RA6X-045).
 	e.restoreBaseFrequency(runErr)
 	e.maybeWriteDrift(e.processing(e.clk.Monotonic()), true)
+	if e.drift != nil && !e.drift.close(driftWriteDeadline) {
+		e.log.Error("the drift file write did not finish before the deadline; exiting anyway",
+			"path", e.cfg.DriftFile, "deadline", driftWriteDeadline)
+	}
+	// Only now wait for the sources, and only for a bounded time: their Run
+	// methods are expected to honour cancellation, but that is an
+	// expectation, not a bound.
+	if stuck := e.drainSources(&wg, sourceDrainDeadline); len(stuck) > 0 {
+		e.log.Error("sources did not stop before the drain deadline; exiting anyway",
+			"sources", strings.Join(stuck, ", "), "deadline", sourceDrainDeadline)
+	}
 	return runErr
+}
+
+// drainSources waits up to deadline for the source goroutines and names any
+// that are still running.
+func (e *Engine) drainSources(wg *sync.WaitGroup, deadline time.Duration) []string {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(deadline):
+	}
+	var stuck []string
+	e.running.Range(func(k, _ any) bool {
+		stuck = append(stuck, k.(string))
+		return true
+	})
+	sort.Strings(stuck)
+	return stuck
 }
 
 // restoreBaseFrequency puts the base frequency estimate back into the kernel
@@ -905,6 +983,14 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 		return err
 	}
 	e.publishStatus(&st, now)
+	// The refusal is published first — UNSYNCED with the PANC reference id,
+	// which is what an operator and every client see — and only then does
+	// it end the run.
+	for _, ev := range res.Events {
+		if ev.Kind == discipline.EventPanicRefused {
+			return fmt.Errorf("engine: %w: %.6f s", ErrPanicRefused, ev.Value)
+		}
+	}
 	return nil
 }
 
@@ -990,13 +1076,14 @@ func (e *Engine) publish(now float64) {
 
 func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 	s := &Status{
-		Status:    *st,
-		Now:       e.clk.Now(),
-		RefTime:   e.refWall,
-		Uptime:    time.Duration((now - e.startedMono) * float64(time.Second)),
-		Precision: e.clk.Precision(),
-		Version:   e.cfg.Version,
-		Infos:     make(map[string]source.Info, len(e.sources)),
+		Status:        *st,
+		PublishedMono: now,
+		Now:           e.clk.Now(),
+		RefTime:       e.refWall,
+		Uptime:        time.Duration((now - e.startedMono) * float64(time.Second)),
+		Precision:     e.clk.Precision(),
+		Version:       e.cfg.Version,
+		Infos:         make(map[string]source.Info, len(e.sources)),
 	}
 	if e.cfg.LeapTable != nil {
 		s.LeapSource = "file"
@@ -1088,6 +1175,83 @@ func (e *Engine) frequencySettled(now float64) (bool, string) {
 	return true, ""
 }
 
+// driftWriter is the single owner of the drift file. The engine hands it a
+// validated frequency and never blocks: create, write, fsync and rename ran
+// on the engine goroutine, so a slow or wedged filesystem stopped ticks,
+// measurement handling and status publication while the UDP listener kept
+// answering from the frozen snapshot (RA6X-044).
+//
+// The candidate slot holds one value. A newer candidate replaces a pending
+// one rather than queueing behind it, so a delayed write can never overwrite
+// a newer accepted frequency with an older one.
+type driftWriter struct {
+	path  string
+	log   *slog.Logger
+	work  chan float64
+	done  chan struct{}
+	write func(path string, ppm float64) error
+
+	// errShown throttles the failure log; owned by the worker goroutine.
+	errShown bool
+}
+
+func newDriftWriter(path string, log *slog.Logger) *driftWriter {
+	w := &driftWriter{
+		path: path, log: log,
+		work:  make(chan float64, 1),
+		done:  make(chan struct{}),
+		write: writeDrift,
+	}
+	go w.run()
+	return w
+}
+
+func (w *driftWriter) run() {
+	defer close(w.done)
+	for ppm := range w.work {
+		if err := w.write(w.path, ppm); err != nil {
+			if !w.errShown {
+				w.log.Warn("cannot write drift file", "path", w.path, "error", err)
+				w.errShown = true
+			}
+			continue
+		}
+		if w.errShown {
+			w.log.Info("drift file writable again", "path", w.path)
+			w.errShown = false
+		}
+	}
+}
+
+// offer hands the worker a candidate without blocking, replacing any pending
+// one.
+func (w *driftWriter) offer(ppm float64) {
+	for {
+		select {
+		case w.work <- ppm:
+			return
+		default:
+		}
+		select {
+		case <-w.work: // drop the superseded candidate
+		default:
+			return
+		}
+	}
+}
+
+// close stops the worker and waits up to deadline for the write in flight.
+// It reports whether the worker finished.
+func (w *driftWriter) close(deadline time.Duration) bool {
+	close(w.work)
+	select {
+	case <-w.done:
+		return true
+	case <-time.After(deadline):
+		return false
+	}
+}
+
 // maybeWriteDrift writes the drift file when the frequency is trustworthy
 // and either the interval has elapsed or the daemon is shutting down.
 func (e *Engine) maybeWriteDrift(now float64, final bool) {
@@ -1110,16 +1274,16 @@ func (e *Engine) maybeWriteDrift(now float64, final bool) {
 		return
 	}
 	e.driftSkipShown = false
-	if err := writeDrift(e.cfg.DriftFile, e.sys.Frequency()); err != nil {
-		if !e.driftErrShown {
-			e.log.Warn("cannot write drift file", "path", e.cfg.DriftFile, "error", err)
-			e.driftErrShown = true
-		}
+	ppm := e.sys.Frequency()
+	// Validate the candidate here, on the owning goroutine, so the worker
+	// only ever receives a value that is safe to persist.
+	if err := clock.CheckFrequency(ppm); err != nil {
+		e.log.Warn("not persisting a frequency that is not finite", "error", err)
 		return
 	}
-	if e.driftErrShown {
-		e.log.Info("drift file writable again", "path", e.cfg.DriftFile)
-		e.driftErrShown = false
+	if e.drift == nil {
+		e.drift = newDriftWriter(e.cfg.DriftFile, e.log)
 	}
+	e.drift.offer(ppm)
 	e.lastDriftWrite = now
 }

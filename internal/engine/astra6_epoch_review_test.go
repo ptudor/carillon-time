@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -573,4 +575,138 @@ func TestAstra6FilelessLeapWarningClears(t *testing.T) {
 	if src.resets.Load() != resets {
 		t.Fatal("a withdrawn warning still produced a boundary reset")
 	}
+}
+
+// TestAstra6PanicRefusalIsFatal covers RA6X-012. The documented fatal panic
+// gate was implemented as an ordinary event and a state change: Run carried
+// on, applying further corrections and ticks, and an operator relying on a
+// nonzero exit and the service manager's backoff got neither.
+func TestAstra6PanicRefusalIsFatal(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	cfg := testConfig("")
+	cfg.Discipline.Loop.StepLimit = 0 // stepping forbidden, so the offset is refused
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.sys.AddSource("a", discipline.Options{Numbering: true})
+	m := good(5000) // far beyond the 1000 s panic threshold
+	m.Source, m.Now, m.At = "a", 1, 1
+
+	runErr := e.handle(e.sys.Update(m), 1)
+	if !errors.Is(runErr, ErrPanicRefused) {
+		t.Fatalf("a refused panic correction returned %v, want ErrPanicRefused", runErr)
+	}
+	// The diagnostic is published before the run ends: UNSYNCED with PANC.
+	st := e.Status()
+	if st.State != discipline.StateUnsynced {
+		t.Fatalf("state %v after a panic refusal", st.State)
+	}
+	if st.RefID != ntp.KissPANC {
+		t.Fatalf("reference id %v after a panic refusal, want PANC", st.RefID)
+	}
+	if len(clk.Steps) != 0 {
+		t.Fatalf("a refused correction stepped the clock: %v", clk.Steps)
+	}
+}
+
+// TestAstra6PanicRefusalEndsRun drives the real lifecycle: the refusal must
+// stop the daemon, and the base frequency must be restored on the way out.
+func TestAstra6PanicRefusalEndsRun(t *testing.T) {
+	dir := t.TempDir()
+	drift := filepath.Join(dir, "drift")
+	if err := os.WriteFile(drift, []byte("12.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	src := &scripted{name: "a", clk: clk, gap: time.Millisecond, script: []discipline.Measurement{good(5000)}}
+	cfg := testConfig(drift, SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	cfg.Discipline.Loop.StepLimit = 0
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = 5 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	select {
+	case err := <-runInBackground(e, ctx):
+		if !errors.Is(err, ErrPanicRefused) {
+			t.Fatalf("Run returned %v, want ErrPanicRefused", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Run kept going after a refused panic correction")
+	}
+	if len(clk.Steps) != 0 {
+		t.Fatalf("a refused correction stepped the clock: %v", clk.Steps)
+	}
+	if len(clk.Frequencies) == 0 {
+		t.Fatal("no frequency was written")
+	}
+	if last := clk.Frequencies[len(clk.Frequencies)-1]; last != e.Status().Frequency {
+		t.Fatalf("kernel left at %v ppm, base estimate is %v", last, e.Status().Frequency)
+	}
+}
+
+func runInBackground(e *Engine, ctx context.Context) chan error {
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	return done
+}
+
+// TestAstra6ShutdownRestoresBeforeDraining covers RA6X-045. Shutdown waited
+// for every source goroutine before restoring the base frequency, so a source
+// that ignores cancellation could hold the kernel at a phase-slew transient
+// until a service manager killed the process.
+func TestAstra6ShutdownRestoresBeforeDraining(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	stuck := &ignoresCancellation{name: "stuck", release: make(chan struct{})}
+	defer close(stuck.release)
+	src := &scripted{name: "a", clk: clk, script: []discipline.Measurement{good(0.05), good(0.05)}}
+	cfg := testConfig("",
+		SourceSpec{Source: src, Options: discipline.Options{Numbering: true}},
+		SourceSpec{Source: stuck, Options: discipline.Options{Numbering: true}})
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(e, ctx)
+	waitFor(t, func() bool { return e.Status().Updates >= 1 })
+	// A nonzero transient is in the kernel by now.
+	cancel()
+
+	start := time.Now()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * sourceDrainDeadline):
+		t.Fatal("Run never returned")
+	}
+	elapsed := time.Since(start)
+	if elapsed > sourceDrainDeadline+2*time.Second {
+		t.Fatalf("shutdown took %v, past the bounded drain", elapsed)
+	}
+	base := e.Status().Frequency
+	if last := clk.Frequencies[len(clk.Frequencies)-1]; last != base {
+		t.Fatalf("kernel left at %v ppm rather than the base estimate %v", last, base)
+	}
+}
+
+// ignoresCancellation is a source whose Run never returns until released,
+// which is what the bounded drain exists for.
+type ignoresCancellation struct {
+	name    string
+	release chan struct{}
+}
+
+func (s *ignoresCancellation) Name() string      { return s.name }
+func (s *ignoresCancellation) Info() source.Info { return source.Info{Name: s.name} }
+func (s *ignoresCancellation) Reset()            {}
+func (s *ignoresCancellation) Run(context.Context, chan<- discipline.Measurement) error {
+	<-s.release
+	return nil
 }

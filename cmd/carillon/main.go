@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -319,13 +320,35 @@ func runDaemon(args []string) int {
 				KoD:               cfg.Serve.KoD,
 				Status: func() ntpserver.SystemStatus {
 					st := eng.Status()
+					// An independent monotonic age limit on the snapshot.
+					// The listener answers from the last published status,
+					// so if the engine stops publishing — a wedged
+					// filesystem, a blocking observer, anything that holds
+					// its goroutine — the server would keep advertising
+					// Synced with a frozen root dispersion for as long as
+					// that lasted. Past the limit it serves unsynchronized
+					// rather than vouching for a clock nobody is watching
+					// (RA6X-044).
+					age := clk.Monotonic() - st.PublishedMono
+					fresh := age <= maxServedStatusAge.Seconds()
+					synced := fresh && (st.State == discipline.StateSynced || st.State == discipline.StateHoldover)
+					disp := st.RootDisp
+					if synced {
+						// Age the advertised uncertainty over the interval
+						// since publication, conservatively.
+						disp += discipline.Phi * math.Max(0, age)
+					}
+					leap := st.Leap
+					if !synced {
+						leap = ntp.LeapUnsync
+					}
 					return ntpserver.SystemStatus{
-						Synced:         st.State == discipline.StateSynced || st.State == discipline.StateHoldover,
-						Leap:           st.Leap,
+						Synced:         synced,
+						Leap:           leap,
 						Stratum:        st.Stratum,
 						Precision:      st.Precision,
 						RootDelay:      st.RootDelay,
-						RootDispersion: st.RootDisp,
+						RootDispersion: disp,
 						ReferenceID:    st.RefID,
 						ReferenceTime:  st.RefTime,
 					}
@@ -454,6 +477,13 @@ func runDaemon(args []string) int {
 	log.Info("stopped")
 	return 0
 }
+
+// maxServedStatusAge is how stale the engine's published snapshot may be
+// before the NTP listener stops treating it as synchronized. The engine
+// publishes on every tick — once a second — so this is two orders of
+// magnitude of slack, and it bounds the damage from any failure that stops
+// the engine goroutine without stopping the process.
+const maxServedStatusAge = 30 * time.Second
 
 // shutdownDeadline bounds the wait for the auxiliary goroutines (DESIGN.md
 // §12). Exiting a few seconds late is better than not exiting at all.
