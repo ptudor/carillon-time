@@ -463,7 +463,11 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 	m := discipline.Measurement{
 		Source: n.cfg.Name, Now: mono, Reach: n.reach, Poll: nmeaPoll,
 		Generation: n.lineGen,
-		Valid:      len(n.offsets) >= 4, At: mono, Offset: median, Delay: 0,
+		// The sentence passed parsing, validity, chronology and epoch
+		// checks: a successful acquisition even when the window is not yet
+		// deep enough for the measurement to be Valid (RA6X-010).
+		Acquired: true,
+		Valid:    len(n.offsets) >= 4, At: mono, Offset: median, Delay: 0,
 		Dispersion: sigma + precision, Jitter: math.Max(sigma, precision),
 		Leap: ntp.LeapNone, Stratum: 0, RefID: ntp.RefIDFromString("GPS"),
 		SourceRefID: ntp.RefIDFromString("GPS"), Precision: n.clk.Precision(), RefTime: s.Timestamp,

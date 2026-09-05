@@ -47,24 +47,34 @@ type Config struct {
 	// on top of the mandatory post-step loop update and the requirement
 	// that another step is no longer on the table. Zero selects 1.
 	SettleUpdates int
+
+	// LocalRefIDs is the set of RFC 5905 §7.3 reference identifiers that
+	// name this host: one per local unicast address. Selection refuses a
+	// source that is this daemon, or whose reference points back at it, so
+	// two mutually configured instances cannot start feeding each other
+	// their own retained time after losing a real upstream (RA6X-038).
+	// Empty disables the check.
+	LocalRefIDs map[ntp.RefID]bool
 }
 
 // EventKind classifies a notable thing that happened during an update.
 type EventKind int
 
 const (
-	EventStep           EventKind = iota // the clock was stepped; Value = seconds
-	EventPanicRefused                    // offset beyond the panic threshold; Value = seconds
-	EventPopcorn                         // a spike was ignored; Value = seconds
-	EventStateChange                     // From → To
-	EventFalseticker                     // Source became a falseticker
-	EventTruechimer                      // Source is no longer a falseticker
-	EventPreferLost                      // the prefer source is not a survivor
-	EventPreferRegained                  // the prefer source is back
-	EventSystemSource                    // Source became the system source
-	EventUnknownSource                   // a measurement arrived for an unregistered source
-	EventPPSUnqualified                  // PPS is stable but no numbering source survives
-	EventPPSQualified                    // PPS has a numbering source again
+	EventStep              EventKind = iota // the clock was stepped; Value = seconds
+	EventPanicRefused                       // offset beyond the panic threshold; Value = seconds
+	EventPopcorn                            // a spike was ignored; Value = seconds
+	EventStateChange                        // From → To
+	EventFalseticker                        // Source became a falseticker
+	EventTruechimer                         // Source is no longer a falseticker
+	EventPreferLost                         // the prefer source is not a survivor
+	EventPreferRegained                     // the prefer source is back
+	EventSystemSource                       // Source became the system source
+	EventUnknownSource                      // a measurement arrived for an unregistered source
+	EventPPSUnqualified                     // PPS is stable but no numbering source survives
+	EventPPSQualified                       // PPS has a numbering source again
+	EventTimingLoop                         // Source is this daemon, or is synchronized to it
+	EventTimingLoopCleared                  // Source is no longer a timing loop
 )
 
 // Event is a notable occurrence, for the engine to log and count.
@@ -153,13 +163,19 @@ type System struct {
 	// directly instead of passing through SETTLING.
 	resyncing bool
 
+	// everSynced reports whether synchronization has been established and
+	// still applies to the clock the daemon is holding. It is set on
+	// entering SYNCED and cleared by a step, which moves the clock out from
+	// under whatever was established before it. Only a state with
+	// still-applicable synchronization may enter serviceable holdover.
+	everSynced bool
+
 	// unsyncedReason records why the daemon is UNSYNCED, so the refid it
 	// advertises tells the operator which of the three causes it is.
 	unsyncedReason ntp.RefID
 
 	sel           Selection
 	sysName       string
-	lastUsedAt    float64
 	lastUpdate    float64
 	haveUpdate    bool
 	offset        float64
@@ -223,7 +239,6 @@ func (s *System) InvalidateSources(now float64) Result {
 	for _, src := range s.all() {
 		src.invalidate()
 	}
-	s.lastUsedAt = 0
 	return s.reselect(now)
 }
 
@@ -240,7 +255,6 @@ func (s *System) Resync(now float64) Result {
 	for _, src := range s.all() {
 		src.invalidate()
 	}
-	s.lastUsedAt = 0
 	s.resyncing = s.state == StateSynced || s.state == StateHoldover
 	return s.reselect(now)
 }
@@ -276,7 +290,12 @@ func (s *System) Update(m Measurement) Result {
 		return Result{Events: []Event{{Kind: EventUnknownSource, Source: m.Source}}}
 	}
 	src.apply(m)
-	if m.Source == s.sysName {
+	// Settling counts *acquisitions* from the system source, not every
+	// event that names it. A timeout, a bad MAC, a rejected packet or an
+	// invalidation notice is a transport heartbeat, not the post-step
+	// evidence the state machine is waiting for; a good reply whose filter
+	// winner is unchanged is an acquisition and does count (RA6X-010).
+	if m.Source == s.sysName && m.IsAcquisition() {
 		s.sinceStep++
 	}
 	return s.reselect(m.Now)
@@ -285,6 +304,9 @@ func (s *System) Update(m Measurement) Result {
 func (s *System) setState(to State, res *Result) {
 	if s.state == to {
 		return
+	}
+	if to == StateSynced {
+		s.everSynced = true
 	}
 	res.Events = append(res.Events, Event{Kind: EventStateChange, From: s.state, To: to})
 	s.state = to
@@ -297,7 +319,8 @@ func (s *System) reselect(now float64) Result {
 	for _, src := range all {
 		prev[src.Name] = src.Status
 	}
-	sel := Select(all, now, s.cfg.MinSurvivors)
+	sel := SelectWithLocal(all, now, s.cfg.MinSurvivors, s.cfg.LocalRefIDs)
+	res.Events = append(res.Events, sel.Events...)
 	for _, src := range all {
 		was, is := prev[src.Name], src.Status
 		if is == StatusFalseticker && was != StatusFalseticker {
@@ -333,22 +356,40 @@ func (s *System) reselect(now float64) Result {
 
 	if sel.System == nil {
 		s.sysName = ""
-		switch s.state {
-		case StateSettling, StateSynced:
+		switch {
+		case s.state == StateSynced:
 			s.holdoverSince = now
 			s.setState(StateHoldover, &res)
+		case s.state == StateSettling && s.everSynced:
+			// Settling *after* a spell of synchronization — the filter
+			// withheld updates, or a leap resync is in progress — still has
+			// applicable synchronization to coast on.
+			s.holdoverSince = now
+			s.setState(StateHoldover, &res)
+		case s.state == StateSettling:
+			// Never synchronized in this epoch, and now there is nothing to
+			// synchronize from. HOLDOVER is served as synchronized by both
+			// the wire and the kernel; entering it here would mean losing
+			// the last source *increased* the trust placed in a clock the
+			// daemon never finished settling — including immediately after
+			// a step (RA6X-009).
+			s.unsyncedReason = ntp.KissINIT
+			s.setState(StateUnsynced, &res)
 		}
 		return res
 	}
 
 	if sel.System.Name != s.sysName {
 		s.sysName = sel.System.Name
-		s.lastUsedAt = 0
 		res.Events = append(res.Events, Event{Kind: EventSystemSource, Source: s.sysName})
 	}
 	// Run the loop only when the system source has a sample it has not
 	// already used; updates from other sources just refresh the selection.
-	if sel.System.At <= s.lastUsedAt {
+	// Consumption is tracked per source: a single system-wide watermark
+	// reset on every source switch, so switching away from a source and
+	// back again re-applied an observation the loop had already integrated
+	// (RA6X-003, RA6X-001).
+	if sel.System.At <= sel.System.usedAt {
 		if s.state == StateHoldover {
 			s.setState(StateSettling, &res)
 		}
@@ -363,7 +404,7 @@ func (s *System) reselect(now float64) Result {
 		}
 		return res
 	}
-	s.lastUsedAt = sel.System.At
+	sel.System.usedAt = sel.System.At
 
 	u := s.loop.Update(sel.Offset, sel.System.Poll, now, s.state == StateSynced, s.mayStep(&sel))
 	res.Actions = append(res.Actions, u.Actions...)
@@ -371,7 +412,8 @@ func (s *System) reselect(now float64) Result {
 	case u.Deferred:
 		// The offset warrants a step but there is not enough post-step
 		// evidence yet. Leave the loop untouched and wait for the next
-		// sample; lastUsedAt has already advanced, so it will run again.
+		// sample; the source's usedAt has already advanced, so it will run
+		// again.
 		return res
 	case u.PanicRefused:
 		res.Events = append(res.Events, Event{Kind: EventPanicRefused, Value: sel.Offset})
@@ -392,6 +434,10 @@ func (s *System) reselect(now float64) Result {
 		// second step inside the startup window used to leave the count
 		// standing and declare SYNCED one update early.
 		s.sinceStep, s.postStepUpdates, s.resyncing = 0, 0, false
+		// The clock has just moved: whatever synchronization preceded the
+		// step no longer applies to it, so losing the last source before
+		// settling completes must not be served as holdover (RA6X-009).
+		s.everSynced = false
 		s.setState(StateSettling, &res)
 	default:
 		s.offset = sel.Offset
@@ -465,9 +511,19 @@ func (s *System) mayStep(sel *Selection) bool {
 	return fresh >= 2
 }
 
-// Tick runs the per-second work: phase slewing and the holdover timeout.
+// Tick runs the per-second work: phase slewing, time-driven source
+// eligibility, and the holdover timeout.
+//
+// The reselection is what makes eligibility honest. Selection ages
+// uncertainty and rejects over-distance and stale sources, but it used to run
+// only on a measurement or an explicit lifecycle event, so if every producer
+// went silent a synchronized source stayed selected indefinitely and the
+// holdover timer never started (RA6X-003). It cannot re-integrate an
+// already-consumed observation: the per-source usedAt watermark is what gates
+// the loop, and a tick brings no new sample.
 func (s *System) Tick(now float64) Result {
-	res := Result{Actions: s.loop.Tick(now)}
+	res := s.reselect(now)
+	res.Actions = append(s.loop.Tick(now), res.Actions...)
 	if s.state == StateHoldover && now-s.holdoverSince > s.cfg.HoldoverMax {
 		s.unsyncedReason = ntp.KissHOLD
 		s.setState(StateUnsynced, &res)
