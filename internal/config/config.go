@@ -41,6 +41,9 @@ const (
 	// MinRecvBuffer is low enough to be a deliberate choice and high enough
 	// that it cannot be a units mistake; MaxRecvBuffer is what a kernel will
 	// plausibly grant with a raised rmem_max.
+	// Keep in step with server.minRecvBuffer, the floor the listener's
+	// halving retry stops at; this package imports server, so the constant
+	// lives in both places rather than being imported in a cycle.
 	MinRecvBuffer = 64 << 10
 	MaxRecvBuffer = 256 << 20
 )

@@ -9,4 +9,6 @@ import (
 
 func enablePacketInfo(syscall.RawConn, string) error { return nil }
 
-func destination([]byte, string) (netip.Addr, []byte) { return netip.Addr{}, nil }
+func martianReceiveFlags(int) bool { return false }
+
+func destination([]byte, string) (netip.Addr, []byte, bool) { return netip.Addr{}, nil, false }

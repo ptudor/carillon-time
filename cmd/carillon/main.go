@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -520,6 +521,16 @@ func serveWarnings(cfg *config.Config) []configurationWarning {
 	if cfg.Serve.RecvBuffer == 0 {
 		warnings = append(warnings, configurationWarning{
 			message: "recv_buffer is unset, so each listening socket keeps the kernel default; a public server that outruns it drops requests with no other evidence",
+		})
+	} else if runtime.GOOS == "freebsd" {
+		// FreeBSD refuses an oversized SO_RCVBUF with ENOBUFS rather than
+		// clamping it the way Linux does. The listener halves the request
+		// until the kernel accepts it, so the daemon still starts, but the
+		// operator gets the buffer they asked for only after raising the
+		// sysctl.
+		warnings = append(warnings, configurationWarning{
+			message: fmt.Sprintf("recv_buffer = %d: FreeBSD refuses a request above %s (default about 1.86 MB) instead of clamping it; raise the sysctl or the listener will settle for a smaller buffer",
+				cfg.Serve.RecvBuffer, ntpserver.RecvBufferSysctl()),
 		})
 	}
 	return warnings
