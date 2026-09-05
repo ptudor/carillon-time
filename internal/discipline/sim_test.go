@@ -638,3 +638,37 @@ func TestSimTolerantOfTickJitter(t *testing.T) {
 		t.Fatalf("tick jitter degraded the RMS from %v to %v", even, rough)
 	}
 }
+
+// TestSystemLeavesSettlingWithoutAFreshLoopUpdate covers a defect in the
+// RF5X-006 fix itself, seen on navlisten2026 on 2026-09-05: the settling
+// counter was decoupled from loop updates, but the *check* was left inside
+// the branch that only runs when the clock filter yields a new lowest-delay
+// sample. A filter withholding updates therefore still pinned the daemon in
+// SETTLING — exactly the outage RF5X-006 set out to remove.
+func TestSystemLeavesSettlingWithoutAFreshLoopUpdate(t *testing.T) {
+	sys := New(simConfig(), 0, true)
+	sys.AddSource("a", Options{Numbering: true})
+	m := func(offset, at, now float64) Measurement {
+		return Measurement{
+			Source: "a", Now: now, At: at, Reach: 0xff, Poll: 6, Valid: true,
+			Offset: offset, Delay: 0.010, Dispersion: 0.001, Jitter: 50e-6,
+			Stratum: 2, Leap: ntp.LeapNone, Precision: -20,
+			SourceRefID: ntp.RefIDFromString("a"),
+		}
+	}
+	// First measurement: sysName is only set during this reselect, so it
+	// does not count toward the settling evidence and the state is SETTLING.
+	sys.Update(m(0.005, 64, 64))
+	if sys.State() != StateSettling {
+		t.Fatalf("state after the first measurement: %v", sys.State())
+	}
+	// Every later measurement reports the same filter sample, so no loop
+	// update runs. The daemon must still reach SYNCED.
+	for i := 2; i <= 6; i++ {
+		sys.Update(m(0.005, 64, float64(i)*64))
+	}
+	if sys.State() != StateSynced {
+		t.Fatalf("still %v after five further samples with no new loop update; "+
+			"settling must not depend on the clock filter releasing one", sys.State())
+	}
+}
