@@ -775,8 +775,18 @@ limit            = 3      # ... but only within the first N loop updates after s
                           # 0 = never step, -1 = always allowed (not recommended on a server)
 panic            = 1000   # seconds; refuse to correct more than this ...
 panic_at_startup = false  # ... unless set, in which case it is allowed for the very first correction
-                          # (set true on hosts with no RTC that start at 1970/build time)
+                          # (set true on hosts with no RTC that start at 1970/build time;
+                          #  needs limit != 0 — see below, limit = 0 still means never step)
 ```
+
+**`limit` outranks `panic_at_startup`.** The two settings compose in one
+direction only: `panic_at_startup` widens *which offsets* may be corrected on
+the first update, and `limit` decides *whether a step may happen at all*. With
+`limit = 0` the daemon never issues a step, and an offset beyond `panic` on the
+first update is refused exactly as it would be with `panic_at_startup = false`
+— it is not quietly turned into a slew of thousands of seconds. Configure
+`panic_at_startup = true` together with a nonzero `limit` (the default 3, or
+-1) for the RTC-less first boot it exists for.
 
 **A second step needs more evidence than the first.** The first step of a run
 is always permitted — it is how a host with no RTC gets its clock. A *further*

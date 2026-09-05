@@ -23,6 +23,13 @@ const (
 	// one host an unbounded supply of fresh buckets and fresh LRU slots
 	// with which to evict real clients.
 	DefaultRateLimitV6Prefix = 64
+
+	// maxRateLimit bounds rate and burst. A billion packets per second is
+	// orders of magnitude beyond any interface, and keeping the values well
+	// away from the top of the float range means the bucket's rate*elapsed
+	// arithmetic cannot itself reach an infinity. Keep in step with
+	// config.maxRateLimit.
+	maxRateLimit = 1e9
 )
 
 // bucketKey identifies a token bucket. Authenticated requests get their own

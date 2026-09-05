@@ -97,8 +97,13 @@ func (f *Fake) Frequency() (float64, error) {
 	return f.freq, nil
 }
 
-// SetFrequency implements Clock.
+// SetFrequency implements Clock. Like the real backends it refuses a
+// non-finite word, so a test that lets one through fails here rather than
+// recording an arbitrary frequency.
 func (f *Fake) SetFrequency(ppm float64) error {
+	if err := CheckFrequency(ppm); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if ppm > 500 {

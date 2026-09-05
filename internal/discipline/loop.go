@@ -154,7 +154,9 @@ func clampFreq(f float64) float64 {
 	return math.Max(-MaxFrequency, math.Min(MaxFrequency, f))
 }
 
-// stepAllowed applies the StepLimit policy.
+// stepAllowed applies the StepLimit policy. It gates the panic-at-startup
+// exception too: an operator who configured limit = 0 has said the clock is
+// never to be stepped, and no offset magnitude changes that.
 func (l *Loop) stepAllowed() bool {
 	switch {
 	case l.cfg.StepLimit < 0:
@@ -178,9 +180,19 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 	var u UpdateResult
 	abs := math.Abs(offset)
 
-	// Step and panic policy.
+	// Step and panic policy. Precedence, in order:
+	//
+	//  1. Beyond Panic: refuse, unless this is the very first update and
+	//     PanicAtStartup is set.
+	//  2. The startup exception still obeys StepLimit. limit = 0 means never
+	//     step, and a configuration that says never must not be overridden
+	//     by a threshold that only says "this is a big offset". Refusing is
+	//     the right answer, not converting thousands of seconds into a slew
+	//     that would take weeks (RA6X-011).
+	//  3. The caller's mayStep veto defers rather than refuses: no state
+	//     changes and the decision is retaken with more evidence.
 	if abs > l.cfg.Panic {
-		if !(l.Updates == 0 && l.cfg.PanicAtStartup) {
+		if !(l.Updates == 0 && l.cfg.PanicAtStartup) || !l.stepAllowed() {
 			u.PanicRefused = true
 			return u
 		}

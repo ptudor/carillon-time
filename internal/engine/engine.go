@@ -26,6 +26,10 @@ import (
 	"carillon/internal/source"
 )
 
+// maxKernelError is the ceiling both kernels apply to maxerror and esterror
+// (MAXPHASE, 16 s), and the value the daemon reports while unsynchronized.
+const maxKernelError = 16 * time.Second
+
 // errFrequencyRefused marks a fatal error that came from SetFrequency
 // itself, so the shutdown path knows not to make the same call again.
 var errFrequencyRefused = errors.New("kernel refused a frequency change")
@@ -130,10 +134,18 @@ type Engine struct {
 	lastLoopUpdate float64
 	lastKernel     clock.Status
 	haveKernel     bool
-	lastDriftWrite float64
-	driftErrShown  bool
-	lastLeapWall   time.Time
-	lastFileLeap   ntp.Leap
+
+	// appliedFreq is the last frequency word the actuator actually
+	// accepted, and haveAppliedFreq whether one ever has been. The engine
+	// tracks this itself because the startup write in Run bypasses the
+	// loop's own bookkeeping, and because the loop records what it issued
+	// rather than what the kernel took (RA6X-016).
+	appliedFreq     float64
+	haveAppliedFreq bool
+	lastDriftWrite  float64
+	driftErrShown   bool
+	lastLeapWall    time.Time
+	lastFileLeap    ntp.Leap
 
 	gen        *atomic.Uint64
 	staleDrops map[string]uint64
@@ -239,6 +251,16 @@ func readDrift(path string) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("parsing %s: %w", path, err)
 	}
+	// strconv accepts "NaN", "Inf", "+Inf" and their case variants, and a
+	// non-finite value passes both of the comparisons below: NaN compares
+	// false against everything. Trusting one marks the frequency known,
+	// initializes the loop with it, survives clampFreq (math.Min/math.Max
+	// propagate NaN) and converts to an arbitrary kernel word. Reject it
+	// here so it takes the same fallback as any other unusable drift file
+	// (RA6X-014). A NaN is not a measured zero and is not treated as one.
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("%s: %v is not a finite frequency", path, v)
+	}
 	if v > discipline.MaxFrequency || v < -discipline.MaxFrequency {
 		return 0, fmt.Errorf("%s: %v ppm is outside ±%v", path, v, discipline.MaxFrequency)
 	}
@@ -332,10 +354,10 @@ func (e *Engine) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if err := e.clk.SetFrequency(e.sys.Frequency()); err != nil {
+	if err := e.setFrequency(e.sys.Frequency()); err != nil {
 		return fmt.Errorf("engine: setting initial frequency: %w", err)
 	}
-	if err := e.setKernel(clock.Status{Leap: ntp.LeapUnsync, MaxError: 16 * time.Second, EstError: 16 * time.Second}); err != nil {
+	if err := e.setKernel(clock.Status{Leap: ntp.LeapUnsync, MaxError: maxKernelError, EstError: maxKernelError}); err != nil {
 		return err
 	}
 
@@ -393,7 +415,11 @@ loop:
 // The pending phase is abandoned rather than finished: it can take
 // arbitrarily long, and exit never steps.
 func (e *Engine) restoreBaseFrequency(runErr error) {
-	applied, ok := e.sys.Applied()
+	// What the kernel is actually running, not what the loop last issued:
+	// the startup write happens before the first Tick, so several
+	// measurements can move the base with the loop still reporting that it
+	// has applied nothing (RA6X-016).
+	applied, ok := e.appliedFreq, e.haveAppliedFreq
 	base := e.sys.Frequency()
 	if !ok || applied == base {
 		return
@@ -403,12 +429,23 @@ func (e *Engine) restoreBaseFrequency(runErr error) {
 		// would only produce a second error on the way out.
 		return
 	}
-	if err := e.clk.SetFrequency(base); err != nil {
+	if err := e.setFrequency(base); err != nil {
 		e.log.Warn("cannot restore the base frequency on exit", "ppm", base, "error", err)
 		return
 	}
 	e.log.Info("kernel frequency left at the base estimate",
 		"ppm", base, "abandoned_slew_ppm", applied-base, "abandoned_phase", e.sys.Pending())
+}
+
+// setFrequency writes a frequency word and records it if the actuator took
+// it. Every frequency write in the daemon goes through here so the shutdown
+// path knows what the kernel is holding.
+func (e *Engine) setFrequency(ppm float64) error {
+	if err := e.clk.SetFrequency(ppm); err != nil {
+		return err
+	}
+	e.appliedFreq, e.haveAppliedFreq = ppm, true
+	return nil
 }
 
 // stale reports whether a measurement describes a clock reading the engine
@@ -523,15 +560,27 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 	for _, a := range res.Actions {
 		switch a.Kind {
 		case discipline.ActionSetFrequency:
-			if err := e.clk.SetFrequency(a.Value); err != nil {
+			if err := clock.CheckFrequency(a.Value); err != nil {
+				return fmt.Errorf("engine: %w: %w", errFrequencyRefused, err)
+			}
+			if err := e.setFrequency(a.Value); err != nil {
 				return fmt.Errorf("engine: %w of %.3f ppm: %w", errFrequencyRefused, a.Value, err)
 			}
 		case discipline.ActionStep:
+			// A finite offset need not fit in a time.Duration, and the plain
+			// conversion wraps in silence: +1e20 s becomes a step of about
+			// +292 years. Refuse before anything is committed — in
+			// particular before the generation bump, so a refused step does
+			// not invalidate every sample in flight (RA6X-041).
+			delta, err := clock.Seconds(a.Value)
+			if err != nil {
+				return fmt.Errorf("engine: refusing a step of %v s: %w", a.Value, err)
+			}
 			// Bump before the step so that anything a source is holding,
 			// and anything already queued, is recognisable as pre-step.
 			e.gen.Add(1)
 			before := e.clk.Now()
-			if err := e.clk.Step(time.Duration(a.Value * float64(time.Second))); err != nil {
+			if err := e.clk.Step(delta); err != nil {
 				return fmt.Errorf("engine: kernel refused step of %.6f s: %w", a.Value, err)
 			}
 			after := e.clk.Now()
@@ -630,12 +679,15 @@ func (e *Engine) syncKernel(st *discipline.Status) error {
 	synced := st.State == discipline.StateSynced || st.State == discipline.StateHoldover
 	ks := clock.Status{Synced: synced, Leap: st.Leap}
 	if synced {
-		ks.MaxError = time.Duration((st.RootDisp + st.RootDelay/2) * float64(time.Second))
-		ks.EstError = time.Duration(st.Jitter * float64(time.Second))
+		// Saturating rather than failing: an uncertainty too large to
+		// express is honestly reported as the largest bound both kernels
+		// accept, which is what an unknown error bound is (RA6X-041).
+		ks.MaxError = clock.BoundSeconds(st.RootDisp+st.RootDelay/2, maxKernelError)
+		ks.EstError = clock.BoundSeconds(st.Jitter, maxKernelError)
 	} else {
 		ks.Leap = ntp.LeapUnsync
-		ks.MaxError = 16 * time.Second
-		ks.EstError = 16 * time.Second
+		ks.MaxError = maxKernelError
+		ks.EstError = maxKernelError
 	}
 	if e.haveKernel && ks == e.lastKernel {
 		return nil

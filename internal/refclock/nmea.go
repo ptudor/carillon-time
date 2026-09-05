@@ -183,6 +183,14 @@ func (n *NMEA) Run(ctx context.Context, out chan<- discipline.Measurement) error
 	defer n.closeReader()
 	buf := make([]byte, 2048)
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		// Belt and braces behind reopen's contract: the loop must never
+		// dereference a reader it does not have (RA6X-018).
+		if n.reader == nil {
+			return fmt.Errorf("refclock %q: no serial reader", n.cfg.Name)
+		}
 		if n.resetRequested.Swap(false) {
 			n.resetWindow()
 		}
@@ -208,12 +216,22 @@ func (n *NMEA) Run(ctx context.Context, out chan<- discipline.Measurement) error
 			n.updateInfo(func(i *source.Info, _ *source.RefclockInfo) { i.LastError = err.Error() })
 			n.log.Warn("GPS serial device unavailable", "error", err)
 			if err := n.reopen(ctx); err != nil {
+				// Cancellation is a clean stop, not a source failure.
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 		}
 	}
 }
 
+// reopen closes the current reader and retries the opener with exponential
+// backoff until it succeeds or ctx is cancelled. It returns nil only when
+// n.reader holds a new, open device: returning nil after cancellation left
+// the reader nil and made Run's next iteration dereference it, panicking in
+// a source goroutine and taking the whole daemon down without restoring the
+// base frequency or flushing statistics (RA6X-018).
 func (n *NMEA) reopen(ctx context.Context) error {
 	n.closeReader()
 	if n.opener == nil {
@@ -225,7 +243,7 @@ func (n *NMEA) reopen(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil
+			return ctx.Err()
 		case <-timer.C:
 		}
 		r, err := n.opener()
@@ -345,7 +363,16 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 	}
 	n.lastStamp = s.Timestamp
 
-	offset := s.Timestamp.Sub(arrival).Seconds() + n.cfg.Offset
+	// time.Time.Sub saturates at ±(1<<63 - 1) ns rather than reporting an
+	// overflow, so a sentence dated far enough from the local clock would
+	// yield an offset of about ±292 years that reads like a real
+	// measurement. Detect the saturation and drop the sentence (RA6X-041).
+	lag := s.Timestamp.Sub(arrival)
+	if lag == math.MaxInt64 || lag == math.MinInt64 {
+		n.reject("GPS timestamp is too far from the local clock to measure")
+		return discipline.Measurement{}, false
+	}
+	offset := lag.Seconds() + n.cfg.Offset
 	n.appendValue(&n.offsets, offset)
 	median, mad := medianMAD(n.offsets)
 	sigma := mad * 1.4826
@@ -353,9 +380,9 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 	n.noteArrival(mono)
 
 	if pulse := n.cfg.Pulse.latest(); !pulse.IsZero() {
-		lag := arrival.Sub(pulse).Seconds()
-		if lag >= 0 && lag < 2 {
-			n.appendValue(&n.lags, lag)
+		sentenceLag := arrival.Sub(pulse).Seconds()
+		if sentenceLag >= 0 && sentenceLag < 2 {
+			n.appendValue(&n.lags, sentenceLag)
 			lagMedian, _ := medianMAD(n.lags)
 			n.updateInfo(func(_ *source.Info, r *source.RefclockInfo) {
 				r.MeasuredLag, r.LagSamples = lagMedian, len(n.lags)

@@ -36,7 +36,9 @@ func Call(ctx context.Context, path string, req Request) (*Response, error) {
 	} else if req.Command != CmdWaitSync || req.Timeout > 0 {
 		wait := 10 * time.Second
 		if req.Timeout > 0 {
-			wait += time.Duration(req.Timeout * float64(time.Second))
+			// Bounded conversion: an out-of-range timeout would otherwise
+			// wrap to a deadline in the past (RA6X-035).
+			wait = waitDuration(req.Timeout) + 10*time.Second
 		}
 		_ = conn.SetDeadline(time.Now().Add(wait))
 	}

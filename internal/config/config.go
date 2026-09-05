@@ -21,6 +21,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"golang.org/x/sys/unix"
 
+	"carillon/internal/clock"
 	ntpserver "carillon/internal/server"
 )
 
@@ -48,12 +49,62 @@ const (
 	MaxRecvBuffer = 256 << 20
 )
 
+// maxCalibrationOffset bounds every refclock calibration offset. These
+// settings compensate cable and driver delay (`offset`, `pps_offset`) or the
+// lag of an NMEA sentence behind its own PPS edge (`nmea_offset`); all three
+// are physically far below one second, and a PPS offset of a second or more
+// makes "which second the edge starts" ambiguous, which is the one thing a
+// PPS refclock cannot answer for itself. Bounding the value also keeps it out
+// of the saturating float-seconds arithmetic on the measurement path
+// (RA6X-041).
+const maxCalibrationOffset = 1.0
+
 // Default field values for an upstream server.
 const (
 	DefaultPollMin = 6
 	DefaultPollMax = 10
 	DefaultPort    = 123
 )
+
+// plausibleCalibration reports whether a refclock calibration offset is a
+// finite number of seconds within ±maxCalibrationOffset.
+func plausibleCalibration(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= -maxCalibrationOffset && v <= maxCalibrationOffset
+}
+
+// Bounds shared by the numeric settings. Several checks used to be one-sided
+// comparisons such as `!(v > 0)`, which reject NaN but happily accept +Inf:
+// an infinite holdover never expires, an infinite stability spread can never
+// be exceeded so the drift gate never fires, and an infinite rate or burst
+// means no rate limiting at all. Nothing here has a meaningful infinite
+// value, and a setting that names seconds must also survive conversion to a
+// time.Duration (RA6X-035).
+const (
+	// maxFrequencySpreadPPM is the width of the whole ±500 ppm range the
+	// kernel accepts. A stability spread at or above it can never be
+	// exceeded, which silently disables the drift-file gate.
+	maxFrequencySpreadPPM = 1000.0
+
+	// maxRateLimit bounds rate_limit_pps and rate_burst. A billion packets
+	// per second is orders of magnitude beyond any interface, and keeping
+	// the values well away from the top of the float range means the token
+	// bucket's rate*elapsed arithmetic cannot itself reach an infinity.
+	maxRateLimit = 1e9
+)
+
+// seconds reports whether v is a finite number of seconds that is strictly
+// positive, converts to a nonzero time.Duration, and does not overflow one.
+// A value that rounds to zero nanoseconds is refused rather than silently
+// becoming "no timeout" or falling back to a default after conversion.
+func seconds(v float64) bool {
+	d, err := clock.Seconds(v)
+	return err == nil && d > 0
+}
+
+// inRange reports whether v is finite and within [lo, hi].
+func inRange(v, lo, hi float64) bool {
+	return !math.IsNaN(v) && v >= lo && v <= hi
+}
 
 // Config is the whole configuration file.
 type Config struct {
@@ -518,11 +569,11 @@ func Validate(cfg *Config) error {
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
-	if !(cfg.Daemon.DriftStableSeconds > 0) {
-		fail("daemon: drift_stable_seconds %v must be greater than zero", cfg.Daemon.DriftStableSeconds)
+	if !seconds(cfg.Daemon.DriftStableSeconds) {
+		fail("daemon: drift_stable_seconds %v must be a finite, representable number of seconds greater than zero", cfg.Daemon.DriftStableSeconds)
 	}
-	if !(cfg.Daemon.DriftStableSpreadPPM > 0) {
-		fail("daemon: drift_stable_spread_ppm %v must be greater than zero", cfg.Daemon.DriftStableSpreadPPM)
+	if !(cfg.Daemon.DriftStableSpreadPPM > 0 && inRange(cfg.Daemon.DriftStableSpreadPPM, 0, maxFrequencySpreadPPM)) {
+		fail("daemon: drift_stable_spread_ppm %v must be in (0, %v]", cfg.Daemon.DriftStableSpreadPPM, maxFrequencySpreadPPM)
 	}
 	if cfg.Daemon.DriftFile == "" {
 		fail("daemon: drift_file must be set")
@@ -617,8 +668,8 @@ func Validate(cfg *Config) error {
 			if r.Edge != "assert" && r.Edge != "clear" {
 				fail("%s: edge %q is not assert or clear", label, r.Edge)
 			}
-			if math.IsNaN(r.Offset) || math.IsInf(r.Offset, 0) {
-				fail("%s: offset must be finite", label)
+			if !plausibleCalibration(r.Offset) {
+				fail("%s: offset %v is not a plausible calibration; it must be finite and within ±%v s", label, r.Offset, maxCalibrationOffset)
 			}
 		} else if r.Type == "gps" {
 			validateGPSRefclock(r, label, fail)
@@ -654,8 +705,8 @@ func Validate(cfg *Config) error {
 	if cfg.Discipline.MinSurvivors < 1 {
 		fail("discipline: min_survivors %d must be at least 1", cfg.Discipline.MinSurvivors)
 	}
-	if !(cfg.Discipline.HoldoverMax > 0) {
-		fail("discipline: holdover_max %v must be greater than 0", cfg.Discipline.HoldoverMax)
+	if !seconds(cfg.Discipline.HoldoverMax) {
+		fail("discipline: holdover_max %v must be a finite, representable number of seconds greater than zero", cfg.Discipline.HoldoverMax)
 	}
 	if !(cfg.Discipline.MaxSlewPPM > 0 && cfg.Discipline.MaxSlewPPM <= 500) {
 		fail("discipline: max_slew_ppm %v must be in (0, 500]", cfg.Discipline.MaxSlewPPM)
@@ -664,8 +715,8 @@ func Validate(cfg *Config) error {
 		fail("discipline: settle_updates %d must be at least 1", cfg.Discipline.SettleUpdates)
 	}
 
-	if !(cfg.Step.Threshold > 0) {
-		fail("step: threshold %v must be greater than 0", cfg.Step.Threshold)
+	if !seconds(cfg.Step.Threshold) {
+		fail("step: threshold %v must be a finite, representable number of seconds greater than zero", cfg.Step.Threshold)
 	}
 	if cfg.Step.Limit < -1 {
 		fail("step: limit %d must be -1 (always), 0 (never), or a positive count", cfg.Step.Limit)
@@ -676,7 +727,9 @@ func Validate(cfg *Config) error {
 	if cfg.Stats.Enabled() && filepath.Clean(cfg.Stats.Dir) == "." {
 		fail("stats: dir must name a directory")
 	}
-	if !(cfg.Step.Panic > cfg.Step.Threshold) {
+	if !seconds(cfg.Step.Panic) {
+		fail("step: panic %v must be a finite, representable number of seconds greater than zero", cfg.Step.Panic)
+	} else if !(cfg.Step.Panic > cfg.Step.Threshold) {
 		fail("step: panic %v must be greater than threshold %v", cfg.Step.Panic, cfg.Step.Threshold)
 	}
 
@@ -702,11 +755,11 @@ func validateGPSRefclock(r *Refclock, label string, fail func(string, ...any)) {
 	if r.PPS != "none" && r.PPSEdge != "assert" && r.PPSEdge != "clear" {
 		fail("%s: pps_edge %q is not assert or clear", label, r.PPSEdge)
 	}
-	if math.IsNaN(r.PPSOffset) || math.IsInf(r.PPSOffset, 0) {
-		fail("%s: pps_offset must be finite", label)
+	if !plausibleCalibration(r.PPSOffset) {
+		fail("%s: pps_offset %v is not a plausible calibration; it must be finite and within ±%v s", label, r.PPSOffset, maxCalibrationOffset)
 	}
-	if math.IsNaN(r.NMEAOffset) || math.IsInf(r.NMEAOffset, 0) {
-		fail("%s: nmea_offset must be finite", label)
+	if !plausibleCalibration(r.NMEAOffset) {
+		fail("%s: nmea_offset %v is not a plausible calibration; it must be finite and within ±%v s", label, r.NMEAOffset, maxCalibrationOffset)
 	}
 	seen := make(map[string]bool, len(r.Sentences))
 	for _, sentence := range r.Sentences {
@@ -832,11 +885,11 @@ func validateServe(s *Serve, needKeys *bool, fail func(string, ...any)) {
 			*needKeys = true
 		}
 	}
-	if !(s.RateLimitPPS > 0) {
-		fail("serve: rate_limit_pps %v must be greater than zero", s.RateLimitPPS)
+	if !(s.RateLimitPPS > 0 && inRange(s.RateLimitPPS, 0, maxRateLimit)) {
+		fail("serve: rate_limit_pps %v must be in (0, %v]", s.RateLimitPPS, maxRateLimit)
 	}
-	if !(s.RateBurst >= 1) {
-		fail("serve: rate_burst %v must be at least 1", s.RateBurst)
+	if !inRange(s.RateBurst, 1, maxRateLimit) {
+		fail("serve: rate_burst %v must be in [1, %v]", s.RateBurst, maxRateLimit)
 	}
 	if s.RateLimitV6Prefix < 32 || s.RateLimitV6Prefix > 128 {
 		fail("serve: rate_limit_v6_prefix %d must be between 32 and 128", s.RateLimitV6Prefix)
