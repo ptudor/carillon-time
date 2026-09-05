@@ -6,7 +6,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-001 — Delayed filter observations destabilize the discipline loop
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/filter.go:73–147`; `internal/source/ntp.go:449–488,533–556`; `internal/discipline/system.go:337–361`; `internal/discipline/loop.go:201–262`.
 
 **Problem:** Advancing a sample timestamp does not make the observation current. The eight-stage minimum-delay filter can release successive observations seven polls old. System passes the historical offset to Loop as present-time feedback, replacing residual phase and integrating frequency using delivery time. Corrections applied since observation are not accounted for. A correct initial frequency and an unbiased reference can therefore produce large clock and frequency errors.
@@ -19,7 +20,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-002 — The filter can withhold useful corrections for many polls
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/filter.go:85–93,143–147`; `internal/source/ntp.go:477–486`; `internal/discipline/system.go:342–357`; `DESIGN.md:561–592`.
 
 **Problem:** A low-delay observation suppresses later filter outputs until eviction or demotion. The loop receives no feedback while its last pending correction decays, even though valid replies continue. The settling repair permits service during this interval but does not resolve the blind discipline interval.
@@ -32,7 +34,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-003 — Time-based source expiry never runs on engine ticks
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/system.go:293–335,462–469`; `internal/discipline/select.go:164–184`; `internal/engine/engine.go:368–374`.
 
 **Problem:** Selection ages uncertainty and rejects over-distance sources only on a measurement or explicit lifecycle event. `System.Tick` performs phase slewing and an already-entered holdover timeout, without reselecting. If all producers become silent, a synchronized source remains selected indefinitely; the holdover timer never starts. With long configured polls, a source can also remain eligible past its distance limit between polls.
@@ -45,7 +48,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-004 — Device reconnect loops retain reachable, selectable estimates
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/refclock/pps.go:257–265,280–313`; `internal/refclock/nmea.go:207–213,217–249`.
 
 **Problem:** A hard device error enters a private reconnect loop without emitting reach zero or invalidating the previous estimate. During repeated open failures, the engine receives no loss information. A disconnected PPS/GPS can remain system source; an old NMEA estimate can continue numbering a live PPS. This is separate from ordinary fetch/read timeouts, which do emit measurements.
@@ -58,7 +62,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-005 — Re-priming PPS does not invalidate the selector's old lock
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/refclock/pps.go:363–369,485–515,541–553`; `internal/discipline/select.go:129–153`.
 
 **Problem:** The new consecutive-rejection and sequence-restart recovery paths empty the PPS window and clear stability but return an ordinary invalid measurement. Such a measurement intentionally retains the previous estimate in SourceState. Reach is still nonzero, so the unlocked PPS stays selected.
@@ -71,7 +76,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-006 — Generation stamping does not bracket clock-step execution
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/engine/engine.go:529–542`; `internal/source/ntp.go:316–343`; `internal/refclock/nmea.go:189–193,260–267,336–345`; `internal/refclock/pps.go:228–246`.
 
 **Problem:** The engine increments the generation before the syscall and leaves that same generation current afterward. A source starting after the increment but before the actual clock change labels a pre-step observation with the post-step generation. NMEA separately reads arrival time before it captures the generation. These windows defeat the intended stale-sample protection and can cause incorrect subsequent corrections.
@@ -84,7 +90,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-007 — Leap transitions are detected after queued corrections execute
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/engine/engine.go:360–370,522–564`.
 
 **Problem:** Run evaluates `sys.Update(m)` before `handle` checks the leap boundary, and handle applies actions before that check. A queued observation spanning the transition can therefore step or change frequency before generation and source filters are reset. Resetting afterward cannot undo an actuator operation.
@@ -97,7 +104,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-008 — Phase debit uses the next frequency word for the previous interval
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/loop.go:258–267,292–338`.
 
 **Problem:** Tick claims to account for the transient that actually ran during elapsed time, but computes `actual` from the new Pending and new base. It then debits that new correction before issuing it. Even successive ordinary ticks disagree with the applied-word integral; intervening loop updates, changed bases, and delayed ticks make the discrepancy larger. Initial ticks also charge a nominal second before the first transient has run.
@@ -110,7 +118,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-009 — Losing a source during settling promotes untrusted time to holdover
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/system.go`, `reselect` (327–335), `Status`; `internal/engine/engine.go`, `syncKernel`; `cmd/carillon/main.go`, NTP status callback.
 
 **Problem:** SETTLING and SYNCED both enter HOLDOVER when selection loses its last source. HOLDOVER is treated as synchronized by the server and kernel even if the daemon never completed settling. Losing evidence can therefore increase the trust placed in the clock, including immediately after a step.
@@ -123,7 +132,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-010 — Failed polls count as successful settling evidence
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/system.go:293–302,342–355,428–435`; `internal/discipline/measurement.go`; `internal/source/ntp.go`, `emit`.
 
 **Problem:** Every Measurement from the selected name increments `sinceStep`, including timeouts, bad authentication, rejected packets, and invalidation notifications. The recent settling repair thus allows SYNCED without the required successful post-step/initial observations. A transport heartbeat and a valid observation have been conflated.
@@ -136,7 +146,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-011 — Panic-at-startup bypasses the never-step setting
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/discipline/loop.go`, `Update` (182–191), `stepAllowed`; `DESIGN.md` §6.6; `deploy/carillon.toml.example`, `[step]`.
 
 **Problem:** `panic_at_startup=true` directly issues the first step above the panic threshold even with `limit=0`. The explicit never-step configuration can therefore move the host clock by thousands of seconds. The existing tests exercise the two options independently and miss their interaction.
@@ -149,7 +160,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-012 — Panic refusal is logged but does not stop the daemon as specified
 
-**Severity:** Medium  
+**Severity:** Medium
+
 **Location:** `internal/discipline/system.go`, `reselect` panic branch; `internal/engine/engine.go`, `handle`, `logEvent`, `Run`; `DESIGN.md:790–794`.
 
 **Problem:** The documented fatal panic gate is implemented as an ordinary event and an UNSYNCED state change. Run continues, allowing future corrections and ticks; an earlier pending slew is not necessarily canceled. Operators relying on a nonzero exit and service-manager backoff do not get it.
@@ -162,7 +174,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-013 — A frozen transient frequency is accepted as stable drift
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/engine/engine.go`, `noteFrequency`, `frequencySettled`, `maybeWriteDrift`; `review/2026/09/takeover-repro/engine_test.go.txt`.
 
 **Problem:** The persistence gate measures the spread of repeated base-frequency readings, without requiring fresh reference evidence. A bad transient left unchanged during filter starvation or source silence appears perfectly stable after 900 seconds and overwrites the known-good drift file. Subsequent restarts inherit the wrong correction.
@@ -175,7 +188,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-014 — NaN in the drift file reaches the clock-control state
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/engine/engine.go:233–245`, `New`; `internal/discipline/loop.go`, `NewLoop`/`clampFreq`; `internal/clock/sysclock_common.go`, `freqWord`.
 
 **Problem:** `ParseFloat` accepts NaN; range comparisons do not reject it. The engine then marks the frequency known and initializes the loop with NaN. Clamps based on floating-point min/max retain NaN, and converting it to a kernel integer is not a valid bounded frequency conversion. This can cause an actuator failure or an extreme correction and also break JSON monitoring.
@@ -188,7 +202,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-015 — Startup temporary cleanup can delete the configured drift file
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/engine/engine.go`, `sweepDriftTemps` (253–276), `New`, `writeDrift`.
 
 **Problem:** Cleanup assumes every old `.drift-*` entry beside the configured drift file is disposable. The filename is user-configurable, so the real calibration file can match that pattern. Unrelated files from another instance in the same directory are also eligible for deletion.
@@ -201,7 +216,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-016 — Shutdown before the first tick leaves the wrong base frequency applied
 
-**Severity:** Medium  
+**Severity:** Medium
+
 **Location:** `internal/engine/engine.go`, `Run` initial SetFrequency and `restoreBaseFrequency`; `internal/discipline/loop.go`, `Applied`.
 
 **Problem:** The initial kernel frequency write bypasses Loop's applied-state bookkeeping. If multiple measurements change the base before the first tick and shutdown occurs then, `Applied()` reports no write and restoration returns early. The kernel retains the startup value rather than the final base estimate reported by status.
@@ -214,7 +230,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-017 — Source-stop events can be overtaken by queued measurements and swallow fatal errors
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/engine/engine.go`, `runSource`, `sourceStopped` (487–507), `Run` request/measurement cases.
 
 **Problem:** Measurements and lifecycle events use different channels with no per-run identity/order. After a source's stop event marks it unreachable, a previously queued valid measurement can revive it. Restart also reuses the same object without an engine-owned sample epoch. Additionally, sourceStopped logs and discards errors returned by handle, unlike normal Run paths; a selection change there can issue an actuator action whose failure is meant to be fatal.
@@ -227,7 +244,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-018 — Canceling an NMEA reconnect panics the daemon
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/refclock/nmea.go:179–215,217–249` (`Run`, `reopen`).
 
 **Problem:** `reopen` closes/clears the reader and returns nil when the context is canceled. Run interprets nil as successful reopening, loops, and dereferences the nil reader before checking cancellation. The panic in a source goroutine terminates the whole daemon and bypasses normal base-frequency restoration and stats flushing.
@@ -240,7 +258,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-019 — NMEA reacquisition reuses a stale pre-outage median
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/refclock/nmea.go`, `tick`, `noteArrival`, `acceptLine`, `resetWindow`.
 
 **Problem:** Ordinary silence can empty reach without clearing the NMEA offset window. When data returns, one fresh sentence immediately qualifies a mostly historical window and stamps its median as current. The host may have slewed or drifted during the outage, making that estimate wrong and falsely precise.
@@ -253,7 +272,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-020 — One future GPS date can suppress all subsequent correct time
 
-**Severity:** High  
+**Severity:** High
+
 **Location:** `internal/refclock/nmea.go:321–347`, `resetWindow`, `reopen`; `internal/refclock/nmea_sentence.go`, ZDA/RMC calendar parsing.
 
 **Problem:** The only date plausibility guard rejects dates older than the build. A checksum-valid future date is remembered in lastStamp before the engine accepts or refuses the correction. All subsequent earlier/correct timestamps are silently dropped; window resets and successful reconnects retain lastStamp. Recovery can require restarting the daemon or waiting decades.
@@ -266,7 +286,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-021 — ZDA can discipline time while the receiver reports an invalid fix
 
-**Severity:** High — **Needs investigation: receiver-specific time-validity policy**  
+**Severity:** High — **Needs investigation: receiver-specific time-validity policy**
+
 **Location:** `internal/refclock/nmea_sentence.go`, `parseZDA`; `internal/refclock/nmea.go:296–335,367–385`; `DESIGN.md`, GPS invalid-fix behavior.
 
 **Problem:** Every structurally valid ZDA is treated as valid time. A recent RMC V or GGA quality 0 changes status to FixValid=false but does not prevent ZDA from forming valid stratum-1 measurements. ZDA preference can then suppress RMC. The code demonstrably admits contradictory data; whether a given receiver's ZDA remains trustworthy without navigation validity needs hardware/protocol confirmation.
@@ -279,8 +300,9 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-022 — Leap warnings are coupled to loop updates and lack a fileless boundary reset
 
-**Severity:** High  
-**Location:** `internal/discipline/system.go:342–418`; `internal/engine/engine.go`, `handle` leap branch, `effectiveStatus`; `internal/source/ntp.go`, `hit`/`emit`.
+**Severity:** High
+
+**Location:** `internal/discipline/system.go:342–418`; `internal/engine/engine.go`, `handle` leap branch and `publish`; `internal/source/ntp.go`, `hit`/`emit`.
 
 **Problem:** Survivor leap majority is recomputed only after a nonignored loop update from the selected source. Warning changes in other survivors can be ignored while its filter winner stays unchanged. Separately, the only engine boundary reset is conditional on a LeapTable: the supported upstream-authoritative path does not reset samples/generation after the kernel's leap and may retain the warning until a later update.
 
@@ -292,12 +314,13 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-023 — An expired authoritative leapfile can suppress valid upstream warnings
 
-**Severity:** Medium — **Needs investigation: expired-authority service policy**  
-**Location:** `internal/leap/leap.go`, `Indicator`; `internal/engine/engine.go`, `effectiveStatus`; `cmd/carillon/main.go`, `configurationWarnings`; `DESIGN.md:841–850`.
+**Severity:** Medium — **Needs investigation: expired-authority service policy**
+
+**Location:** `internal/leap/leap.go`, `Indicator`; `internal/engine/engine.go`, `handle` and `publish`; `cmd/carillon/main.go`, `configurationWarnings`; `DESIGN.md:841–850`.
 
 **Problem:** The design deliberately retains an expired table, but engine use of its authority never expires. Once the table no longer contains a newly announced leap, Indicator returns none and overrides a correct survivor majority; the wire and kernel continue as synchronized despite monitor health being unhealthy. Startup warnings alone do not reach operators whose daemon crosses expiry much later.
 
-**Evidence:** `Indicator` never checks Expiry; `effectiveStatus` always assigns its result when LeapTable is nonnil. Expiry is exposed to monitoring and checked by startup warnings only. This is an explicit policy gap, not an accidental failure to reload a changed file.
+**Evidence:** `Indicator` never checks Expiry; `handle` and `publish` override synchronized/holdover LI with its result when LeapTable is nonnil. Expiry is exposed to monitoring and checked by startup warnings only. This is an explicit policy gap, not an accidental failure to reload a changed file.
 
 **Fix specification:** Specify a safe expired-authority policy. Retain the loaded table/provenance for diagnostics as the design requires, but do not silently assert valid current leap knowledge: either cease synchronized service or allow explicitly configured fallback to current survivor consensus. Emit runtime expiry/near-expiry state transitions. Preserve default authority selection and restart-based configuration loading unless a separately designed reload is adopted.
 
@@ -305,7 +328,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-024 — Filter startup uncertainty omits all unfilled stages
 
-**Severity:** Medium  
+**Severity:** Medium
+
 **Location:** `internal/discipline/filter.go`, `NewFilter`, dispersion accumulation; `internal/source/ntp.go`, `hit`; `internal/discipline/select.go`, `SourceState.apply`.
 
 **Problem:** The filter weights only real samples and omits uncertainty for absent stages. A single packet can look orders of magnitude more certain than an unprimed eight-stage filter warrants, affecting candidate admission, weighting, and served root dispersion. The prior deliberate skip remains unresolved.
@@ -318,7 +342,8 @@ This is an incremental review checkpoint. The final revision will include the co
 
 ## RA6X-025 — Filtered offsets are paired with metadata from a different packet
 
-**Severity:** Medium  
+**Severity:** Medium
+
 **Location:** `internal/source/ntp.go`, `hit` (449–488), `emit` (533–556); `internal/discipline/system.go:409–418`; `internal/discipline/filter.go`, stage data.
 
 **Problem:** A historical filter winner supplies offset/delay/At, while emit uses stratum, root delay/dispersion, reference identity/time, precision, and leap fields from the latest exchange. The resulting measurement need not describe any actual sample. Upstream reference changes at a stable network address are not a filter-reset boundary. When System starts using an old candidate, its advertised root dispersion also omits the elapsed age already included in selection distance.
@@ -328,3 +353,213 @@ This is an incremental review checkpoint. The final revision will include the co
 **Fix specification:** Distinguish latest association metadata from observation-specific quality, retaining enough stage metadata to assess a selected observation honestly. Reset or conservatively revalidate history when the upstream's reference/quality changes materially. Age uncertainty to the publication epoch at selection changes, without double aging on later ticks. Preserve external status names and wire format, and coordinate with the observation-age design in RA6X-001.
 
 **Verification:** Feed packets with distinct delays, offsets, root dispersion, and reference identities so an older stage wins; verify consistent quality bounds and timely current LI/reach metadata. Switch to an aged survivor and assert advertised dispersion is at least its correctly aged bound.
+
+## RA6X-026 — FreeBSD answers directed broadcasts as unicast requests
+
+**Severity:** Medium
+
+**Location:** `internal/server/pktinfo_freebsd.go`, `martianReceiveFlags` and `destination`; `internal/server/martian.go`, `martianDestination`.
+
+**Problem:** The FreeBSD receive path does not reject IPv4 interface broadcast destinations. It copies the received destination into IP_SENDSRCADDR, potentially replying with a broadcast source address. A broadcast request can solicit multiple servers; the martian counters and claimed unicast-only policy are incorrect on this platform.
+
+**Evidence:** `martianReceiveFlags` always returns false; `destination` returns false for every IP_RECVDSTADDR value; the shared check recognizes only limited broadcast and multicast. The FreeBSD source comment explicitly acknowledges the directed-broadcast hole, while the following destination comment incorrectly says the flags check catches it. The existing FreeBSD fixture failed in the prior target-host verification. This review did not send broadcasts or execute FreeBSD binaries.
+
+**Fix specification:** Identify directed broadcasts using receive-interface/address information and current interface broadcast configuration, with refresh on network changes and an explicit policy when metadata is unavailable. Reject before reply construction and count exactly one martian outcome. Preserve valid unicast addresses ending in .255, non-/24 subnets, IPv6, wildcard binding, and multihomed reply-source selection. Do not import nonexistent FreeBSD MSG_BCAST constants or use address-suffix heuristics.
+
+**Verification:** Run the existing FreeBSD martian fixture and controlled target-host packet captures for /24 and non-/24 directed broadcasts, limited broadcast, multicast, and valid secondary unicast addresses. Require zero broadcast replies and correct unicast reply source.
+
+## RA6X-027 — Required-key authentication failures bypass all response limiting
+
+**Severity:** Medium
+
+**Location:** `internal/server/responder.go:197–204`, `cryptoNAK`; `internal/server/ratelimit.go`.
+
+**Problem:** Invalid MACs from a require_key prefix can produce unlimited crypto-NAKs before the token bucket is consulted. A sender able to use or spoof such a source can force authentication work and replies at arrival rate. Moving verification before the legitimate peer's bucket fixed bucket poisoning but left this other path unbounded. These small replies are reflection traffic; the demonstrated issue is not packet-size amplification.
+
+**Evidence:** `TestVerification035CryptoNAKFloodIsBounded` receives 100 NAKs from 100 instantaneous bad-MAC requests with burst 8. The branch returns `h.cryptoNAK(...)` before `h.limiter.allow`. Require-key prefixes are not restricted to a handful of individual addresses despite the explanatory comment.
+
+**Fix specification:** Bound invalid-authentication work and NAK emission using a separate bounded budget that cannot consume legitimate authenticated clients' tokens. Preserve silent rejection of missing/wrong-but-valid keys where currently intentional, MAC verification before trusting key identity, ACL order, response-size bounds, and exactly-one terminal outcome accounting. Ensure all reply paths have a documented budget.
+
+**Verification:** Make the existing flood probe pass; flood absent, unknown, wrong, and known-invalid keys, then require a valid required-key request to succeed. Test IPv6 prefix aggregation, maximum table size, and independent listeners.
+
+## RA6X-028 — Optional authenticated clients share the unsigned client's bucket
+
+**Severity:** Medium
+
+**Location:** `internal/server/responder.go:216–234`; deployment examples using client keys without matching `serve.require_key`.
+
+**Problem:** When a key is optional, verification happens after bucket selection, so replyKey is nil and all requests from the address use key ID zero. Spoofed unsigned traffic can exhaust the allowance of a correctly authenticated client. Only the require_key configuration receives the protection claimed by the address-plus-key limiter abstraction.
+
+**Evidence:** `TestAstra6OptionalAuthHasIndependentBucket` consumes the unsigned allowance and then gets no normal response to a valid optional-key request from the same address. `limitKey := h.limiter.key(addr, keyIDOf(replyKey))` precedes optional verification.
+
+**Fix specification:** Give verified optional-key traffic its intended authenticated bucket, while retaining a separate admission budget that bounds crypto work from unauthenticated traffic. Coordinate with RA6X-027 rather than moving every verification ahead of every limit. Preserve optional authentication: configuring keys alone must not require all clients to authenticate. Never use an unverified trailer ID to allocate privileged tokens.
+
+**Verification:** Make the named probe pass; verify unsigned, valid optional, valid required, and invalid-MAC traffic cannot improperly consume each other's protected allowance and cannot create unbounded bucket entries.
+
+## RA6X-029 — Authenticated clients cannot authenticate this server's RATE replies
+
+**Severity:** Medium
+
+**Location:** `internal/server/responder.go:219–225`; `internal/source/ntp.go`, `exchange` authentication before `IsKiss`.
+
+**Problem:** RATE replies are always unsigned, even after successful required-key verification. Carillon's authenticated client consequently records bad authentication and never executes RATE backoff. Two instances can therefore fail to honor their own authenticated rate-control protocol.
+
+**Evidence:** The RATE path explicitly passes nil as the reply key. `TestAstra6AuthenticatedRATEIsAuthenticated` verifies a valid authenticated request's RATE response and finds no valid MAC. The client rejects missing MACs before interpreting the kiss code.
+
+**Fix specification:** Sign RATE replies to requests whose MAC and permitted identity have been verified; use the same established key and packet framing as normal authenticated responses. Integrate optional-key handling with RA6X-028. Preserve unsigned-client compatibility, KoD emission limits, anti-amplification bounds, origin echo, and silent drops where no KoD is due. Do not sign responses merely because a request claims a key ID.
+
+**Verification:** Make the named probe pass and add a full client/server test: exhaust the authenticated bucket, receive and authenticate RATE, then observe the client's next scheduled transmission honor the backoff.
+
+## RA6X-030 — RATE backoff is not consistently applied or cleared
+
+**Severity:** Medium
+
+**Location:** `internal/source/ntp.go`, `Run`, `handleKiss`, `ensureResolved`; `internal/source/poll.go`, `pollInterval`.
+
+**Problem:** A RATE inside iburst changes poll but does not stop the remaining two-second burst requests. RATE also mutates the configured PollMax; changing DNS address clears only kodMinPoll, so a replacement server inherits the previous server's expanded maximum and current long poll. The ±5% jitter can schedule below a newly asserted minimum interval.
+
+**Evidence:** The burst loop exits only for denial/cancellation. `handleKiss` assigns `n.cfg.PollMax = want`; address change resets the filter and kodMinPoll but not PollMax/current poll. `TestVerification017AddressChangeDropsKissMaximum` reproduces the persistent maximum. `pollInterval` applies symmetric jitter without a floor.
+
+**Fix specification:** Separate immutable configured bounds from association-specific effective bounds and the next-send deadline. End/reschedule iburst when RATE is accepted, enforce the chosen minimum on actual send times, and clear the old server's policy when endpoint identity changes. Preserve randomized scheduling, bounded DNS retry, ordinary iburst behavior, and legitimate configured long polls. Specify which state survives re-resolution to the same endpoint.
+
+**Verification:** Make the existing address-change probe pass. Capture send times for RATE on the first/middle/final burst request, repeated RATE, DNS replacement, same-address refresh, and normal adaptive polling; assert no request precedes the effective deadline.
+
+## RA6X-031 — An untrusted RATE can suppress polling for over a day
+
+**Severity:** Medium
+
+**Location:** `internal/source/ntp.go`, `handleKiss`; `internal/discipline/loop.go`, `MaxPoll`.
+
+**Problem:** A correctly matched but unauthenticated RATE can raise a normally short configured poll to exponent 17: 131072 seconds, about 36.4 hours. Randomized origins make blind off-path injection difficult, but an on-path sender or faulty server can still cause this avoidable availability loss. Ordinary configured long polling and externally demanded backoff are different trust decisions.
+
+**Evidence:** The only cap on the server's requested exponent is discipline.MaxPoll=17, and it overrides PollMax. [RFC 8633 §5.4](https://www.rfc-editor.org/rfc/rfc8633.html#section-5.4) recommends bounding accepted RATE backoff and a maximum exponent no greater than 13; that recommendation is stricter than this implementation. Origin matching is already present and must remain.
+
+**Fix specification:** Define a conservative cap for remotely demanded backoff, particularly unauthenticated RATE, independent of the legal operator-configured poll range. Preserve origin/address validation and authenticated DENY/RSTR semantics. Retain bounded continued polling or explicitly retire an unusable association with visible state; do not silently sleep for an attacker-selected day-scale interval.
+
+**Verification:** Test matched/mismatched origins and extreme signed poll values, authenticated and unsigned RATE, repeated RATE, and configured PollMax above/below the remote-backoff cap. Confirm actual retry deadlines and fallback/holdover visibility.
+
+## RA6X-032 — Control socket startup can delete ordinary files or unlink a live daemon
+
+**Severity:** High
+
+**Location:** `internal/control/server.go:44–69`, `Listen`; `internal/control/control_test.go`, stale-socket test.
+
+**Problem:** Any existing path that does not accept a Unix-socket connection within 500 ms is removed. A mistaken control path destroys a regular file; permissions, backlog exhaustion, or a timeout can also cause a live socket to be unlinked. The latter permits a second listener at the same pathname and defeats the daemon's single-instance check.
+
+**Evidence:** `os.Stat` does not check type, and every DialTimeout failure flows to os.Remove. `TestAstra6ListenPreservesRegularFile` creates a file containing a sentinel and confirms Listen replaces it with a socket. The ordinary stale-socket test itself uses a regular file, encoding the unsafe assumption.
+
+**Fix specification:** Use Lstat and reject non-socket paths, including symlinks. Only remove an owned stale socket after a narrowly classified connection-refused condition; permission errors and timeouts must fail startup without unlinking. Prevent check/unlink/bind races from removing a replacement inode or allowing competing clock owners, using an appropriate ownership/locking scheme. Preserve mode 0660, socket path, ErrInUse discoverability, and legitimate recovery from an abandoned socket.
+
+**Verification:** Make the named probe pass; use a real abandoned Unix socket for stale cleanup. Test regular files, directories, symlinks, permission denial, a busy live listener, and two concurrent starters. Confirm file contents and the original listener remain intact on every refusal.
+
+## RA6X-033 — Control calls ignore cancellation after connecting
+
+**Severity:** Medium
+
+**Location:** `internal/control/client.go:27–110`, `Call` and `WaitSync`.
+
+**Problem:** DialContext handles cancellation only while dialing. Once connected, a cancellable context with no deadline does not interrupt a blocked response read. An indefinite waitsync can hang after cancellation. WaitSync's own timeout is sent to the server but is not installed as a client context deadline; an unresponsive server may exceed it by ten seconds.
+
+**Evidence:** `TestAstra6CallHonorsCancellation` connects to a controlled listener, cancels, and finds Call still blocked after 200 ms; closing the connection is needed for cleanup. Call copies an existing deadline once but has no cancellation callback. WaitSync passes the original ctx to Call and relies on Request.Timeout.
+
+**Fix specification:** Tie established connection lifetime to context cancellation and derive a bounded context for nonzero WaitSync timeouts. Stop callbacks and close connections on every exit. Return errors that retain errors.Is cancellation/deadline semantics. Preserve timeout=0 as intentionally indefinite while ctx remains live and preserve retries only for missing/refused startup sockets.
+
+**Verification:** Make the named probe pass. Test cancellation before dial, after connect, during write/read, and a server that never answers; bound elapsed WaitSync time and check for leaked goroutines or callbacks.
+
+## RA6X-034 — Abandoned waitsync requests accumulate and can deadlock listener failure
+
+**Severity:** Medium
+
+**Location:** `internal/control/server.go`, `Serve`, `handle`, `dispatch(CmdWaitSync)`; `internal/engine/engine.go`, `Wait`.
+
+**Problem:** Each accepted client gets a goroutine. A zero-timeout waitsync clears deadlines and waits only on the daemon context, without detecting client disconnect. Local clients can accumulate indefinitely while unsynchronized. If Accept then fails for a non-timeout error, Serve waits for these handlers before returning, but their context is not cancelled until the caller learns Serve failed: an error-path deadlock.
+
+**Evidence:** The fatal Accept branch calls `s.wg.Wait()` without cancelling a handler context; dispatch passes the parent ctx directly to Engine.Wait. The five-second reply deadline helps only after Wait has finished. Normal request permissions restrict exposure to local socket-authorized users, but disconnect leaks also occur without hostile behavior.
+
+**Fix specification:** Give Serve a child context cancelled on every exit and bind each waiting request to connection closure. Bound concurrent clients/waiters or apply a documented admission policy. Keep writes bounded and ensure fatal listener failure reaches main promptly. Preserve legitimate long waitsync requests and the one-request/one-response protocol.
+
+**Verification:** Repeatedly connect, send waitsync 0, and disconnect while unsynchronized; require waiter counts to return to baseline. Inject fatal Accept failure with a live waiter and require prompt Serve return, handler cleanup, and daemon cancellation.
+
+## RA6X-035 — Positive infinity and unrepresentable durations pass configuration validation
+
+**Severity:** Medium
+
+**Location:** `internal/config/config.go`, `Validate`, `validateServe`; `internal/server/responder.go`, `NewHandler`; `cmd/carillon/main.go`, float-to-duration configuration conversion; `cmd/carillonctl/main.go`, waitsync argument parsing.
+
+**Problem:** Several checks reject NaN through comparisons but accept positive infinity. Infinite holdover prevents expiry, infinite stability spread disables its guard, and infinite rate/burst values undermine limiting. Huge finite seconds can overflow time.Duration; tiny positive seconds can round to zero and silently select a default. CLI waitsync also needs finite/range validation before duration conversion.
+
+**Evidence:** DriftStableSeconds/Spread, HoldoverMax, Step.Panic, RateLimitPPS, and RateBurst use one-sided positive comparisons with no IsInf check. Main directly casts DriftStableSeconds*1e9 to time.Duration. TOML supports `inf`; public constructor callers can also provide math.Inf(1). This differs from refclock offsets, whose validation explicitly checks IsNaN/IsInf.
+
+**Fix specification:** Validate finiteness and meaningful representable ranges at config, CLI, and public constructor boundaries. Reject overflow and unintended zero-after-rounding rather than defaulting after conversion. Keep explicit zero meanings such as CLI waitsync 0 and stats keep_days 0. Preserve existing valid settings, TOML names, defaults, and documented frequency clamps; cover all float fields systematically.
+
+**Verification:** Table-test NaN, ±Inf, maximum representable seconds, just-overflowing finite values, sub-nanosecond values, and normal boundary settings through both Parse and constructors. Ensure invalid configs fail before sockets/devices/clock mutations and limiter state never becomes nonfinite.
+
+## RA6X-036 — Presence-sensitive refclock validation silently ignores explicit settings
+
+**Severity:** Low
+
+**Location:** `internal/config/config.go`, `Parse`, `validateGPSRefclock`, refclock-type validation.
+
+**Problem:** Validation relies on decoded values instead of whether a type-specific key was present. Explicit zero/empty values for keys belonging to another refclock type silently pass. This contradicts strict validation and can hide a misplaced calibration or GPS configuration. PPS-specific settings with pps=none likewise need an explicit documented policy.
+
+**Evidence:** The six cases in `TestVerification021RejectsExplicitGPSOnlyZeros` still fail. For example, GPS validation rejects offset only when `r.Offset != 0`; a supplied offset=0 is indistinguishable from absence. Nonzero equivalents are rejected, making diagnostics value-dependent.
+
+**Fix specification:** Retain TOML key presence and reject explicitly supplied inapplicable keys consistently, with a precise source/type/key error. Distinguish parsing policy from programmatically constructed config defaults. Preserve valid defaults, existing key names, correct pps_offset/nmea_offset behavior, and intentionally supported pps=none settings; document any compatibility exception rather than silently ignoring a key.
+
+**Verification:** Run the existing six-case fixture, then test absent, zero, empty, and nonzero variants for both types and GPS with/without PPS. Confirm all shipped examples continue parsing.
+
+## RA6X-037 — DNS address choice can pin an association to an unusable endpoint
+
+**Severity:** Medium
+
+**Location:** `internal/source/ntp.go`, `resolve`, `ensureResolved`, `pollOnce`.
+
+**Problem:** Only the first DNS answer is ever selected. Re-resolution may return the same unusable first answer despite a healthy alternative. Worse, network-unreachable and other general network errors do not increment consecutiveTimeouts, so they never trigger re-resolution at all. A dual-stack or multihomed hostname can remain unusable indefinitely.
+
+**Evidence:** resolve returns addrs[0]. ensureResolved returns early while haveAddr && consecutiveTimeouts<resolveAfterTimeouts. Only errTimeout and ECONNREFUSED update that counter; ENETUNREACH/EHOSTUNREACH reach the generic error branch. There is no list of alternate addresses or attempted-endpoint state.
+
+**Fix specification:** Retain/rotate usable DNS answers on relevant reachability failures, distinguish temporary DNS failure from endpoint failure, and periodically retry without abandoning a healthy association unnecessarily. Reset endpoint-specific filter/RATE state when changing peers (RA6X-030). Preserve literal IP behavior, bounded retries, address-family support, request authentication, and one active exchange per source.
+
+**Verification:** Use injected lookup/exchange seams with first-answer-unreachable/second-answer-healthy, stable answer ordering, DNS changes, all answers failing, transient DNS failure with a still-good cached address, and recovery. Require eventual use of the healthy endpoint without tight retry loops.
+
+## RA6X-038 — Selection has no local timing-loop rejection
+
+**Severity:** Medium
+
+**Location:** `internal/source/ntp.go`, `exchange` and `emit`; `internal/discipline/select.go`, `candidate`; `internal/discipline/system.go`, reference-ID publication.
+
+**Problem:** A peer reporting this host as its reference is still eligible. After losing a real upstream, two mutually configured instances can begin selecting each other's retained time and misrepresenting independence while stratum/uncertainty eventually grow. Configured self-addresses are also not rejected. Distance/stratum limits bound some outcomes but do not replace detecting the loop at admission.
+
+**Evidence:** Exchange checks origin, authentication, stratum, LI, timestamps, delay, and distance; neither it nor candidate compares the peer's RefID with local interface identities. RefID is retained only for status and propagation. [RFC 5905's fitness test](https://www.rfc-editor.org/rfc/rfc5905.html#appendix-A.5.5.3) includes a local-reference loop check. IPv6 reference IDs require the protocol's hashed-address representation.
+
+**Fix specification:** Carry sufficient local endpoint identity to reject direct self-synchronization and a peer whose reference points back to this daemon. Define handling for multihomed hosts, IPv4-mapped addresses, IPv6 hash collisions, NAT, and stratum-1 textual IDs; avoid treating all equal upstream references as loops. Preserve ordinary shared-upstream configurations and read-only querying of the local server.
+
+**Verification:** Simulate two instances with a real reference, remove it, and require the circular candidate to be rejected promptly. Test IPv4/IPv6, multiple local addresses, legitimate peers sharing a third reference, local query, and reference changes.
+
+## RA6X-039 — Device identity checks use path spelling instead of the underlying device
+
+**Severity:** Medium
+
+**Location:** `internal/config/refclock_check_linux.go`, `checkRefclockPlatform`; `internal/config/config.go`, refclock validation/checks; `internal/pps/pps_linux.go`, `Open`, `linuxPPSPath`.
+
+**Problem:** Linux's same-tty GPS/PPS prohibition is enforced only by string equality. Aliases can bypass it and allow N_PPS to replace the NMEA tty discipline. Independently configured refclocks can also open one serial/PPS device twice, compete for bytes, or overwrite device parameters. Conversely, a valid PPS symlink whose basename is not pps followed by digits is misclassified as a tty and fails to open.
+
+**Evidence:** The platform check compares `r.PPS == r.Device`; linuxPPSPath recognizes only a basename pattern. No global device-identity ownership map exists. These branches are confirmed statically; alias/hotplug behavior and shared FreeBSD device operation need target-device verification.
+
+**Fix specification:** Resolve/classify device identity using actual device metadata/capabilities, track ownership across configured refclocks, and reject incompatible duplicate use. Allow the explicitly supported FreeBSD GPS/PPS sharing arrangement. Preserve operator-facing aliases and hotplug/reconnect behavior; revalidate identity when reopening an alias that can be retargeted. Do not solve this by globally forbidding symlinks.
+
+**Verification:** Use controlled aliases and platform-specific fake/open seams for one tty under two names, duplicate GPS blocks, differing PPS edges on one device, and a /dev/ppsN alias. On hardware, confirm supported FreeBSD sharing and restoration of tty state after every failure.
+
+## RA6X-040 — Negative root-delay interoperability needs an explicit representation policy
+
+**Severity:** Medium — **Needs investigation: peer/version interoperability**
+
+**Location:** `internal/ntp/time.go`, `Short.Seconds`; `internal/ntp/packet.go`, RootDelay; `internal/source/ntp.go`, root-distance validation.
+
+**Problem:** RootDelay uses the same unsigned short-format conversion as RootDispersion. A peer encoding a small negative root delay is interpreted as roughly 65536 seconds and rejected. Historic NTP documentation permits signed root delay, whereas RFC 5905 describes short format as unsigned; resolve the actual supported v1–v4 wire behavior before changing the shared type.
+
+**Evidence:** A raw RootDelay of 0xffff0000 decodes as +65535 rather than -1. [RFC 4330 §4](https://www.rfc-editor.org/rfc/rfc4330.html#section-4), superseded by RFC 5905, explicitly describes signed root delay and possible small negative values. Current code has no field-specific signed conversion. No affected live-peer capture was obtained in this review.
+
+**Fix specification:** Check supported ntpd/chrony implementations and relevant protocol versions. If signed root delay is required for interoperability, add a field-specific decode/encode policy and safe distance handling; keep dispersion unsigned and nonnegative. Preserve public numeric units and packet sizes, and reject genuinely excessive or malicious negative values rather than allowing them to cancel uncertainty.
+
+**Verification:** Compare actual peer packets and add raw-bit tests around zero, small negatives, maximum positives, and negative-delay-plus-dispersion combinations for each supported version. Confirm ordinary unsigned root dispersion remains unchanged.
