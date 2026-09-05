@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"carillon/internal/discipline"
 	"carillon/internal/engine"
 	"carillon/internal/ntp"
 	ntpserver "carillon/internal/server"
@@ -66,6 +67,14 @@ type Recorder struct {
 	lastUpdates int
 	lastPulse   map[string]time.Time
 	lastErrLog  time.Time
+
+	// horizon is the retention clock: the latest wall time seen while the
+	// discipline vouched for it. Rows are still labelled with the time of
+	// the observation they describe, but destructive retention only ever
+	// runs from this, so a future RTC at boot — or a misdated source row —
+	// cannot erase the archive (RA6X-046). It never moves backwards.
+	horizon     time.Time
+	haveHorizon bool
 }
 
 // New returns a recorder for an already-validated directory.
@@ -137,6 +146,7 @@ func (r *Recorder) process(st *engine.Status) error {
 	if st.Now.IsZero() {
 		return nil
 	}
+	r.noteHorizon(st)
 	if st.Updates > 0 && st.Updates != r.lastUpdates {
 		if err := r.writeLoop(st); err != nil {
 			return err
@@ -276,7 +286,7 @@ func (r *Recorder) file(kind string, at time.Time, header string) (*dailyFile, e
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("stats: creating %s: %w", dir, err)
 	}
-	r.prune(at)
+	r.pruneTrusted()
 	path := filepath.Join(dir, kind+".tsv")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -299,9 +309,40 @@ func (r *Recorder) file(kind string, at time.Time, header string) (*dailyFile, e
 	return df, nil
 }
 
+// noteHorizon advances the retention clock. Only a snapshot the discipline
+// reports as SYNCED counts: that is the state in which the daemon is
+// asserting the wall clock is right, and it is reached only after settling,
+// so it also excludes the interval around a large startup step. The horizon
+// never retreats, so an unsynchronized excursion cannot pull retention
+// backwards either.
+func (r *Recorder) noteHorizon(st *engine.Status) {
+	if st.State != discipline.StateSynced || st.Now.IsZero() {
+		return
+	}
+	if !r.haveHorizon || st.Now.After(r.horizon) {
+		r.horizon, r.haveHorizon = st.Now, true
+	}
+}
+
+// pruneTrusted runs retention from the horizon rather than from the time of
+// the row being written. Until the clock has been synchronized once, nothing
+// is removed: an RTC reading 2099 at boot would otherwise delete every
+// retained day on the first minute tick. Recording itself is never withheld —
+// unsynchronized observations are still written, under their own dates.
+//
+// Because the horizon can lag the row's date, retention keeps at least
+// keep_days and sometimes a little more. That is the safe direction.
+func (r *Recorder) pruneTrusted() {
+	if !r.haveHorizon {
+		return
+	}
+	r.prune(r.horizon)
+}
+
 // prune removes day directories older than KeepDays, and any year and month
 // directories left empty behind them. It runs at rotation, which is at most
 // once a day per kind, so walking the tree costs nothing that matters.
+// Callers reach it through pruneTrusted, which supplies a trusted time.
 func (r *Recorder) prune(at time.Time) {
 	if r.keepDays <= 0 {
 		return

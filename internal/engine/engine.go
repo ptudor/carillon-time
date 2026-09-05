@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -267,23 +268,65 @@ func readDrift(path string) (float64, error) {
 	return v, nil
 }
 
+// driftTempPattern is the os.CreateTemp pattern writeDrift uses. It is
+// derived from the destination's own name so that two carillon instances
+// sharing a state directory cannot see each other's temporaries as garbage,
+// and so that no configured destination can match the sweep's glob: a name of
+// the form ".<base>-tmp-<digits>" is always longer than "<base>".
+func driftTempPattern(path string) string {
+	return "." + filepath.Base(path) + "-tmp-*"
+}
+
+// driftTempName matches exactly what os.CreateTemp produces from that
+// pattern: the literal prefix followed by the decimal digits of a random
+// number, and nothing else. Anything else in the directory — including a
+// drift file the operator happened to name .drift-calibrated — is not this
+// writer's and is never removed.
+var driftTempName = regexp.MustCompile(`-tmp-[0-9]+$`)
+
+// legacyDriftTempName matches the temporaries carillon wrote before the
+// pattern became destination-specific. They are only swept when the
+// destination is the default "drift", which is the only case in which they
+// provably belonged to it.
+var legacyDriftTempName = regexp.MustCompile(`^\.drift-[0-9]+$`)
+
 // sweepDriftTemps removes leftover drift temporaries. writeDrift is atomic —
 // write, fsync, rename — but a SIGKILL or a power cut between CreateTemp and
-// Rename leaves a .drift-NNNN file behind, and nothing else ever removes one.
-// A year of unclean shutdowns leaves clutter in the state directory that
-// -check cannot explain. Only files older than a minute are removed, so a
-// concurrent write by another instance is left alone.
+// Rename leaves one behind, and nothing else ever removes it. A year of
+// unclean shutdowns leaves clutter in the state directory that -check cannot
+// explain.
+//
+// Every candidate must clear four tests before it is removed (RA6X-015):
+// its name must be one this writer generates, it must be a regular file
+// (Lstat, so a symlink is never followed and a directory is never touched),
+// it must not be the configured destination itself by device and inode, and
+// it must be older than a minute so a concurrent write is left alone. The
+// filename is operator-configurable, so the destination can legitimately look
+// like a temporary; deleting it would throw away the host's calibration.
 func sweepDriftTemps(path string, now time.Time, log *slog.Logger) {
 	if path == "" {
 		return
 	}
-	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".drift-*"))
+	dir := filepath.Dir(path)
+	dest, destErr := os.Lstat(path)
+	sweepLegacy := filepath.Base(path) == "drift"
+
+	matches, err := filepath.Glob(filepath.Join(dir, ".*"))
 	if err != nil {
 		return
 	}
 	for _, m := range matches {
-		info, err := os.Stat(m)
-		if err != nil || now.Sub(info.ModTime()) < time.Minute {
+		base := filepath.Base(m)
+		mine := strings.HasPrefix(base, "."+filepath.Base(path)+"-tmp-") && driftTempName.MatchString(base)
+		if !mine && !(sweepLegacy && legacyDriftTempName.MatchString(base)) {
+			continue
+		}
+		info, err := os.Lstat(m)
+		if err != nil || !info.Mode().IsRegular() || now.Sub(info.ModTime()) < time.Minute {
+			continue
+		}
+		if destErr == nil && os.SameFile(dest, info) {
+			log.Debug("not removing the configured drift file", "path", m)
 			continue
 		}
 		if err := os.Remove(m); err != nil {
@@ -297,7 +340,7 @@ func sweepDriftTemps(path string, now time.Time, log *slog.Logger) {
 // writeDrift persists the frequency atomically (write, fsync, rename).
 func writeDrift(path string, ppm float64) error {
 	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".drift-*")
+	f, err := os.CreateTemp(dir, driftTempPattern(path))
 	if err != nil {
 		return err
 	}

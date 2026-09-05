@@ -370,6 +370,10 @@ func runDaemon(args []string) int {
 		log.Error("control socket", "error", err)
 		return exitRuntime
 	}
+	// Listen holds an exclusive lock on the control path for as long as the
+	// daemon runs; release it on every exit, including the ones that never
+	// reach Serve.
+	defer ctl.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
