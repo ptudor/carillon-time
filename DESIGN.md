@@ -587,19 +587,34 @@ Per update with `θ = θ_sys`:
 if the step policy fires (§6.6) and a step is permitted: Step(θ); pending = 0; Reset() every source; return
 if synced and |θ − θ_prev| > 3·ψ_clk and μ < 2P: ignore it (popcorn spike); return
 ψ_clk   = exp. average (weight 1/8) of |θ − θ_prev|, floored at the clock precision
+          first update: |θ|/√8, not |θ| — otherwise a 100 ms initial offset is
+          reported as 100 ms of clock jitter and is still 26 ms out twenty
+          updates later. The update after a step is skipped: θ_prev is zero
+          then and the difference describes nothing.
 pending = θ                                       # replace, don't accumulate
 if |θ| ≤ max_slew·τ:                              # linear region only — see anti-windup
     freq += θ · min(μ, 2048) / (4τ²) · 1e6        # 2048 s = Allan intercept
 freq    = clamp(freq, ±500)
 ```
 
-Every second (engine ticker):
+An update issues no frequency word of its own. Writing the base alone would
+remove the phase transient the previous tick applied and pause the slew until
+the next one — about 6 % of the slew capacity with a PPS at poll 4 — so the
+new base plus the transient for the new pending phase is issued by the tick
+that follows, at most one tick away.
+
+Every second (engine ticker), charging the **real** elapsed time `dt` since
+the previous tick rather than a nominal second, because the kernel ran at the
+transient for however long the ticker actually took. `dt` is clamped to
+`[0, 2 s]`; a longer gap is a stall of unknown length and is charged one
+second, since over-debiting the phase would leave a correction that was never
+applied believed to be done.
 
 ```
 adj      = clamp(pending / τ, ±max_slew)          # max_slew = max_slew_ppm · 1e-6
 total    = clamp(freq + adj·1e6, ±500)            # the kernel's own limit
-pending -= (total − freq)·1e-6                    # only what the clamp let through
-SetFrequency(total)                               # holds for one second
+pending -= (total − freq)·1e-6 · dt               # only what the clamp let through, for dt
+SetFrequency(total)                               # holds until the next tick
 ```
 
 **Why these gains.** With phase gain 1/τ and integral gain K, the closed

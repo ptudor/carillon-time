@@ -30,8 +30,81 @@ func TestLoopFirstUpdate(t *testing.T) {
 	if l.Pending != 0.010 || l.Updates != 1 {
 		t.Fatalf("pending %v updates %d", l.Pending, l.Updates)
 	}
-	if a, ok := hasAction(u.Actions, ActionSetFrequency); !ok || a.Value != 12.5 {
-		t.Fatalf("frequency must be re-issued unchanged on the first update: %+v", u.Actions)
+	// An update issues no frequency action of its own: writing the base
+	// alone would remove the phase transient the last Tick applied and
+	// pause the slew until the next one. The Tick that follows carries the
+	// new base plus the transient for the new pending phase.
+	if a, ok := hasAction(u.Actions, ActionSetFrequency); ok {
+		t.Fatalf("update issued a frequency action of %v ppm", a.Value)
+	}
+	if a, ok := hasAction(l.Tick(1001), ActionSetFrequency); !ok || a.Value <= 12.5 {
+		t.Fatalf("the next tick must carry the base plus the transient: %v", a.Value)
+	}
+	// RF5X-025: the first update's jitter is the offset averaged in from
+	// the precision floor, not the whole offset.
+	if want := 0.010 / math.Sqrt(jitterAverage); math.Abs(l.Jitter-want) > 1e-12 {
+		t.Fatalf("first-update jitter %v, want %v", l.Jitter, want)
+	}
+}
+
+// TestLoopJitterSeedAndStep covers RF5X-025: a 100 ms initial offset must not
+// be reported as 100 ms of clock jitter, and the update after a step must not
+// treat the zeroed lastOffset as a real change.
+func TestLoopJitterSeedAndStep(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	l.Update(0.100, 6, 0, false, true)
+	if want := 0.100 / math.Sqrt(jitterAverage); math.Abs(l.Jitter-want) > 1e-12 {
+		t.Fatalf("first-update jitter %v, want about %v (35 ms)", l.Jitter, want)
+	}
+
+	l = NewLoop(loopCfg(), 0, true)
+	l.Update(0.001, 6, 0, false, true)
+	l.Update(0.001, 6, 64, false, true)
+	before := l.Jitter
+	if u := l.Update(2.0, 6, 128, false, true); !u.Stepped {
+		t.Fatal("expected a step")
+	}
+	if l.Jitter != before {
+		t.Fatalf("a step changed the jitter estimate: %v -> %v", before, l.Jitter)
+	}
+	l.Update(0.002, 6, 192, false, true)
+	if l.Jitter != before {
+		t.Fatalf("the update after a step must not fold in the zeroed lastOffset: %v -> %v", before, l.Jitter)
+	}
+	l.Update(0.003, 6, 256, false, true)
+	if l.Jitter == before {
+		t.Fatal("ordinary updates must still move the jitter estimate")
+	}
+}
+
+// TestLoopTickChargesRealElapsedTime covers RF5X-011: the kernel runs at the
+// transient for however long the engine's ticker actually took, so a late
+// tick must debit the phase for that interval, not for a nominal second.
+func TestLoopTickChargesRealElapsedTime(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	l.Update(0.010, 6, 0, false, true) // tau = 256
+	l.Tick(1)                          // first tick: charged one second
+	adj := l.Pending / l.tau
+	pending := l.Pending
+	l.Tick(1 + maxTickInterval) // late, but inside the accounting window
+	if want := pending - maxTickInterval*adj; math.Abs(l.Pending-want) > 1e-15 {
+		t.Fatalf("pending %v after a %.0f s tick, want %v", l.Pending, maxTickInterval, want)
+	}
+
+	// A stall of unknown length is charged one second rather than
+	// over-debiting a correction that was never applied.
+	pending = l.Pending
+	adj = pending / l.tau
+	l.Tick(1 + maxTickInterval + 10)
+	if want := pending - adj; math.Abs(l.Pending-want) > 1e-15 {
+		t.Fatalf("pending %v after a stall, want %v", l.Pending, want)
+	}
+
+	// Time that has not moved debits nothing.
+	pending = l.Pending
+	l.Tick(1 + maxTickInterval + 10)
+	if l.Pending != pending {
+		t.Fatalf("a zero-length tick debited the phase: %v -> %v", pending, l.Pending)
 	}
 }
 

@@ -416,3 +416,53 @@ and `disagrees with ntp by 0.120`; NTP at θ = 0.100 ± 2 ms with a PPS at
 PPS, which is exactly the wrong-edge signature. The hardware check (swap
 `edge`, confirm the daemon logs the disagreement and does not go to stratum 1)
 remains a target-host step.
+
+## RF5X-011 — Loop.Tick assumes exactly one second; Update drops the transient — FIXED
+
+**Changed.** `Loop.Tick(now)` now computes the real elapsed time since the
+previous tick and debits `Pending -= actual·dt` / `slewed += actual·dt`
+instead of assuming one second. `dt` is clamped to `[0, maxTickInterval]`
+(2 s); a longer gap is treated as one second, because over-debiting the phase
+would leave a correction that was never applied believed done. The first tick
+of a run is charged one second. `Loop.Update` no longer emits a frequency
+action at all — writing the base alone removed the transient the last tick
+applied and paused the slew for up to a second — so the following tick carries
+the new base plus the transient for the new pending phase. The ±`MaxSlewPPM`
+and ±500 ppm clamps are unchanged, and `TestLoopTickSlew`'s exponential
+approach still holds with `dt = 1`.
+
+`internal/discipline` still does no logging (hard rule 6), so the stall the
+review asks to be logged is only clamped here; the operator sees it as a
+tick-to-tick gap in `loop.tsv`.
+
+**Note on the verification.** The fix specification says to clamp `dt` to
+`[0, 2 s]` and treat anything larger as one second, but its verification asks
+for a 3 s tick to debit `3 × adj`. Those cannot both hold. The clamp is the
+normative half, so the test uses a 2 s late tick (charged in full), a gap
+beyond the clamp (charged one second), and a zero-length tick (charged
+nothing).
+
+**Files.** `internal/discipline/loop.go`, `loop_test.go`, `sim_test.go`,
+`DESIGN.md` §6.4.
+
+**Verification.** PASS. `TestLoopTickChargesRealElapsedTime` covers the three
+cases above. `TestSimTolerantOfTickJitter` runs the five-hour convergence
+simulation with every simulated second varying by ±200 ms (true time and the
+loop's accounting both use the real interval) and asserts the steady-state RMS
+is unchanged: 27.0 µs with an even ticker, 28.1 µs with the jitter.
+
+## RF5X-025 — First-update jitter equals the whole initial offset — FIXED
+
+**Changed.** The first loop update seeds the jitter estimate as
+`max(precision, |θ|/√8)` — the same exponential average run from the precision
+floor, as ntpd does — instead of taking the whole offset. The update following
+a step no longer folds in its difference at all, because `step()` zeroes
+`lastOffset` and the difference then describes nothing. The averaging constant
+is unchanged.
+
+**Files.** `internal/discipline/loop.go`, `loop_test.go`, `DESIGN.md` §6.4.
+
+**Verification.** PASS. `TestLoopJitterSeedAndStep` asserts a 100 ms initial
+offset gives ≈35 ms of jitter (0.100/√8), that a step leaves the estimate
+untouched, that the update after it does too, and that ordinary updates still
+move it.
