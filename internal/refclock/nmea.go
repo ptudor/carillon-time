@@ -197,8 +197,19 @@ func (n *NMEA) Run(ctx context.Context, out chan<- discipline.Measurement) error
 		read, err := n.reader.ReadTimeout(buf, nmeaReadTimeout)
 		switch {
 		case err == nil:
+			// The epoch is captured around the clock read that fixes the
+			// arrival time, not later at byte framing: reading the arrival
+			// first and the epoch afterwards let a step land in between and
+			// stamp a pre-step arrival with the post-step epoch (RA6X-006).
+			// A settled epoch that did not change across the read is the
+			// only one this chunk may be attributed to.
+			gen := n.generation()
 			wall, mono := n.clk.Now(), n.clk.Monotonic()
-			for _, m := range n.consume(buf[:read], wall, mono) {
+			if after := n.generation(); after != gen || (gen != 0 && !source.StableEpoch(gen)) {
+				n.discardChunk(after)
+				continue
+			}
+			for _, m := range n.consume(buf[:read], wall, mono, gen) {
 				if !n.emit(ctx, out, m) {
 					return nil
 				}
@@ -273,16 +284,28 @@ func (n *NMEA) closeReader() {
 	}
 }
 
+// discardChunk drops a read whose arrival timestamp spans a clock
+// discontinuity, along with the partial sentence and the offset window built
+// against the old epoch.
+func (n *NMEA) discardChunk(now uint64) {
+	n.staleSeen++
+	n.haveLine = false
+	n.resetWindow()
+	n.updateInfo(func(i *source.Info, _ *source.RefclockInfo) { i.Stale++ })
+	n.log.Info("discarding serial data that spans a clock step", "count", n.staleSeen, "generation", now)
+}
+
 // consume frames sentences while preserving the wall/monotonic timestamp of
-// the read that delivered each '$' start character.
-func (n *NMEA) consume(chunk []byte, wall time.Time, mono float64) []discipline.Measurement {
+// the read that delivered each '$' start character, and the clock epoch that
+// read was taken in.
+func (n *NMEA) consume(chunk []byte, wall time.Time, mono float64, gen uint64) []discipline.Measurement {
 	var out []discipline.Measurement
 	for _, b := range chunk {
 		switch {
 		case b == '$':
 			n.line = append(n.line[:0], b)
 			n.lineWall, n.lineMono, n.haveLine = wall, mono, true
-			n.lineGen = n.generation()
+			n.lineGen = gen
 		case !n.haveLine:
 			continue
 		case b == '\n' || b == '\r':

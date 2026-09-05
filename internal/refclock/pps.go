@@ -232,7 +232,12 @@ func (p *PPS) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 		s, err := p.reader.Fetch(defaultFetchTimeout)
 		switch {
 		case err == nil:
-			if now := p.generation(); now != gen {
+			// The pulse is usable only if the epoch was the same settled
+			// value before and after the fetch. An unchanged but odd epoch
+			// means a discontinuity was executing throughout, so the
+			// kernel's timestamp straddles it even though the counter did
+			// not move (RA6X-006).
+			if now := p.generation(); now != gen || (now != 0 && !source.StableEpoch(now)) {
 				// The clock was stepped while we waited for this edge, so
 				// the kernel's timestamp for it is on the wrong side of the
 				// step. Drop the pulse rather than let it into the window.

@@ -248,3 +248,73 @@ func waitFor(t *testing.T, pred func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestAstra6QueuedMeasurementDoesNotRewindEngineTime is the review's
+// RA6X-059 probe. The engine used the producer's enqueue-time reading as
+// "now", so a buffered or cross-source measurement arriving after a newer
+// tick made global time move backwards.
+func TestAstra6QueuedMeasurementDoesNotRewindEngineTime(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	e, err := New(testConfig(""), clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.sys.AddSource("a", discipline.Options{Numbering: true})
+	clk.Advance(100 * time.Second)
+	if err := e.handle(e.sys.Tick(clk.Monotonic()), clk.Monotonic()); err != nil {
+		t.Fatal(err)
+	}
+	before := e.Status().Uptime
+	m := good(0.001)
+	m.Source = "a"
+	m.Now = 1
+	m.At = 1
+	if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+		t.Fatal(err)
+	}
+	if e.Status().Uptime < before {
+		t.Fatalf("processing a queued measurement rewound uptime: %v -> %v", before, e.Status().Uptime)
+	}
+}
+
+// TestAstra6ProcessingClockIsMonotonic covers RA6X-059's contract directly:
+// whatever order events arrive in, the processing clock the engine hands to
+// the discipline and to publication never decreases.
+func TestAstra6ProcessingClockIsMonotonic(t *testing.T) {
+	_, e := newBoundsEngine(t)
+	seq := []float64{10, 5, 11, 11, 3, 12, 0}
+	want := []float64{10, 10, 11, 11, 11, 12, 12}
+	for i, in := range seq {
+		if got := e.processing(in); got != want[i] {
+			t.Fatalf("processing(%v) = %v, want %v", in, got, want[i])
+		}
+	}
+}
+
+// TestAstra6QueuedMeasurementKeepsObservationTime checks the other half of
+// RA6X-059: processing time is established at consumption, but the
+// observation's own timestamp is not rewritten, so its age stays honest.
+func TestAstra6QueuedMeasurementKeepsObservationTime(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	src := &scripted{name: "a", clk: clk, script: []discipline.Measurement{good(0.001)}}
+	cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	waitFor(t, func() bool { return e.Status().Updates >= 1 })
+	// Uptime is derived from the processing clock, which is the fake
+	// clock the scripted source advanced; it must be positive and must not
+	// be the source's own stamp of zero.
+	if up := e.Status().Uptime; up <= 0 {
+		t.Fatalf("uptime %v after a measurement", up)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

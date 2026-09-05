@@ -125,7 +125,7 @@ type Engine struct {
 	order   []string
 
 	meas   chan discipline.Measurement
-	reqs   chan func()
+	reqs   chan func() error
 	status atomic.Pointer[Status]
 
 	tick           time.Duration // ticker period; one second outside tests
@@ -143,10 +143,20 @@ type Engine struct {
 	// rather than what the kernel took (RA6X-016).
 	appliedFreq     float64
 	haveAppliedFreq bool
-	lastDriftWrite  float64
-	driftErrShown   bool
-	lastLeapWall    time.Time
-	lastFileLeap    ntp.Leap
+
+	// procNow is the engine's processing clock: the monotonic time at which
+	// the event now being handled is being consumed, held nondecreasing.
+	// Measurements carry the producer's own timestamp, and a buffered or
+	// cross-source one can arrive after a newer tick; using it as "now"
+	// understated candidate ages, restarted expired timeouts and made
+	// uptime and root uncertainty regress while the real clock advanced
+	// (RA6X-059). Observation time stays in Measurement.At.
+	procNow        float64
+	haveProcNow    bool
+	lastDriftWrite float64
+	driftErrShown  bool
+	lastLeapWall   time.Time
+	lastFileLeap   ntp.Leap
 
 	gen        *atomic.Uint64
 	staleDrops map[string]uint64
@@ -154,6 +164,11 @@ type Engine struct {
 	// sourceErrors holds the reason a source's goroutine is not running,
 	// overlaid on its own Info snapshot until it is running again.
 	sourceErrors map[string]string
+
+	// restarting names the sources whose goroutine is being started again
+	// but has not yet delivered anything. Their recorded failure survives
+	// until it does, so health rests on fresh evidence.
+	restarting map[string]bool
 
 	// freqHistory is the recent base frequency, for the drift-file gate.
 	freqHistory    []freqSample
@@ -190,8 +205,10 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 		gen = new(atomic.Uint64)
 	}
 	// Generation 0 means "unstamped" and is never stale, so the live
-	// counter starts at 1.
-	gen.CompareAndSwap(0, 1)
+	// counter starts at the first settled epoch. Even values are settled
+	// epochs; an odd value means a discontinuity is executing. See the
+	// epoch protocol in internal/source.
+	gen.CompareAndSwap(0, source.FirstEpoch)
 
 	e := &Engine{
 		cfg:          cfg,
@@ -200,11 +217,12 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 		sys:          discipline.New(cfg.Discipline, freq, known),
 		sources:      make(map[string]SourceSpec, len(cfg.Sources)),
 		meas:         make(chan discipline.Measurement, 64),
-		reqs:         make(chan func(), 16),
+		reqs:         make(chan func() error, 16),
 		tick:         time.Second,
 		gen:          gen,
 		staleDrops:   make(map[string]uint64, len(cfg.Sources)),
 		sourceErrors: make(map[string]string, len(cfg.Sources)),
+		restarting:   make(map[string]bool, len(cfg.Sources)),
 	}
 	for _, s := range cfg.Sources {
 		name := s.Source.Name()
@@ -423,28 +441,43 @@ loop:
 		case <-ctx.Done():
 			break loop
 		case m := <-e.meas:
+			// Processing time is established here, at consumption, not
+			// taken from the producer's enqueue-time reading, and a leap
+			// boundary is processed before the measurement is admitted:
+			// both change whether this observation may be used at all.
+			now := e.processing(e.clk.Monotonic())
+			e.crossLeap(now)
 			if e.stale(m) {
 				continue
 			}
-			if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			e.noteSourceAlive(m.Source)
+			m.Now = now
+			if err := e.handle(e.sys.Update(m), now); err != nil {
 				runErr = err
 				break loop
 			}
 		case <-ticker.C:
-			now := e.clk.Monotonic()
+			now := e.processing(e.clk.Monotonic())
+			e.crossLeap(now)
 			if err := e.handle(e.sys.Tick(now), now); err != nil {
 				runErr = err
 				break loop
 			}
 			e.maybeWriteDrift(now, false)
 		case f := <-e.reqs:
-			f()
+			// Lifecycle work runs on this goroutine like everything else,
+			// and a fatal result from it reaches the same shutdown path a
+			// fatal result from a measurement does (RA6X-017).
+			if err := f(); err != nil {
+				runErr = err
+				break loop
+			}
 		}
 	}
 	cancel()
 	wg.Wait()
 	e.restoreBaseFrequency(runErr)
-	e.maybeWriteDrift(e.clk.Monotonic(), true)
+	e.maybeWriteDrift(e.processing(e.clk.Monotonic()), true)
 	return runErr
 }
 
@@ -480,6 +513,17 @@ func (e *Engine) restoreBaseFrequency(runErr error) {
 		"ppm", base, "abandoned_slew_ppm", applied-base, "abandoned_phase", e.sys.Pending())
 }
 
+// processing advances the engine's processing clock to now and returns it.
+// It never goes backwards: an event delivered late must not make a source
+// look younger, restart a timeout that has already expired, or rewind the
+// published uptime (RA6X-059).
+func (e *Engine) processing(now float64) float64 {
+	if !e.haveProcNow || now > e.procNow {
+		e.procNow, e.haveProcNow = now, true
+	}
+	return e.procNow
+}
+
 // setFrequency writes a frequency word and records it if the actuator took
 // it. Every frequency write in the daemon goes through here so the shutdown
 // path knows what the kernel is holding.
@@ -503,13 +547,33 @@ func (e *Engine) stale(m discipline.Measurement) bool {
 		return false // the source does not stamp generations
 	}
 	current := e.gen.Load()
-	if m.Generation >= current {
+	// Exactly the current settled epoch, and nothing else. An odd epoch is
+	// one a discontinuity was executing during, and a value ahead of the
+	// engine's own counter is not a reading of this clock at all.
+	if m.Generation == current && source.StableEpoch(current) {
 		return false
 	}
 	e.staleDrops[m.Source]++
-	e.log.Debug("discarding a measurement taken before a clock step",
+	e.log.Debug("discarding a measurement taken outside the current clock epoch",
 		"source", m.Source, "generation", m.Generation, "current", current)
 	return true
+}
+
+// beginEpochChange marks a clock discontinuity as in progress and returns the
+// function that completes it. Between the two the counter is odd, so every
+// sample a source starts, finishes, or emits inside the window is recognisably
+// untrustworthy rather than being labelled with the new epoch (RA6X-006). The
+// completion must run even when the discontinuity fails, or acquisition would
+// stay permanently in progress.
+func (e *Engine) beginEpochChange() func() {
+	e.gen.Add(1)
+	done := false
+	return func() {
+		if !done {
+			done = true
+			e.gen.Add(1)
+		}
+	}
 }
 
 // runSource runs one source, restarting it whenever Run returns.
@@ -528,7 +592,7 @@ func (e *Engine) runSource(ctx context.Context, name string, s source.Source) {
 			return
 		}
 		delay := backoff
-		if !e.request(ctx, func() { e.sourceStopped(name, err, delay) }) {
+		if !e.request(ctx, func() error { return e.sourceStopped(name, err, delay) }) {
 			return
 		}
 		t := time.NewTimer(delay)
@@ -538,7 +602,7 @@ func (e *Engine) runSource(ctx context.Context, name string, s source.Source) {
 			return
 		case <-t.C:
 		}
-		if !e.request(ctx, func() { e.sourceRestarting(name) }) {
+		if !e.request(ctx, func() error { e.sourceRestarting(name); return nil }) {
 			return
 		}
 		if backoff < sourceRestartMax {
@@ -551,8 +615,8 @@ func (e *Engine) runSource(ctx context.Context, name string, s source.Source) {
 }
 
 // request hands f to the engine goroutine, or reports false if the daemon is
-// shutting down.
-func (e *Engine) request(ctx context.Context, f func()) bool {
+// shutting down. A non-nil result from f ends the run.
+func (e *Engine) request(ctx context.Context, f func() error) bool {
 	select {
 	case e.reqs <- f:
 		return true
@@ -564,10 +628,10 @@ func (e *Engine) request(ctx context.Context, f func()) bool {
 // sourceStopped records that a source's goroutine returned. The source stays
 // registered; reach 0 is how every other unreachable source is reported, so
 // the selector, the status output and the metrics all say the same thing.
-func (e *Engine) sourceStopped(name string, err error, retryIn time.Duration) {
+func (e *Engine) sourceStopped(name string, err error, retryIn time.Duration) error {
 	spec, ok := e.sources[name]
 	if !ok {
-		return
+		return nil
 	}
 	reason := "source stopped"
 	if err != nil {
@@ -577,29 +641,123 @@ func (e *Engine) sourceStopped(name string, err error, retryIn time.Duration) {
 		e.log.Warn("source stopped; restarting", "source", name, "retry_in", retryIn)
 	}
 	e.sourceErrors[name] = reason
-	now := e.clk.Monotonic()
+	// Run has already returned, so every measurement of this source's still
+	// in the queue belongs to the run that has stopped, and nothing more can
+	// arrive until it is restarted. Drop them here: lifecycle events and
+	// measurements travel on different channels, so a stop event can
+	// otherwise be overtaken by an older valid sample that revives a dead
+	// source (RA6X-017).
+	e.dropQueued(name)
+	// Nothing is producing for this source any more, so its estimate is
+	// revoked rather than merely marked unreachable: a source whose
+	// goroutine has exited must not stay selected on the strength of the
+	// last thing it said.
+	now := e.processing(e.clk.Monotonic())
 	m := discipline.Measurement{
-		Source: name, Now: now, Reach: 0,
+		Source: name, Now: now, Reach: 0, Invalidate: true,
 		Poll: spec.Source.Info().Poll, Generation: e.gen.Load(),
 	}
-	if err := e.handle(e.sys.Update(m), now); err != nil {
-		e.log.Error("after a source stopped", "error", err)
+	// A fallback selection here can issue an actuator action, and an
+	// actuator failure is fatal wherever it happens: return it rather than
+	// logging it and carrying on (RA6X-017).
+	return e.handle(e.sys.Update(m), now)
+}
+
+// sourceRestarting prepares for a source's Run to be entered again. It is
+// called from the source's own goroutine just before that happens.
+//
+// The recorded failure is not cleared yet. It is cleared when the restarted
+// run actually delivers something, so health reflects fresh evidence rather
+// than the mere intention to restart.
+func (e *Engine) sourceRestarting(name string) {
+	e.restarting[name] = true
+	e.log.Info("restarting source", "source", name)
+	e.publish(e.clk.Monotonic())
+}
+
+// dropQueued removes every queued measurement from one source, preserving the
+// order of the others. It runs on the engine goroutine, so nothing else is
+// reading e.meas while it does.
+func (e *Engine) dropQueued(name string) {
+	n := len(e.meas)
+	if n == 0 {
+		return
+	}
+	keep := make([]discipline.Measurement, 0, n)
+	for i := 0; i < n; i++ {
+		select {
+		case m := <-e.meas:
+			if m.Source == name {
+				e.staleDrops[name]++
+				continue
+			}
+			keep = append(keep, m)
+		default:
+			i = n
+		}
+	}
+	for _, m := range keep {
+		select {
+		case e.meas <- m:
+		default:
+			e.staleDrops[m.Source]++
+		}
 	}
 }
 
-// sourceRestarting clears the recorded failure just before Run is entered
-// again, so the next Info snapshot is the source's own.
-func (e *Engine) sourceRestarting(name string) {
-	delete(e.sourceErrors, name)
-	e.log.Info("restarting source", "source", name)
-	now := e.clk.Monotonic()
-	e.publish(now)
+// noteSourceAlive clears a recorded failure once the restarted run has
+// actually produced something.
+func (e *Engine) noteSourceAlive(name string) {
+	if e.restarting[name] {
+		delete(e.restarting, name)
+		delete(e.sourceErrors, name)
+	}
+}
+
+// crossLeap processes a leap-second boundary the kernel has just applied. It
+// must run *before* a queued measurement is fed to the discipline and before
+// any correction action is evaluated: a leap moves the clock by exactly one
+// second, so an observation spanning the boundary is wrong by that much, and
+// resetting the sources afterwards cannot undo a step the loop has already
+// asked for (RA6X-007).
+//
+// The reset is bracketed by the same in-progress epoch a step uses, so a
+// sample a source starts while the reset runs is not labelled with the new
+// epoch either.
+func (e *Engine) crossLeap(now float64) {
+	if e.cfg.LeapTable == nil {
+		return
+	}
+	wall := e.clk.Now()
+	if !e.cfg.LeapTable.Crossed(e.lastLeapWall, wall) {
+		e.lastLeapWall = wall
+		return
+	}
+	e.lastLeapWall = wall
+	// A leap moves the clock by a second: every measurement in flight is
+	// wrong by exactly that much.
+	finish := e.beginEpochChange()
+	for _, src := range e.sources {
+		src.Source.Reset()
+	}
+	finish()
+	reset := e.sys.Resync(now)
+	for _, ev := range reset.Events {
+		e.logEvent(ev)
+	}
+	e.log.Warn("leap transition crossed; source filters reset", "at", wall.UTC().Format(time.RFC3339Nano))
 }
 
 // handle applies actions, logs events, refreshes the kernel status and
 // publishes a snapshot. An actuator failure is fatal: the daemon cannot do
 // its job without the clock.
+//
+// Callers that consume a queued measurement must call crossLeap first; handle
+// repeats the check for the benefit of direct callers, and it is idempotent
+// because a boundary is only crossed once.
 func (e *Engine) handle(res discipline.Result, now float64) error {
+	now = e.processing(now)
+	e.crossLeap(now)
 	for _, a := range res.Actions {
 		switch a.Kind {
 		case discipline.ActionSetFrequency:
@@ -619,11 +777,15 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 			if err != nil {
 				return fmt.Errorf("engine: refusing a step of %v s: %w", a.Value, err)
 			}
-			// Bump before the step so that anything a source is holding,
-			// and anything already queued, is recognisable as pre-step.
-			e.gen.Add(1)
+			// Bracket the whole discontinuity: anything a source is
+			// holding, anything already queued, and anything started while
+			// the syscall runs is recognisable as not belonging to the new
+			// epoch.
+			finish := e.beginEpochChange()
 			before := e.clk.Now()
-			if err := e.clk.Step(delta); err != nil {
+			err = e.clk.Step(delta)
+			finish()
+			if err != nil {
 				return fmt.Errorf("engine: kernel refused step of %.6f s: %w", a.Value, err)
 			}
 			after := e.clk.Now()
@@ -640,21 +802,6 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 	st := e.sys.Status(now)
 	wall := e.clk.Now()
 	if e.cfg.LeapTable != nil {
-		if e.cfg.LeapTable.Crossed(e.lastLeapWall, wall) {
-			// A leap moves the clock by a second: every measurement in
-			// flight is wrong by exactly that much.
-			e.gen.Add(1)
-			for _, src := range e.sources {
-				src.Source.Reset()
-			}
-			reset := e.sys.Resync(now)
-			for _, ev := range reset.Events {
-				e.logEvent(ev)
-			}
-			st = e.sys.Status(now)
-			e.log.Warn("leap transition crossed; source filters reset", "at", wall.UTC().Format(time.RFC3339Nano))
-		}
-		e.lastLeapWall = wall
 		indicator := e.cfg.LeapTable.Indicator(wall)
 		if indicator != e.lastFileLeap {
 			if indicator == ntp.LeapNone {
@@ -747,6 +894,7 @@ func (e *Engine) setKernel(ks clock.Status) error {
 }
 
 func (e *Engine) publish(now float64) {
+	now = e.processing(now)
 	st := e.sys.Status(now)
 	if e.cfg.LeapTable != nil && (st.State == discipline.StateSynced || st.State == discipline.StateHoldover) {
 		st.Leap = e.cfg.LeapTable.Indicator(e.clk.Now())
