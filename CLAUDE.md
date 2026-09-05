@@ -7,15 +7,23 @@ second job is the two-host topology: the **home** box (GPS + PPS, stratum 1)
 is the trusted upstream for the **colo** box (stratum 2), which serves time to
 its clients.
 
-**Status (2026-08-23):** milestones M0–M4 of `DESIGN.md` §15 are implemented
+**Status (2026-09-05):** milestones M0–M4 of `DESIGN.md` §15 are implemented
 in code, plus a public-server hardening pass (2026-08-24) covering martian
 filtering, a counter for every dropped datagram, per-address-family statistics
-and the `[serve]` sizing knobs — see `DESIGN.md` §7 and §10.4.
-The authenticated two-host topology is deployed on `gummi` (Fedora 43) and
-`twocom` (FreeBSD 15): both clock backends, init systems, drift persistence,
-IPv4/IPv6 listeners, ACLs, CMAC, and client/server paths have passed an initial
-real-host acceptance run (`deploy/ACCEPTANCE.md`). They are now the long-term
-in-house test hosts. Linux and FreeBSD PPS API/capability/fetch paths have
+and the `[serve]` sizing knobs — see `DESIGN.md` §7 and §10.4. A 36-finding
+deep review (`review/2026/09/REVIEW_FABLE5_XHIGH.md`) was worked through on
+2026-09-05: 34 fixed, 2 skipped with reasons, all recorded per finding in
+`FIXES_FABLE5_XHIGH.md`. Note the two open items there — the FreeBSD half of
+RF5X-003 (directed broadcasts are still answered on FreeBSD; the constants the
+fix needs do not exist there) and RF5X-012 (the RFC filter dispersion, which
+cannot be applied without also changing the staleness rule).
+The authenticated topology is deployed on `gummi` (Fedora 43), `twocom`
+(FreeBSD 15) and `navlisten2026` (Debian 13, client-only): both clock
+backends, init systems, drift persistence, IPv4/IPv6 listeners, ACLs, CMAC,
+and client/server paths have passed repeated real-host acceptance runs
+(`deploy/ACCEPTANCE.md`). They are the long-term in-house test hosts.
+
+Linux and FreeBSD PPS API/capability/fetch paths have
 also run on them, but none of their configured serial inputs currently has a
 live pulse, so GPS/PPS stratum-1 acceptance remains pending. M4 adds GPS/NMEA,
 leapfile authority, daily statistics, and read-only JSON/health/Prometheus

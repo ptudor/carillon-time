@@ -303,9 +303,140 @@ Two things worth not repeating:
 Rollback: `.prev` on `twocom` is `cd83602` (not `1410eae`, which two installs
 in five minutes displaced); `.prev` on `navlisten2026` is `1410eae`.
 
+## Fable 5.1 review fixes — 2026-09-05 (UTC)
+
+Deployed `7289d4e` to `gummi`, `twocom` and `navlisten2026`, replacing
+`1410eae` on `gummi` and `2700bc7` on the other two. `gummi` is back up since
+the 2026-08-28 entry, so all three hosts are current for the first time since
+2026-08-25.
+
+This carries the fixes for a 36-finding deep review (`review/2026/09/
+REVIEW_FABLE5_XHIGH.md`); 34 fixed, 2 skipped with reasons in
+`FIXES_FABLE5_XHIGH.md`. The two that matter operationally here are RF5X-006
+(SETTLING counted loop updates) and RF5X-004 (the slew transient was left in
+the kernel at exit).
+
+Order was upstream-first with the rule from 2026-08-28 observed properly this
+time — wait for the upstream to reach `synced`, not merely to have been
+restarted: `gummi`, then `twocom`, then `navlisten2026`.
+
+Pre-flight: the new binary was staged in `/tmp` on each host and run
+`-check` against that host's *live* configuration before anything was
+replaced. This release makes validation stricter (RF5X-021 rejects GPS-only
+keys on a `type = "pps"` refclock) and adds three keys with defaults
+(`[discipline] settle_updates`, `[serve] rate_limit_v6_prefix`,
+`[stats] keep_days`), so an existing configuration could in principle have
+stopped validating. All three passed unchanged; `twocom` reported its three
+standing public-server warnings and nothing else.
+
+Results:
+
+- **Settling is no longer a multi-minute outage.** `carillonctl waitsync`
+  returned in **3.2 s** on `gummi`, **2.1 s** on `twocom` and **2.3 s** on
+  `navlisten2026`. The 2026-08-28 entry recorded `twocom` sitting in
+  `settling` for 15 minutes and serving 108 requests unsynchronized, and
+  `gummi` taking over eight minutes on another day. `twocom` served 0
+  unsynchronized this time.
+- Zero steps on all three; frequency carried across from the drift files
+  untouched: `gummi` −15.418 to −15.336 ppm, `twocom` +6.127 to +6.482 ppm,
+  `navlisten2026` +9.437 to +9.414 ppm.
+- Topology unchanged: `gummi` stratum 3 off the Fedora pool, `twocom`
+  stratum 4 with `gummi` as system source, `navlisten2026` stratum 3 with
+  `junia` as system source and both LAN hosts as survivors.
+- `/healthz` returns 200 `healthy` on all three.
+- Statistics now land in `<dir>/YYYY/MM/DD/<kind>.tsv` (RF5X-029). The tree
+  was created on first write on each host. **The pre-existing flat
+  `<kind>.YYYY-MM-DD.tsv` files are left in place** — nothing reads or
+  removes them, so they can be archived or deleted at leisure.
+  `[stats] keep_days` is unset (0, keep everything) everywhere.
+- SELinux on `gummi`: the replaced binaries were `restorecon`'d and kept
+  `system_u:object_r:bin_t:s0`; no denials.
+- Measured clock precision (RF5X-020) is now realistic on every host, where
+  the old minimum-delta method reported 2^-30 everywhere regardless of the
+  hardware: `twocom` 2^-21, `navlisten2026` 2^-22, `gummi` 2^-24. `carillon
+  query` against `twocom` shows the new value on the wire. Everything floored
+  at the precision — the filter's jitter floor, the loop's popcorn threshold,
+  the negative-delay tolerance — moves with it.
+- Authenticated and unauthenticated `carillon query` from `gummi` to `twocom`
+  both answer correctly. `twocom` has no `require_key` prefixes, so RF5X-008's
+  verify-before-limit path is not exercised by this topology; the optional-MAC
+  path is.
+
+RF5X-004 confirmed on a real kernel, which the fake-clock tests cannot do.
+Before the stop, `navlisten2026`'s base estimate was +9.405 ppm with −7.7 ms
+of phase pending, and `ntptime` showed the kernel holding **+1.739 ppm** —
+the base plus the slew transient. On stop the daemon logged
+
+```
+msg="kernel frequency left at the base estimate" ppm=9.404899529698861
+  abandoned_slew_ppm=-7.554560832743737 abandoned_phase=-0.0077283198055273505
+```
+
+and left +9.4049 in the kernel, matching the drift file. The old binary would
+have left +1.85 ppm there — 7.6 ppm, 0.65 s/day, adrift from what the drift
+file claimed — until something else wrote the frequency word.
+
+Not exercised, because no host has one: the live PPS/GPS paths, and so
+RF5X-001 (the spike gate) and RF5X-007 (the PPS agreement check) remain
+covered only by their tests.
+
+### Worth not repeating: `synced` no longer means `settled`
+
+`twocom`'s frequency moved from +6.13 ppm to +32.28 ppm over the four minutes
+after cutover, driving the offset down from 2.9 ms to 484 µs with no steps,
+then turned around and began unwinding once the offset crossed zero. The loop
+was doing its job; the disturbance was ours:
+
+```
+13:16:46  offset +2.907 ms  freq  6.48 ppm   (restarted, from the drift file)
+13:17:06  offset +2.776 ms  freq  9.79 ppm
+13:17:37  offset +2.512 ms  freq 14.52 ppm
+13:19:45  offset +2.207 ms  freq 31.80 ppm   <- mu = 128 s against tau = 64 s
+13:20:50  offset +0.484 ms  freq 32.28 ppm
+13:25:07  offset -1.418 ms  freq 30.89 ppm   <- overshoot unwinding, as designed
+```
+
+`gummi` was restarted 40 s before `twocom` and reached `synced` in 3.2 s, but
+it still had ~10 ms of phase to slew out and went on slewing for another ten
+minutes. `twocom` polls it at `poll_min = 4`, so it saw its own upstream's
+deliberate rate offset as a frequency error and integrated it. The 13:19:45
+step is large because the clock filter had not produced a new lowest-delay
+sample for 128 s while tau was 64 s: `mu > tau` makes one integration step
+bigger than the time constant.
+
+None of this is new — `mu` and tau have always been defined that way, and the
+filter gate is the same one RF5X-006 is about. What *is* new is that the old
+rule from 2026-08-28, "wait for the upstream to reach `synced`, not merely to
+have been restarted", has quietly stopped being enough. It used to imply a
+multi-minute wait that incidentally outlasted the upstream's slew. Now
+`synced` arrives in seconds, which is the point of RF5X-006, and the wait it
+used to buy is gone.
+
+**The rule for the next deployment of a chain:** wait for the upstream's
+`Pending slew` to fall to a few hundred microseconds — `carillonctl tracking`
+reports it — not merely for its state to read `synced`. On this LAN that is
+about ten minutes after the upstream restarts, or one `holdover_max`-free
+poll interval after its offset settles, whichever is longer.
+
+Rollback: `.prev` on all three is the version each was running before —
+`1410eae` on `gummi`, `2700bc7` on `twocom` and `navlisten2026`.
+
 ## Repeatable checklist
 
-On each host:
+Deploy a chain upstream-first, and between hosts wait for the upstream's
+`Pending slew` to fall to a few hundred microseconds — not merely for its
+state to read `synced`, which since 2026-09-05 arrives in seconds and no
+longer implies the upstream has finished moving its clock.
+
+On each host, before replacing anything, stage the new binary and run it
+against the live configuration — validation gets stricter from time to time:
+
+```sh
+scp -F ~/Git/infra/ssh-claude/config carillon <host>:/tmp/
+ssh -F ~/Git/infra/ssh-claude/config <host> 'sudo /tmp/carillon -check -config <config>'
+```
+
+Then, on each host:
 
 ```sh
 carillon -check -config /path/to/carillon.toml
