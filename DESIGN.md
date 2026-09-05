@@ -572,10 +572,26 @@ consequence for the state machine (SETTLING no longer counts loop updates) but
 deliberately left the gate itself alone, because re-running the loop on the
 same sample would double-integrate it.
 
-The cost is real and was measured on 2026-09-05: after a restart, `gummi`
-carried a frequency 17 ppm from what it needed and took no loop update for ten
-minutes, drifting about 7 ms while its downstream followed it. See
-`TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands` for the bound and
+The cost is real, and larger than the bound above suggests. Measured on
+`gummi` on 2026-09-05: **2533 s — 42 minutes — between consecutive loop
+updates**, longer than the Allan intercept because the stale sample must both
+age past it *and* lose to a fresher one on delay. `gummi` drifted 18 ms blind
+in that window and 27 ms by the time it was restarted. Its two downstreams
+read the eventual correction as a rate change and integrated it:
+`navlisten2026` reached **−95.4 ppm** and `twocom` **+46.0 ppm**, against true
+values of about +10 and +6 — that is 8 s/day on a host that was healthy an
+hour earlier. A blind spell upstream becomes a frequency error downstream,
+and the chain amplifies it.
+
+The ranking is what withholds the sample: `Filter.Add` ranks by raw `delay`
+until the Allan intercept, so a sample's growing dispersion — φ·age, already
+38 ms at 2533 s — does not cost it its place, and a 20 ms-delay sample from
+forty minutes ago still outranks a fresh 25 ms one. Ranking by root distance
+(`delay/2 + dispersion`) instead would demote it as soon as φ·age exceeds its
+delay advantage, which for a 10 ms advantage is about 11 minutes rather than
+34-plus. That is a deviation from RFC 5905 §10 and from ntpd, which have the
+same wart, so it wants a simulation pass before it is made. See
+`TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands` for the mechanism and
 `deploy/ACCEPTANCE.md` for the live trace. A fix needs to let the loop run on
 a stale-but-current estimate without winding up on it — for instance by
 integrating only the elapsed time since the last *loop* update rather than
