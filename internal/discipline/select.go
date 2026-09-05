@@ -98,9 +98,13 @@ type SourceState struct {
 	Precision   int8
 	RefTime     time.Time
 
-	// Status and Distance are outputs of the last Select call.
+	// Status and Distance are outputs of the last Select call. Current is
+	// the estimate propagated to the selection instant: the stored offset
+	// minus the phase the loop has already corrected since the observation
+	// was taken. Offset stays the raw stored estimate, for status.
 	Status   SelectStatus
 	Distance float64
+	Current  float64
 
 	// usedAt is the sample time of the last estimate the loop consumed from
 	// this source. It is per source rather than one system-wide value,
@@ -241,7 +245,7 @@ func freshnessDeadline(poll int8) float64 {
 func ppsAgreement(p *SourceState, numbering []*SourceState, now float64) (name string, delta float64, agrees bool) {
 	closest := math.Inf(1)
 	for _, n := range numbering {
-		d := math.Abs(n.Offset - p.Offset)
+		d := math.Abs(n.Current - p.Current)
 		if d <= n.RootDistance(now)+math.Max(4*n.Jitter, ppsAgreementFloor) {
 			return "", 0, true
 		}
@@ -312,18 +316,45 @@ func timingLoop(s *SourceState, local map[ntp.RefID]bool) bool {
 }
 
 func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
-	return SelectWithLocal(sources, now, minSurvivors, nil)
+	return SelectAt(sources, now, minSurvivors, SelectOptions{})
 }
 
-// SelectWithLocal is Select with the local reference identities needed for the
-// timing-loop check.
-func SelectWithLocal(sources []*SourceState, now float64, minSurvivors int, local map[ntp.RefID]bool) Selection {
+// SelectOptions carries the context selection needs beyond the sources
+// themselves.
+type SelectOptions struct {
+	// LocalRefIDs identifies this host, for the timing-loop check.
+	LocalRefIDs map[ntp.RefID]bool
+
+	// AppliedSince returns the phase the discipline has corrected between an
+	// observation's time and now. Every stored offset is reduced by it
+	// before the offsets are compared or combined, so observations taken at
+	// different moments are all expressed as the error remaining *now*
+	// (RA6X-001, RA6X-025). Nil means no correction is known, which is the
+	// right answer for a caller that is not driving a clock.
+	AppliedSince func(at, now float64) float64
+}
+
+// SelectAt is Select with the selection context.
+func SelectAt(sources []*SourceState, now float64, minSurvivors int, opts SelectOptions) Selection {
+	local := opts.LocalRefIDs
 	var sel Selection
 	var cands, pps []*SourceState
 	preferConfigured, anySurvived := false, false
 	for _, s := range sources {
 		s.Distance = s.RootDistance(now)
 		s.stale = s.Valid && now-s.Updated > freshnessDeadline(s.Poll)
+		// Express the estimate at the selection instant. The clock filter
+		// can release an observation several polls old, and feeding its
+		// offset to the loop as present-time feedback re-integrates a
+		// correction the loop has already made — which is what wound the
+		// frequency up by hundreds of ppm in the takeover reproduction
+		// (RA6X-001). The applied correction is known exactly; the
+		// oscillator's own drift over the interval is already carried by
+		// the dispersion the filter ages at Phi.
+		s.Current = s.Offset
+		if opts.AppliedSince != nil && s.Valid {
+			s.Current -= opts.AppliedSince(s.At, now)
+		}
 		if s.PPS {
 			// These describe the comparison made in *this* selection.
 			// Retaining them when no comparison happens — the PPS was
@@ -369,7 +400,7 @@ func SelectWithLocal(sources []*SourceState, now float64, minSurvivors int, loca
 	// surviving numbering source agrees the clock is within the guard band.
 	var numbering []*SourceState
 	for _, s := range survivors {
-		if s.Numbering && math.Abs(s.Offset) < PPSGuard {
+		if s.Numbering && math.Abs(s.Current) < PPSGuard {
 			numbering = append(numbering, s)
 		}
 	}
@@ -458,18 +489,18 @@ func SelectWithLocal(sources []*SourceState, now float64, minSurvivors int, loca
 	for _, s := range survivors {
 		w := 1 / math.Max(s.Distance, MinDispersion/2)
 		sumW += w
-		sumWO += w * s.Offset
+		sumWO += w * s.Current
 	}
 	mean := sumWO / sumW
 	if sys.Prefer {
-		sel.Offset = sys.Offset
+		sel.Offset = sys.Current
 	} else {
 		sel.Offset = mean
 	}
 	var spread float64
 	for _, s := range survivors {
 		w := 1 / math.Max(s.Distance, MinDispersion/2)
-		d := s.Offset - sel.Offset
+		d := s.Current - sel.Offset
 		spread += w * d * d
 	}
 	spread = math.Sqrt(spread / sumW)
@@ -494,9 +525,9 @@ func intersect(c []*SourceState, sel *Selection) []*SourceState {
 	edges := make([]edge, 0, 3*n)
 	for _, s := range c {
 		edges = append(edges,
-			edge{s.Offset - s.Distance, -1},
-			edge{s.Offset, 0},
-			edge{s.Offset + s.Distance, +1})
+			edge{s.Current - s.Distance, -1},
+			edge{s.Current, 0},
+			edge{s.Current + s.Distance, +1})
 	}
 	sort.Slice(edges, func(i, j int) bool {
 		if edges[i].v != edges[j].v {
@@ -551,7 +582,7 @@ func intersect(c []*SourceState, sel *Selection) []*SourceState {
 	sel.Low, sel.High = low, high
 	var surv []*SourceState
 	for _, s := range c {
-		if s.Offset+s.Distance < low || s.Offset-s.Distance > high {
+		if s.Current+s.Distance < low || s.Current-s.Distance > high {
 			s.Status = StatusFalseticker
 			continue
 		}
@@ -573,7 +604,7 @@ func cluster(surv []*SourceState) []*SourceState {
 			var sum float64
 			for j, o := range surv {
 				if i != j {
-					d := s.Offset - o.Offset
+					d := s.Current - o.Current
 					sum += d * d
 				}
 			}

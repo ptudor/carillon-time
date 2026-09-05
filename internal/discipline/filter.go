@@ -70,10 +70,29 @@ func (f *Filter) Add(offset, delay, disp, now float64) (out Output, updated bool
 		f.n++
 	}
 
-	// Rank the samples: distance is the delay, except that samples older
-	// than the Allan intercept are pushed behind everything current, and
-	// samples whose dispersion has reached MaxDispersion carry no
-	// information at all.
+	// Rank the samples by root distance — half the delay plus the
+	// dispersion — rather than by raw delay.
+	//
+	// RFC 5905 §10 and ntpd rank by delay alone, which means a sample's
+	// growing dispersion never costs it its place: one unusually fast early
+	// reply outranks every later one until the Allan intercept demotes it,
+	// and no loop update happens for that whole period. Measured live, that
+	// was 42 minutes of blind running (DESIGN.md §6.3). Ranking by distance
+	// demotes it as soon as φ·age exceeds *half* its delay advantage —
+	// about 11 minutes for a 10 ms advantage — because a delay advantage is
+	// worth δ/2 to the offset estimate, not δ.
+	//
+	// This is a deliberate deviation, made with the simulation pass DESIGN
+	// asked for: in the takeover reproduction it takes the maximum age of
+	// the selected observation from 448 s to 0 s at poll 6 and from 1792 s
+	// to 0 s at poll 8, delivers an update on essentially every poll, and
+	// leaves the symmetric cases converging exactly as before (RA6X-002).
+	// It is safe only together with the observation-time propagation in
+	// Select (RA6X-001): on its own it does not fix delayed feedback.
+	//
+	// Samples older than the Allan intercept are still pushed behind
+	// everything current, and samples whose dispersion has reached
+	// MaxDispersion carry no information at all.
 	type ranked struct {
 		idx  int
 		dist float64
@@ -89,7 +108,7 @@ func (f *Filter) Add(offset, delay, disp, now float64) (out Output, updated bool
 		case now-s.t > AllanIntercept:
 			d = MaxDistance + s.disp
 		default:
-			d = s.delay
+			d = s.delay/2 + s.disp
 		}
 		order = append(order, ranked{i, d})
 	}

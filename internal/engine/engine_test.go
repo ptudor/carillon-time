@@ -716,23 +716,33 @@ func TestEngineFrequencySettledGate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.noteFrequency(0, 10)
+	// A synchronized daemon whose loop keeps delivering updates.
+	updates := 0
+	note := func(at, ppm float64) {
+		updates++
+		e.noteFrequency(at, &discipline.Status{
+			State: discipline.StateSynced, SystemSource: "a",
+			Frequency: ppm, Updates: updates,
+		})
+	}
+
+	note(0, 10)
 	if ok, why := e.frequencySettled(50); ok || !strings.Contains(why, "frequency history") {
 		t.Fatalf("50 s of history must not settle: ok=%v why=%q", ok, why)
 	}
 	for at := 0.0; at <= 200; at += 10 {
-		e.noteFrequency(at, 10+at/500) // 0.4 ppm across the whole run
+		note(at, 10+at/500) // 0.4 ppm across the whole run
 	}
 	if ok, why := e.frequencySettled(200); !ok {
 		t.Fatalf("a steady frequency must settle: %q", why)
 	}
-	e.noteFrequency(210, 40) // a 30 ppm jump
+	note(210, 40) // a 30 ppm jump
 	if ok, why := e.frequencySettled(210); ok || !strings.Contains(why, "frequency moved") {
 		t.Fatalf("a moving frequency must not settle: ok=%v why=%q", ok, why)
 	}
 	// Once the jump ages out of the window it settles again.
 	for at := 220.0; at <= 340; at += 10 {
-		e.noteFrequency(at, 40)
+		note(at, 40)
 	}
 	if ok, why := e.frequencySettled(340); !ok {
 		t.Fatalf("steady at the new value must settle again: %q", why)

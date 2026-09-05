@@ -710,7 +710,7 @@ func TestAstra6RejectsTimingLoops(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			sel := SelectWithLocal([]*SourceState{c.source}, 1, 1, local)
+			sel := SelectAt([]*SourceState{c.source}, 1, 1, SelectOptions{LocalRefIDs: local})
 			rejected := sel.System == nil
 			if rejected != c.rejected {
 				t.Fatalf("rejected=%v, want %v (status %v)", rejected, c.rejected, c.source.Status)
@@ -751,14 +751,14 @@ func TestAstra6TimingLoopTransitions(t *testing.T) {
 		}
 		return n
 	}
-	if got := count(SelectWithLocal([]*SourceState{peer}, 1, 1, local), EventTimingLoop); got != 1 {
+	if got := count(SelectAt([]*SourceState{peer}, 1, 1, SelectOptions{LocalRefIDs: local}), EventTimingLoop); got != 1 {
 		t.Fatalf("first selection reported %d loop events, want 1", got)
 	}
-	if got := count(SelectWithLocal([]*SourceState{peer}, 2, 1, local), EventTimingLoop); got != 0 {
+	if got := count(SelectAt([]*SourceState{peer}, 2, 1, SelectOptions{LocalRefIDs: local}), EventTimingLoop); got != 0 {
 		t.Fatalf("a standing loop was reported again: %d events", got)
 	}
 	peer.RefID = ntp.RefIDFromAddr(netip.MustParseAddr("198.51.100.7"))
-	sel := SelectWithLocal([]*SourceState{peer}, 3, 1, local)
+	sel := SelectAt([]*SourceState{peer}, 3, 1, SelectOptions{LocalRefIDs: local})
 	if got := count(sel, EventTimingLoopCleared); got != 1 {
 		t.Fatalf("recovery reported %d times, want 1", got)
 	}
@@ -781,4 +781,201 @@ func TestAstra6NoLocalIdentityDisablesTheCheck(t *testing.T) {
 	if sel := Select([]*SourceState{peer}, 1, 1); sel.System != peer {
 		t.Fatal("the loop check fired with no local identity configured")
 	}
+}
+
+// TestAstra6ChargesTheAppliedWord is the review's RA6X-008 probe. Tick
+// computed the *next* frequency word and then debited that from the pending
+// phase, so the accounting disagreed with what the kernel had actually been
+// running.
+//
+// The probe's original constant, 0.009902343750 s, was derived from the old
+// behaviour in which the first tick also charged a nominal second for a
+// transient that had not run yet — which the same finding lists as a defect.
+// With that corrected the residual is one first-tick charge higher; the rule
+// the finding is about, that the debit is the *applied* word, is unchanged
+// and is what this asserts.
+func TestAstra6ChargesTheAppliedWord(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	l.Update(0.010, 6, 0, false, true) // tau = 256, so the transient is 39.0625 ppm
+
+	l.Tick(1)
+	if l.Pending != 0.010 {
+		t.Fatalf("the first tick charged a transient that had not run: pending %v", l.Pending)
+	}
+	applied := l.applied - l.appliedBase
+	if math.Abs(applied-39.0625) > 1e-9 {
+		t.Fatalf("issued transient %v ppm, want 39.0625", applied)
+	}
+
+	l.Tick(2.5) // the 39.0625 ppm word ran for 1.5 s
+	want := 0.010 - 39.0625e-6*1.5
+	if math.Abs(l.Pending-want) > 1e-15 {
+		t.Fatalf("pending %.12f, want %.12f: the debit must be the word that ran", l.Pending, want)
+	}
+}
+
+// TestAstra6AppliedWordIntegral is the independent oracle RA6X-008 asks for.
+// It records every word the loop issues and, at each accounting point,
+// requires the phase the loop debited to equal the integral of the word that
+// was actually held over the interval it was actually held for — across
+// irregular ticks, a late tick past the accounting window, loop updates that
+// change the base, a sign change and saturation.
+func TestAstra6AppliedWordIntegral(t *testing.T) {
+	type event struct {
+		at     float64
+		update bool
+		offset float64
+	}
+	script := []event{
+		{at: 0, update: true, offset: 0.010},
+		{at: 1},
+		{at: 2},
+		{at: 2.5},
+		{at: 5}, // a late tick, past maxTickInterval
+		{at: 6, update: true, offset: 0.004},
+		{at: 6.5},
+		{at: 7},
+		{at: 9, update: true, offset: -0.002}, // a sign change
+		{at: 10},
+		{at: 11},
+		{at: 11.25}, // a very short tick
+		{at: 12, update: true, offset: 0.3},
+		{at: 13},
+		{at: 14},
+	}
+	for _, base := range []float64{0, 12.5, -300, 480} {
+		t.Run(fmt.Sprintf("base=%v", base), func(t *testing.T) {
+			cfg := loopCfg()
+			cfg.StepLimit = 0 // slew everything, so nothing is stepped away
+			l := NewLoop(cfg, base, true)
+
+			// The oracle's model of the kernel: the word it holds and the
+			// base that word was computed against, captured when issued.
+			var word, wordBase float64
+			var haveWord bool
+			at := 0.0
+
+			// expected is the phase the held word moved over [at, now],
+			// clamped the same way the loop clamps a stall.
+			expected := func(now float64) float64 {
+				if !haveWord || now <= at {
+					return 0
+				}
+				return (word - wordBase) * 1e-6 * math.Min(now-at, maxTickInterval)
+			}
+			record := func(now float64, acts []Action) {
+				at = now
+				for _, a := range acts {
+					if a.Kind == ActionSetFrequency {
+						// Tick does not change Freq, so the loop's current
+						// base is the one it used for this word.
+						word, wordBase, haveWord = a.Value, l.Freq, true
+					}
+				}
+			}
+
+			for _, e := range script {
+				before := l.Pending
+				want := expected(e.at)
+				if e.update {
+					u := l.Update(e.offset, 6, e.at, false, true)
+					if u.Stepped {
+						t.Fatal("this script must not step")
+					}
+					// The update charges the interval, then replaces the
+					// residual; the debit is observable in slewed.
+					record(e.at, u.Actions)
+					continue
+				}
+				acts := l.Tick(e.at)
+				if got := before - l.Pending; math.Abs(got-want) > 1e-12 {
+					t.Fatalf("at %v the loop debited %.15f s, the held word moved %.15f s", e.at, got, want)
+				}
+				record(e.at, acts)
+			}
+		})
+	}
+}
+
+// TestAstra6NoDoubleDebitAcrossUpdate covers the reconciliation RA6X-008
+// asks for: an observation's offset already reflects every correction applied
+// before it was taken, so the interval up to the update must not be charged
+// against the replacement pending phase as well.
+func TestAstra6NoDoubleDebitAcrossUpdate(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	l.Update(0.010, 6, 0, false, true)
+	l.Tick(1) // issues 39.0625 ppm
+	// Ten seconds later a fresh observation arrives. Whatever ran in the
+	// meantime is already in its offset.
+	l.Update(0.004, 6, 11, false, true)
+	if l.Pending != 0.004 {
+		t.Fatalf("the replacement pending phase was debited on arrival: %v", l.Pending)
+	}
+	// The next tick may only charge the interval since the update.
+	before := l.Pending
+	applied := l.applied - l.appliedBase
+	l.Tick(12)
+	if want := before - applied*1e-6; math.Abs(l.Pending-want) > 1e-15 {
+		t.Fatalf("pending %v, want %v: only the second since the update may be charged", l.Pending, want)
+	}
+}
+
+// TestAstra6AccountingEdgeCases covers the remaining semantics RA6X-008 asks
+// to be defined.
+func TestAstra6AccountingEdgeCases(t *testing.T) {
+	t.Run("backward time charges nothing", func(t *testing.T) {
+		l := NewLoop(loopCfg(), 0, true)
+		l.Update(0.010, 6, 0, false, true)
+		l.Tick(1)
+		l.Tick(2)
+		before := l.Pending
+		l.Tick(1.5)
+		if l.Pending != before {
+			t.Fatalf("backward time debited the phase: %v -> %v", before, l.Pending)
+		}
+	})
+
+	t.Run("a step restarts the accounting", func(t *testing.T) {
+		cfg := loopCfg()
+		l := NewLoop(cfg, 0, true)
+		l.Update(0.010, 6, 0, false, true)
+		l.Tick(1)
+		u := l.Update(1.0, 6, 100, false, true)
+		if !u.Stepped {
+			t.Fatal("setup: the offset was not stepped")
+		}
+		if l.Pending != 0 {
+			t.Fatalf("a step left pending phase behind: %v", l.Pending)
+		}
+		// The first tick after a step re-issues the base and charges the
+		// interval since the step, not since before it.
+		l.Tick(101)
+		if l.Pending != 0 {
+			t.Fatalf("the tick after a step invented pending phase: %v", l.Pending)
+		}
+	})
+
+	t.Run("the total stays within the frequency bound", func(t *testing.T) {
+		cfg := loopCfg()
+		cfg.StepLimit = 0
+		l := NewLoop(cfg, 499, true)
+		l.Update(10, 6, 0, false, true)
+		for i := 1; i <= 20; i++ {
+			for _, a := range l.Tick(float64(i)) {
+				if a.Kind == ActionSetFrequency && (a.Value > MaxFrequency || a.Value < -MaxFrequency) {
+					t.Fatalf("issued %v ppm, outside ±%v", a.Value, MaxFrequency)
+				}
+			}
+		}
+	})
+
+	t.Run("no base-only pulse between updates", func(t *testing.T) {
+		l := NewLoop(loopCfg(), 12.5, true)
+		u := l.Update(0.010, 6, 0, false, true)
+		for _, a := range u.Actions {
+			if a.Kind == ActionSetFrequency {
+				t.Fatalf("an update issued a frequency action: %+v", u.Actions)
+			}
+		}
+	})
 }

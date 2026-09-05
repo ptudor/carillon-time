@@ -47,13 +47,20 @@ func TestFilterJitter(t *testing.T) {
 	f := NewFilter(1e-6)
 	f.Add(0.000, 0.010, 0, 0)
 	f.Add(0.004, 0.011, 0, 64)
+	// Ranking is by root distance, so by t=128 the first sample's grown
+	// dispersion (φ·128 = 1.92 ms) has cost it its 1 ms delay advantage and
+	// the fresh sample wins (RA6X-002).
 	out, ok := f.Add(-0.004, 0.012, 0, 128)
-	if ok {
-		t.Fatal("no update expected")
+	if !ok {
+		t.Fatal("the fresh sample must displace one whose dispersion has grown past its delay advantage")
 	}
-	// RMS of the other two offsets against the best (0): sqrt((16+16)/2) ms
-	if math.Abs(out.Jitter-0.004) > 1e-9 {
-		t.Fatalf("jitter got %v want 0.004", out.Jitter)
+	if out.Offset != -0.004 || out.At != 128 {
+		t.Fatalf("output must describe the fresh sample: %+v", out)
+	}
+	// RMS of the other two offsets against the best (-0.004):
+	// sqrt((4² + 8²)/2) ms.
+	if want := math.Sqrt((16 + 64) / 2.0) * 1e-3; math.Abs(out.Jitter-want) > 1e-9 {
+		t.Fatalf("jitter got %v want %v", out.Jitter, want)
 	}
 	if out.Samples != 3 {
 		t.Fatalf("samples %d", out.Samples)
@@ -111,16 +118,16 @@ func TestFilterRingWraps(t *testing.T) {
 	}
 }
 
-// TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands documents the
-// starvation a minimum-delay filter allows, observed live on 2026-09-05.
+// TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands is the starvation
+// regression, observed live on 2026-09-05 and fixed by RA6X-002.
 //
-// Add reports updated = false whenever the lowest-delay sample in the
-// register is one already reported, so an early sample that happens to have
-// the best delay withholds every later one until AllanIntercept demotes it.
-// System's loop-update gate keys on the same thing, so the discipline loop is
-// not run at all for that whole period — whatever the clock is doing
-// meanwhile. On `gummi` that was ten minutes and about 7 ms; the bound below
-// is worse.
+// Add reports updated = false whenever the best sample in the register is one
+// already reported, and System's loop-update gate keys on the same thing, so
+// a withheld run is a run with no loop update at all. Ranking by raw delay,
+// as RFC 5905 §10 and ntpd do, let one unusually fast early reply hold that
+// place until the Allan intercept demoted it: 2048 s at poll 8, and 2533 s
+// measured on `gummi`. Ranking by root distance costs it the place as soon as
+// φ·age exceeds half its delay advantage, which is what this bounds.
 func TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands(t *testing.T) {
 	f := NewFilter(1e-6)
 	const poll = 256.0 // seconds; poll 8
@@ -142,12 +149,14 @@ func TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands(t *testing.T) {
 	t.Logf("longest run with no filter update: %.0f s (%.1f min) at poll 8", maxGap, maxGap/60)
 	t.Logf("at the 17 ppm gummi was carrying, that is %.0f ms of uncorrected time error",
 		maxGap*17e-6*1e3)
-	if maxGap < 4*poll {
-		t.Fatalf("expected a long withholding run, got %.0f s", maxGap)
+	// The 20 ms delay advantage is worth 10 ms to the offset estimate, so
+	// the early sample loses its place once φ·age passes 10 ms: about 667 s,
+	// which at poll 8 is the third arrival after it. The bound is the
+	// crossover, not the Allan intercept.
+	if want := 10e-3 / Phi; maxGap > want+poll {
+		t.Fatalf("withholding run %.0f s, longer than the %.0f s distance crossover", maxGap, want)
 	}
-	// AllanIntercept is what finally breaks the deadlock, so the run is
-	// bounded by it rather than by the ring depth.
-	if maxGap < AllanIntercept*0.9 {
-		t.Fatalf("expected the run to last until the Allan intercept, got %.0f s", maxGap)
+	if maxGap >= AllanIntercept*0.9 {
+		t.Fatalf("the run still lasts until the Allan intercept: %.0f s", maxGap)
 	}
 }

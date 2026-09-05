@@ -319,7 +319,10 @@ func (s *System) reselect(now float64) Result {
 	for _, src := range all {
 		prev[src.Name] = src.Status
 	}
-	sel := SelectWithLocal(all, now, s.cfg.MinSurvivors, s.cfg.LocalRefIDs)
+	sel := SelectAt(all, now, s.cfg.MinSurvivors, SelectOptions{
+		LocalRefIDs:  s.cfg.LocalRefIDs,
+		AppliedSince: s.loop.AppliedSince,
+	})
 	res.Events = append(res.Events, sel.Events...)
 	for _, src := range all {
 		was, is := prev[src.Name], src.Status
