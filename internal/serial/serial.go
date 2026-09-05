@@ -3,7 +3,11 @@
 // discipline where needed.
 package serial
 
-import "errors"
+import (
+	"errors"
+
+	"golang.org/x/sys/unix"
+)
 
 // ErrTimeout means no serial data was readable before the requested timeout.
 var ErrTimeout = errors.New("serial read timed out")
@@ -13,6 +17,14 @@ var ErrTimeout = errors.New("serial read timed out")
 type Port struct {
 	fd   int
 	path string
+
+	// poll and read are the syscall seam ReadTimeout uses. They are nil in
+	// production, where the real unix.Poll and unix.Read are called; only
+	// tests set them, to drive kernel outcomes a pipe cannot produce (a
+	// readable descriptor whose read(2) returns n=0 with no error). A Port
+	// is owned by one reference-clock goroutine, so these need no locking.
+	poll func(fds []unix.PollFd, timeoutMillis int) (int, error)
+	read func(fd int, buf []byte) (int, error)
 }
 
 // FD returns the kernel descriptor.
