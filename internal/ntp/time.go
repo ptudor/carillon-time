@@ -260,4 +260,5 @@ var (
 	KissINIT = RefIDFromString("INIT") // not yet synchronized
 	KissSTEP = RefIDFromString("STEP") // just stepped; resynchronizing
 	KissHOLD = RefIDFromString("HOLD") // holdover expired (carillon-specific)
+	KissPANC = RefIDFromString("PANC") // offset beyond the panic threshold; no correction attempted (carillon-specific)
 )

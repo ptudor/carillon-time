@@ -153,3 +153,92 @@ reach still 1. `TestGenerationStampedOnMeasurements` checks the stamp itself.
 `TestSystemSecondStepWithTwoAgreeingSurvivors` cover both arms of the step
 gate, including that a deferred step leaves `Updates` and `Pending` alone.
 `go vet ./...` and `go test -race ./...` pass.
+
+## RF5X-005 — A leap transition drops the server to LI=3 for three loop updates — FIXED
+
+**Changed.** Option 1 of the fix specification. `System.Resync(now)` replaces
+`InvalidateSources` in the engine's leap branch: it drops every source
+estimate and clears `lastUsedAt` exactly as before, but sets a `resyncing`
+flag (only when the daemon was SYNCED or HOLDOVER) that makes the first
+post-reset loop update restore SYNCED directly instead of passing through
+SETTLING. `InvalidateSources` is retained for any other caller. The
+generation counter from RF5X-002 is bumped at the same point (item 3), so
+pre-leap measurements are discarded rather than invalidated-then-applied. The
+kernel `STA_INS`/`STA_DEL` sequencing, the `Source.Reset()` sweep and the
+holdover timeout are untouched.
+
+**Files.** `internal/discipline/system.go`, `internal/engine/engine.go`,
+`internal/engine/engine_test.go`, `internal/discipline/sim_test.go`,
+`DESIGN.md` §6.5.
+
+**Verification.** PASS. `TestEngineLeapfileOverridesAndResetsAtTransition`
+extended: the first measurement after the transition gives `StateSynced`,
+`Leap == LeapNone`, `clk.Status().Synced == true`, and the `main.go` mapping
+the NTP listener uses reads synchronized. `TestEngineNeverServesUnsyncedAcrossALeap`
+walks four updates across the transition and asserts the listener's view is
+never false. `TestSystemResyncSkipsSettling` covers the System level.
+
+## RF5X-010 — The SETTLING counter is not reset by a second step — FIXED
+
+**Changed.** RF5X-006 replaced the counter, so per the specification's own
+instruction the "since last step" reference is now reset on *every* step:
+`sinceStep`, `postStepUpdates` and `resyncing` are zeroed in the `u.Stepped`
+branch before `setState`, which no longer owns the counter at all
+(`setState`'s `if to != StateSynced { settled = 0 }` is gone).
+
+**Files.** `internal/discipline/system.go`, `internal/discipline/sim_test.go`.
+
+**Verification.** PASS. `TestSystemSecondStepResetsSettling` reproduces the
+review's scratch sequence with `settle_updates = 3`: after a second step the
+evidence counters read 0 and SYNCED comes only after three further post-step
+samples, not two.
+
+## RF5X-006 — SETTLING counts filter updates, so a restarted host answers LI=3 for minutes — FIXED
+
+**Changed.** SETTLING progress is now counted in *measurements received for
+the system source since the last step* (`System.sinceStep`, incremented in
+`Update`), not in loop updates. `System.settleDone` declares SYNCED when (1)
+at least one post-step loop update has run — so a step is never served as
+synchronized, (2) `sinceStep >= SettleUpdates`, and (3) another step is no
+longer on the table: `!loop.stepAllowed()` or the offset at the last update
+was at or below `StepThreshold`. `SettleUpdates` moved out of `main.go` into
+`[discipline] settle_updates`, default 1, validated `>= 1`, and documented in
+the example config. The loop-update gate (`lastUsedAt`) that protects the PLL,
+the wire behaviour while genuinely UNSYNCED and `waitsync` semantics are
+unchanged.
+
+**Files.** `internal/discipline/system.go`, `internal/config/config.go`,
+`cmd/carillon/main.go`, `deploy/carillon.toml.example`, `DESIGN.md` §6.5,
+`internal/discipline/sim_test.go`, `internal/engine/engine_test.go`.
+
+**Verification.** PASS. `TestSimSettling` gained the assertion the review
+asks for: the time spent in `StateSettling` after the last step must be under
+two poll intervals (2 × 64 s) for the sim source with delay noise. All three
+states are still seen.
+
+## RF5X-034 — Refid HOLD advertised after a panic refusal — FIXED
+
+**Changed.** `System` tracks `unsyncedReason`: `INIT` from construction,
+`HOLD` set when the holdover timeout fires in `Tick`, and a new
+`ntp.KissPANC` set when the loop refuses a panic correction. `Status()`
+advertises that reason instead of deriving `HOLD` from `haveUpdate`.
+
+**Files.** `internal/ntp/time.go`, `internal/discipline/system.go`,
+`internal/discipline/sim_test.go`, `DESIGN.md` §7.4.
+
+**Verification.** PASS. `TestSimPanicRefused` now asserts the refid is `PANC`.
+
+## RF5X-036 — "preferred source is not usable" logged at ERROR on every start — FIXED
+
+**Changed.** `Select` remembers per source whether it has ever been reachable
+(`everReachable`) and ever been a survivor (`everSurvived`), and reports
+`PreferLost` only once the prefer source has been reachable at least once and
+something has been a survivor at least once. Before anything has ever been
+usable there is nothing to have lost. `prefer_lost` semantics once running are
+unchanged, and the engine still logs a genuine loss at ERROR.
+
+**Files.** `internal/discipline/select.go`, `internal/discipline/sim_test.go`.
+
+**Verification.** PASS. `TestSimPreferLost` asserts no `EventPreferLost`
+before the first survivor; with the gate removed it fails with *1 prefer-lost
+events before the first survivor at t=64*.

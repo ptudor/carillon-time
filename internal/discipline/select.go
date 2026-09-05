@@ -97,6 +97,12 @@ type SourceState struct {
 	Status   SelectStatus
 	Distance float64
 
+	// everReachable and everSurvived remember that this source has been
+	// usable at least once, so that "the preferred source is not usable"
+	// is not reported before it has ever had a chance to be.
+	everReachable bool
+	everSurvived  bool
+
 	// sinceStep counts the valid measurements this source has delivered
 	// since the last clock step. A second step must not rest on a single
 	// post-step sample, which is how a measurement computed before the
@@ -199,13 +205,20 @@ type Selection struct {
 func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
 	var sel Selection
 	var cands, pps []*SourceState
-	preferConfigured := false
+	preferConfigured, preferSeen, anySurvived := false, false, false
 	for _, s := range sources {
 		s.Distance = s.RootDistance(now)
 		ok, st := s.candidate()
 		s.Status = st
+		if s.Reach != 0 {
+			s.everReachable = true
+		}
+		if s.everSurvived {
+			anySurvived = true
+		}
 		if s.Prefer && !s.NoSelect {
 			preferConfigured = true
+			preferSeen = preferSeen || s.everReachable
 		}
 		if !ok {
 			continue
@@ -241,8 +254,16 @@ func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
 		s.Status = StatusSurvivor
 	}
 	sel.Survivors = survivors
+	for _, s := range survivors {
+		s.everSurvived = true
+	}
+	// Before anything has ever been usable there is nothing to have lost.
+	// Reporting it there logs an ERROR at every daemon start, followed by
+	// "preferred source is back in charge" a few seconds later, which is a
+	// false page for anyone alerting on ERROR lines.
+	reportPreferLost := preferConfigured && preferSeen && (anySurvived || len(survivors) > 0)
 	if len(survivors) == 0 || len(survivors) < minSurvivors {
-		sel.PreferLost = preferConfigured
+		sel.PreferLost = reportPreferLost
 		return sel
 	}
 
@@ -263,7 +284,7 @@ func Select(sources []*SourceState, now float64, minSurvivors int) Selection {
 			}
 		}
 	}
-	sel.PreferLost = preferConfigured && sys == nil
+	sel.PreferLost = reportPreferLost && sys == nil
 	if sys == nil {
 		sys = survivors[0]
 	}

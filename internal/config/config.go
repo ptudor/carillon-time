@@ -232,6 +232,13 @@ type Discipline struct {
 
 	// MaxSlewPPM bounds the rate at which phase is corrected.
 	MaxSlewPPM float64 `toml:"max_slew_ppm"`
+
+	// SettleUpdates is how many measurements for the system source must
+	// arrive after a step before the clock is served as synchronized
+	// (DESIGN.md §6.5). One is enough for the guards around it; raise it
+	// on a path noisy enough that a single post-step sample is not
+	// convincing.
+	SettleUpdates int `toml:"settle_updates"`
 }
 
 // Step is the clock stepping policy (DESIGN.md §6.6).
@@ -285,9 +292,10 @@ func Default() *Config {
 			Allow: []string{"127.0.0.0/8", "::1/128"},
 		},
 		Discipline: Discipline{
-			MinSurvivors: 1,
-			HoldoverMax:  3600,
-			MaxSlewPPM:   500,
+			MinSurvivors:  1,
+			HoldoverMax:   3600,
+			MaxSlewPPM:    500,
+			SettleUpdates: 1,
 		},
 		Step: Step{
 			Threshold:      0.5,
@@ -593,6 +601,9 @@ func Validate(cfg *Config) error {
 	}
 	if !(cfg.Discipline.MaxSlewPPM > 0 && cfg.Discipline.MaxSlewPPM <= 500) {
 		fail("discipline: max_slew_ppm %v must be in (0, 500]", cfg.Discipline.MaxSlewPPM)
+	}
+	if cfg.Discipline.SettleUpdates < 1 {
+		fail("discipline: settle_updates %d must be at least 1", cfg.Discipline.SettleUpdates)
 	}
 
 	if !(cfg.Step.Threshold > 0) {

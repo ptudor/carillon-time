@@ -141,7 +141,7 @@ func simConfig() Config {
 		},
 		MinSurvivors:  1,
 		HoldoverMax:   3600,
-		SettleUpdates: 3,
+		SettleUpdates: 1,
 	}
 }
 
@@ -266,6 +266,12 @@ func TestSimPanicRefused(t *testing.T) {
 	if st := r.sys.Status(r.now); st.Stratum != 16 || st.Leap != ntp.LeapUnsync {
 		t.Fatalf("status %+v", st)
 	}
+	// HOLD means "was synchronized, lost its sources" and sends the
+	// operator to look at the network; a clock past the panic threshold is
+	// a different problem and says so.
+	if st := r.sys.Status(r.now); st.RefID != ntp.KissPANC {
+		t.Fatalf("refid %v after a panic refusal, want PANC", st.RefID)
+	}
 
 	cfg := simConfig()
 	cfg.Loop.PanicAtStartup = true
@@ -305,7 +311,22 @@ func TestSimPreferLost(t *testing.T) {
 	a, b, p := newSimSource("a", 8), newSimSource("b", 9), newSimSource("p", 10)
 	r := newSim(simConfig(), 0, 0, true, a, b, p)
 	r.sys.AddSource("p", Options{Numbering: true, Prefer: true})
-	r.run(1800, nil)
+	// Before any source has ever been a survivor there is nothing to have
+	// lost. Reporting it there logged an ERROR at every daemon start,
+	// followed by "back in charge" seconds later: a false page per restart.
+	firstSurvivor := -1.0
+	lostBeforeSurvivor := 0
+	r.run(1800, func(now float64) {
+		if firstSurvivor < 0 && len(r.sys.sel.Survivors) > 0 {
+			firstSurvivor = now
+		}
+		if firstSurvivor < 0 {
+			lostBeforeSurvivor = r.count(EventPreferLost)
+		}
+	})
+	if lostBeforeSurvivor != 0 {
+		t.Fatalf("%d prefer-lost events before the first survivor at t=%.0f", lostBeforeSurvivor, firstSurvivor)
+	}
 	if st := r.sys.Status(r.now); st.SystemSource != "p" || st.PreferLost {
 		t.Fatalf("prefer must drive: %+v", st)
 	}
@@ -373,11 +394,22 @@ func TestSimSettling(t *testing.T) {
 	a := newSimSource("a", 12)
 	r := newSim(simConfig(), 0, 0, true, a)
 	states := map[State]bool{}
-	// Three loop updates need three new best samples, which with varying
-	// delays can take a good many polls.
-	r.run(1800, func(float64) { states[r.sys.State()] = true })
+	settlingAfterLastStep := 0
+	r.run(1800, func(float64) {
+		states[r.sys.State()] = true
+		if r.sys.State() == StateSettling {
+			settlingAfterLastStep++
+		} else if r.sys.State() == StateSynced {
+			settlingAfterLastStep = 0
+		}
+	})
 	if !states[StateUnsynced] || !states[StateSettling] || !states[StateSynced] {
 		t.Fatalf("states seen: %v", states)
+	}
+	// SETTLING is counted in measurements for the system source, not in
+	// loop updates, so it must not outlast a couple of poll intervals.
+	if settlingAfterLastStep > 2*64 {
+		t.Fatalf("spent %d s settling; a restarted server answers LI=3 for that long", settlingAfterLastStep)
 	}
 	st := r.sys.Status(r.now)
 	if st.Leap != ntp.LeapNone || st.Stratum != 3 {
@@ -484,5 +516,87 @@ func TestSystemSecondStepWithTwoAgreeingSurvivors(t *testing.T) {
 	apply(sys.Update(m("b", -2.0, 129))) // two survivors agree: allowed
 	if steps != 2 {
 		t.Fatalf("two agreeing survivors must permit the step; steps=%d", steps)
+	}
+}
+
+// TestSystemSecondStepResetsSettling covers RF5X-010: setState is a no-op
+// when the state is already SETTLING, so a second step inside the startup
+// window left the settling evidence standing and declared SYNCED early.
+func TestSystemSecondStepResetsSettling(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 3
+	cfg.Loop.StepLimit = -1 // the point here is the second step, not the budget
+	sys := New(cfg, 0, true)
+	sys.AddSource("a", Options{Numbering: true})
+	m := func(offset, now float64) Measurement {
+		return Measurement{
+			Source: "a", Now: now, At: now, Reach: 0xff, Poll: 6, Valid: true,
+			Offset: offset, Delay: 0.010, Dispersion: 0.001, Jitter: 50e-6,
+			Stratum: 2, Leap: ntp.LeapNone, Precision: -20,
+			SourceRefID: ntp.RefIDFromString("a"),
+		}
+	}
+	now := 0.0
+	feed := func(offset float64) State {
+		now += 64
+		sys.Update(m(offset, now))
+		return sys.State()
+	}
+	if st := feed(2.0); st != StateSettling { // first step
+		t.Fatalf("after the first step: %v", st)
+	}
+	feed(0.001)
+	feed(0.001)
+	// Two post-step samples so far; the third would declare SYNCED. Step
+	// again instead: the count must start over.
+	if st := feed(2.0); st != StateSettling {
+		t.Fatalf("after the second step: %v", st)
+	}
+	if sys.sinceStep != 0 || sys.postStepUpdates != 0 {
+		t.Fatalf("settling evidence survived the second step: sinceStep=%d updates=%d",
+			sys.sinceStep, sys.postStepUpdates)
+	}
+	if st := feed(0.001); st != StateSettling {
+		t.Fatalf("one post-step sample: %v, want settling", st)
+	}
+	if st := feed(0.001); st != StateSettling {
+		t.Fatalf("two post-step samples: %v, want settling", st)
+	}
+	if st := feed(0.001); st != StateSynced {
+		t.Fatalf("three post-step samples: %v, want synced", st)
+	}
+}
+
+// TestSystemResyncSkipsSettling covers RF5X-005 at the System level: after a
+// leap reset the first fresh measurement restores SYNCED without SETTLING.
+func TestSystemResyncSkipsSettling(t *testing.T) {
+	sys := New(simConfig(), 0, true)
+	sys.AddSource("a", Options{Numbering: true})
+	m := func(now float64) Measurement {
+		return Measurement{
+			Source: "a", Now: now, At: now, Reach: 0xff, Poll: 6, Valid: true,
+			Offset: 0.001, Delay: 0.010, Dispersion: 0.001, Jitter: 50e-6,
+			Stratum: 2, Leap: ntp.LeapNone, Precision: -20,
+			SourceRefID: ntp.RefIDFromString("a"),
+		}
+	}
+	for i := 1; i <= 4; i++ {
+		sys.Update(m(float64(i) * 64))
+	}
+	if sys.State() != StateSynced {
+		t.Fatalf("state before the leap: %v", sys.State())
+	}
+	sys.Resync(320)
+	if sys.State() != StateHoldover {
+		t.Fatalf("state after Resync: %v, want holdover", sys.State())
+	}
+	if st := sys.Update(m(384)); len(st.Actions) == 0 {
+		t.Fatal("the first post-leap measurement produced no loop update")
+	}
+	if sys.State() != StateSynced {
+		t.Fatalf("state after the first post-leap update: %v, want synced", sys.State())
+	}
+	if st := sys.Status(384); st.Leap != ntp.LeapNone || st.Stratum != 3 {
+		t.Fatalf("post-leap status: %+v", st)
 	}
 }

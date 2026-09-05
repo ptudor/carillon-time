@@ -80,7 +80,7 @@ func testConfig(drift string, srcs ...SourceSpec) Config {
 			Loop: discipline.LoopConfig{
 				StepThreshold: 0.5, StepLimit: 3, Panic: 1000, MaxSlewPPM: 500, Precision: 1e-6, FreqMeasure: 900,
 			},
-			MinSurvivors: 1, HoldoverMax: 3600, SettleUpdates: 3,
+			MinSurvivors: 1, HoldoverMax: 3600, SettleUpdates: 1,
 		},
 		DriftFile: drift,
 		Sources:   srcs,
@@ -208,6 +208,80 @@ func TestEngineLeapfileOverridesAndResetsAtTransition(t *testing.T) {
 	}
 	if ks := clk.Status(); !ks.Synced || ks.Leap != ntp.LeapNone {
 		t.Fatalf("post-transition kernel status: %+v", ks)
+	}
+
+	// RF5X-005: the first fresh measurement after the transition restores
+	// SYNCED directly. A leap moves the clock by a whole second and changes
+	// neither the frequency nor the phase error, so passing through
+	// SETTLING would answer LI=3 / stratum 16 for as long as the state
+	// machine took to work back — at exactly the moment a leap second makes
+	// a good server most valuable.
+	clk.Advance(time.Second)
+	m := good(0.001)
+	m.Source, m.Now, m.At = "gps", clk.Monotonic(), clk.Monotonic()
+	if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+		t.Fatal(err)
+	}
+	st := e.Status()
+	if st.State != discipline.StateSynced || st.Leap != ntp.LeapNone {
+		t.Fatalf("first post-transition update: state=%v leap=%v, want synced/none", st.State, st.Leap)
+	}
+	if ks := clk.Status(); !ks.Synced || ks.Leap != ntp.LeapNone {
+		t.Fatalf("kernel status after the first post-transition update: %+v", ks)
+	}
+	// The mapping main.go gives the NTP listener must never read false
+	// across the transition: that is what makes clients reject the server.
+	if !serverSynced(st) {
+		t.Fatalf("the listener would have answered unsynchronized: state=%v", st.State)
+	}
+}
+
+// serverSynced mirrors the Status mapping in cmd/carillon: what the NTP
+// listener answers with.
+func serverSynced(st *Status) bool {
+	return st.State == discipline.StateSynced || st.State == discipline.StateHoldover
+}
+
+// TestEngineNeverServesUnsyncedAcrossALeap walks the whole transition and
+// asserts the listener's view is synchronized at every step (RF5X-005).
+func TestEngineNeverServesUnsyncedAcrossALeap(t *testing.T) {
+	transition := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	clk := clock.NewFake(transition.Add(-24 * time.Hour))
+	src := &scripted{name: "gps", clk: clk}
+	cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	cfg.LeapTable = &leap.Table{
+		Expiry:      time.Date(2026, 12, 28, 0, 0, 0, 0, time.UTC),
+		Transitions: []leap.Transition{{At: transition, Leap: ntp.LeapInsert}},
+	}
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed := func() {
+		clk.Advance(time.Second)
+		m := good(0.001)
+		m.Source, m.Now, m.At = "gps", clk.Monotonic(), clk.Monotonic()
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 3 {
+		feed()
+	}
+	if !serverSynced(e.Status()) {
+		t.Fatal("not synced before the transition")
+	}
+	clk.Advance(transition.Sub(clk.TrueTime()) + time.Second)
+	now := clk.Monotonic()
+	if err := e.handle(e.sys.Tick(now), now); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4 {
+		if !serverSynced(e.Status()) {
+			t.Fatalf("the listener answered unsynchronized %d updates after the transition (state %v)",
+				i, e.Status().State)
+		}
+		feed()
 	}
 }
 
