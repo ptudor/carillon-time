@@ -563,3 +563,711 @@ This is an incremental review checkpoint. The final revision will include the co
 **Fix specification:** Check supported ntpd/chrony implementations and relevant protocol versions. If signed root delay is required for interoperability, add a field-specific decode/encode policy and safe distance handling; keep dispersion unsigned and nonnegative. Preserve public numeric units and packet sizes, and reject genuinely excessive or malicious negative values rather than allowing them to cancel uncertainty.
 
 **Verification:** Compare actual peer packets and add raw-bit tests around zero, small negatives, maximum positives, and negative-delay-plus-dispersion combinations for each supported version. Confirm ordinary unsigned root dispersion remains unchanged.
+
+## RA6X-041 — Clock actions are converted to durations without range checks
+
+**Severity:** High
+
+**Location:** `internal/engine/engine.go:529–536,629–635`; `internal/refclock/nmea.go`, offset construction; `internal/config/config.go`, refclock offset validation.
+
+**Problem:** A finite offset need not fit in time.Duration. Engine casts seconds*1e9 directly before stepping, so an extreme value reaches the actuator as an unrelated duration. Finite but enormous calibration values are accepted, ZDA permits year 9999, and time.Time.Sub itself saturates on very large differences. PanicAtStartup can bypass the usual magnitude refusal. This is an actuator-boundary defect even after configuration validation is strengthened.
+
+**Evidence:** `TestAstra6StepRejectsUnrepresentableDuration` supplies a +1e20-second action to Engine.handle with a fake clock. On this arm64 toolchain, handle returns nil and records a +2562047h47m16.854775807s step, roughly 292 years. Other conversion implementations need not produce the same out-of-range result. Kernel error-duration conversions use the same unchecked pattern. No real clock was touched.
+
+**Fix specification:** Validate finiteness and exact representable bounds before each actuator conversion, with overflow-safe conversion and explicit refusal/error propagation. Enforce plausible acquisition/correction rules before losing information through Time.Sub saturation. Preserve legitimate large startup corrections, offset sign, nanosecond units, configured step policy, and backend APIs. Never clamp an unrepresentable phase correction into a centuries-long step.
+
+**Verification:** Make the named fake-actuator probe pass. Cover both signs, NaN/Inf, representable limits and neighboring floating values, huge finite calibration, a future-year sentence, and a legitimate RTC-at-1970 bootstrap. Assert no actuator call on rejection and safe unsynchronized/error status.
+
+## RA6X-042 — NMEA leap-second parsing normalizes or rejects the same instant inconsistently
+
+**Severity:** Medium
+
+**Location:** `internal/refclock/nmea_sentence.go`, `parseNMEA`, `parseNMEAClock`; `internal/refclock/nmea.go`, lastStamp duplicate suppression.
+
+**Problem:** RMC converts 23:59:60 into the following midnight, while ZDA rejects the date rollover produced by the same conversion. RMC's normalized timestamp then collides with the actual next midnight in lastStamp. Second 60 is also allowed at arbitrary minutes without a leap policy. Leap-boundary samples can be misdated, skipped, or admitted with a one-second error.
+
+**Evidence:** parseNMEAClock permits second<=60; RMC validates the calendar date before adding the time, but ZDA validates the final normalized date. Both use time.Date, which cannot represent UTC second 60 distinctly. Additionally, fractional digits beyond nine are discarded before validating their contents, allowing malformed suffixes to pass as time.
+
+**Fix specification:** Represent or deliberately reject leap-boundary sentences consistently and connect their admission to the established leap/epoch policy (RA6X-006/007/022). Do not silently map a leap second to an ordinary next-day sample. Validate the complete fractional field before truncating supported precision. Preserve valid RMC/ZDA timestamps, accepted talkers, checksum requirements, supported subsecond precision, and same-second duplicate suppression.
+
+**Verification:** Test both sentence types at 23:59:59, 23:59:60, and 00:00:00 around insertion and ordinary days; include deletion, arbitrary-minute second 60, and malformed long fractions. Verify the true midnight sample remains usable and no spurious correction occurs.
+
+## RA6X-043 — Receive-buffer fallback can skip the promised minimum
+
+**Severity:** Low
+
+**Location:** `internal/server/listener.go:158–179`, `setReadBuffer`.
+
+**Problem:** Halving an arbitrary requested size can jump below minRecvBuffer without trying it. A system able to provide the documented minimum can therefore fail startup, even though the error says the request was tried down to that minimum.
+
+**Evidence:** With want=100000 and a 65536-byte floor, a refusal at 100000 produces next size=50000 and exits. No request for 65536 occurs. The prior target verification records this fallback gap; this review confirms the loop statically.
+
+**Fix specification:** Clamp the final fallback attempt to the minimum exactly once, terminate on non-capacity errors, and report actual attempted/effective sizes. Preserve current syscall hints, startup failure when even the minimum is unavailable, Linux doubled SO_RCVBUF reporting, and the configured maximum.
+
+**Verification:** Inject a buffer setter that rejects 100000 but accepts 65536. Test power-of-two and non-power-of-two requests, an initial request equal to the floor, all attempts failing, and an immediate non-capacity error.
+
+## RA6X-044 — Synchronous persistence can freeze discipline while the NTP server serves stale synchronization
+
+**Severity:** High
+
+**Location:** `internal/engine/engine.go`, `Run`, `maybeWriteDrift`, `writeDrift`, `publishStatus`; `cmd/carillon/main.go`, NTP Handler.Status closure; `internal/server/responder.go`, status use.
+
+**Problem:** Drift-file create/write/fsync/rename runs synchronously on the sole engine goroutine. A slow filesystem blocks ticks, source handling, and status publication. The UDP listener continues answering from the last immutable snapshot with Synced=true and frozen root dispersion; the last slew word may also remain applied much longer than intended. The server has no independent snapshot-freshness check. A blocking observer/logger presents the same architectural hazard.
+
+**Evidence:** Run calls maybeWriteDrift in its ticker branch; writeDrift calls f.Sync directly. The server closure maps StateSynced/StateHoldover to Synced without checking publication age. Monitor health has a five-second stale test, but that does not affect wire service. This path is confirmed statically; no filesystem stall was induced on the real daemon.
+
+**Fix specification:** Isolate persistence behind a bounded, single-owner worker with immutable validated frequency candidates and observable failures; preserve atomic replacement and stable-write gating. Add an independent monotonic age limit to served status, conservatively aging uncertainty or serving unsynchronized when the engine is stale. Make observer nonblocking requirements enforceable/documented. Coordinate applied-word accounting with RA6X-008 and shutdown with RA6X-045; do not let delayed writes overwrite a newer accepted candidate.
+
+**Verification:** Block an injected drift writer while driving a fake oscillator and an in-process responder. Require ticks/measurement handling to continue, bounded queueing, and no synchronized response from an expired snapshot. Test slow success, permanent error, worker shutdown, and reordered candidates.
+
+## RA6X-045 — The shutdown deadline excludes the engine and frequency restoration
+
+**Severity:** High
+
+**Location:** `internal/engine/engine.go:378–383`, `restoreBaseFrequency`; `cmd/carillon/main.go`, eng.Run and auxiliaries.wait ordering.
+
+**Problem:** Shutdown waits for every source goroutine before restoring base frequency, and final persistence can also block before Run returns. Main's deadline starts only afterward. A stuck source/driver or filesystem can prevent restoration and exit indefinitely; a service manager's eventual kill can leave the phase-slew transient in the kernel. The documented bounded shutdown is therefore incomplete.
+
+**Evidence:** The sequence is cancel → wg.Wait → restoreBaseFrequency → maybeWriteDrift → return, followed by main's auxiliary deadline. No source-drain timeout protects the clock cleanup. Current source interfaces depend on implementations honoring cancellation and device timeout behavior; these expectations are not a bound.
+
+**Fix specification:** Stop accepting updates and restore the base/appropriate kernel status promptly under engine ownership before waiting on untrusted blocking components. Bound source/auxiliary drain and best-effort persistence within an overall shutdown policy, with explicit error reporting. Preserve single-writer clock ownership, no exit-time step, ordinary clean shutdown, and the existing no-frequency-retry rule after a rejected frequency syscall where applicable.
+
+**Verification:** Use a fake source that intentionally ignores cancellation and a separately blocked drift writer. Cancel while a nonzero transient is applied; require prompt fake-clock restoration and bounded process shutdown, with a diagnostic identifying the stuck component. Do not use a real clock or driver hang to test this.
+
+## RA6X-046 — Statistics retention trusts an unsynchronized wall clock
+
+**Severity:** High
+
+**Location:** `internal/stats/writer.go`, `recordServer`, `file`, `prune`; `cmd/carillon/main.go`, stats Config.Now wiring.
+
+**Problem:** Any new dated file invokes destructive retention using that row's wall date, even before the clock is trusted. A future RTC at boot can erase all retained historical statistics on a minute tick or shutdown server row. A future PPS timestamp or other misdated row can trigger the same deletion independently of server statistics.
+
+**Evidence:** `TestAstra6UntrustedWallTimeDoesNotPrune` plants a 2026 statistics file, creates a recorder with Now=2099 and keep_days=7, and calls recordServer without any synchronized engine state. The planted file is deleted. prune removes whole dated directories based solely on the supplied at value. keep_days=0 avoids this path but is not the only supported configuration.
+
+**Fix specification:** Separate the timestamp used to label observations from a trusted retention horizon. Do not advance destructive retention from unsynchronized, implausibly jumping, or source-provided wall time. Define when validated clock history makes a new horizon safe, including boot and large steps. Preserve existing TSV paths/columns, logging of unsynchronized observations, keep_days=0, and intentional UTC-day retention semantics; do not disable all recording until synchronization.
+
+**Verification:** Make the named probe pass. Test future and past RTCs, startup/shutdown before sync, a corrected RTC, misdated PPS rows, forward/backward steps, and trusted ordinary day rotation. Confirm only expired owned statistics are removed once the horizon is trusted.
+
+## RA6X-047 — Statistics omit source loss and state transitions without loop updates
+
+**Severity:** Medium — **Needs investigation: intended diagnostic coverage**
+
+**Location:** `internal/stats/writer.go:131–145`, `process`; `DESIGN.md`, statistics contract.
+
+**Problem:** Loop/source rows are emitted only when Updates changes. During filter starvation, holdover entry/expiry, repeated failures, or source shutdown, the most useful health changes may never be recorded. This is consistent with the documented per-update sampling rate but conflicts with using these files to reconstruct outage and discipline behavior; the limitation should be an explicit operational decision.
+
+**Evidence:** Both writeLoop and writeSources are inside `st.Updates > 0 && st.Updates != r.lastUpdates`. Engine publishes ticks and lifecycle changes, but the recorder discards them for these files. Server traffic rows do not record the missing discipline/source state.
+
+**Fix specification:** Decide and document a bounded event/heartbeat recording contract. Record material state/reach/source changes even if no new phase observation is accepted, without pretending they are loop updates. Preserve existing TSV column meanings and consumers; use an explicitly identified event stream or compatible repeated snapshots rather than silently redefining Updates. Keep I/O off the engine and bound outage log volume.
+
+**Verification:** Simulate synchronized → source loss → holdover → unsynchronized → recovery with no intervening loop updates. Require the chosen recording mechanism to reconstruct the transitions and distinguish them from new measurements, with a bounded row rate.
+
+## RA6X-048 — Per-pulse statistics can silently coalesce accepted PPS events
+
+**Severity:** Medium
+
+**Location:** `internal/engine/engine.go`, `publishStatus`; `internal/refclock/pps.go`, Info publication; `internal/stats/writer.go`, `process` lastPulse logic; `DESIGN.md:1351–1354`.
+
+**Problem:** The claimed per-accepted-pulse file is generated from each source's latest Info when the engine publishes a snapshot, not from the accepted pulse event itself. If multiple pulses arrive before queued measurements are processed, every snapshot can see only the newest pulse. Earlier accepted pulses disappear without the recorder's dropped counter increasing. Measurements and diagnostic pulse data can also describe different events.
+
+**Evidence:** publishStatus calls Source.Info at snapshot time; Recorder reads Refclock.LastPulse/Sequence and deduplicates repeated LastPulse. The engine queue carries Measurement, not an immutable pulse record, and Info retains only the latest pulse. A source advances independently of engine consumption, making coalescing possible even when the recorder queue never fills.
+
+**Fix specification:** Carry accepted-pulse identity/data through an immutable event path with bounded buffering and explicit drop accounting, or explicitly change the diagnostic contract to sampled pulse snapshots. Preserve nonblocking clock discipline, sequence wrap handling, existing TSV columns, and cumulative source counters. Do not infer zero loss from recorder-queue drops alone.
+
+**Verification:** Hold engine processing while a fake PPS source accepts several sequential pulses, then drain without filling the recorder queue. Require one correct row per accepted pulse or a documented loss count that accounts for every omitted event; verify no mismatched timestamp/offset/sequence tuples.
+
+## RA6X-049 — JSON output failures are reported as successful empty responses
+
+**Severity:** Medium
+
+**Location:** `internal/monitor/server.go:172–176`, `writeJSON`; `internal/control/server.go`, `reply`; `cmd/carillonctl/main.go`, JSON encoding.
+
+**Problem:** HTTP status 200 is committed before encoding, and the encoding error is discarded. Nonfinite state, reachable through RA6X-014/035, yields an empty success response. Control serialization logs and closes without a structured error, while the CLI ignores encoding/write errors and can exit successfully with incomplete output.
+
+**Evidence:** `TestAstra6JSONEncodingFailureIsNotSuccess` passes a NaN-valued object to writeJSON and obtains HTTP 200 with an empty body. The function discards Encoder.Encode's result. The control/CLI paths similarly lack a useful client-visible failure outcome.
+
+**Fix specification:** Serialize before committing success headers, return a bounded stable 500/error response on internal encoding failure, and log appropriate diagnostics without exposing secrets. Return nonzero CLI status on failed JSON output. Validate finite state upstream as well; do not silently turn invalid numeric data into healthy zero values or change valid schema/units.
+
+**Verification:** Make the named probe pass; test NaN/Inf in tracking/source fields, a failing output writer, and normal status responses. Assert valid JSON and correct non-success status/error signaling, with the same schema for valid data.
+
+## RA6X-050 — A preferred source that never answers is never reported lost
+
+**Severity:** Medium
+
+**Location:** `internal/discipline/select.go:238–251,310–337`; monitor health and prefer transition events.
+
+**Problem:** PreferLost requires the preferred source to have been reachable at least once. A miswired, misconfigured, or permanently unavailable preferred GPS/upstream can remain absent forever while fallback service is reported healthy. Avoiding noisy startup alerts accidentally suppresses a real persistent failure.
+
+**Evidence:** `reportPreferLost := preferConfigured && preferSeen && ...`; preferSeen comes only from everReachable. `TestVerification036ReportsNeverReachablePreferAfterFallback` advances successful fallback operation while the preferred source never reaches and observes PreferLost=false.
+
+**Fix specification:** Suppress the initial no-source acquisition phase or a documented grace interval, then report an unavailable configured preferred source once fallback is established, regardless of whether it ever answered. Preserve exactly-once loss/recovery transition logs, fallback selection, noselect behavior, and the ability of another valid preferred source to satisfy the policy in the lower-level selector API.
+
+**Verification:** Make the existing probe pass. Test initial acquisition, permanent preferred-source absence, delayed first answer, later loss/recovery, and the existing multiple-prefer selector compatibility case.
+
+## RA6X-051 — PPS disagreement diagnostics outlive the comparison that produced them
+
+**Severity:** Low
+
+**Location:** `internal/discipline/select.go`, Select and ppsAgreement; `internal/control/protocol.go`, `RefclocksOf`.
+
+**Problem:** Losing the numbering source can leave a previously disagreeing PPS marked with a current-looking DisagreesWith/Disagreement value even though it is now unqualified or unreachable and no comparison exists. Operators can chase edge/calibration errors when the present problem is numbering loss.
+
+**Evidence:** These fields are assigned only inside the PPSQualified branch. Candidate rejection and the no-numbering path do not clear them. `TestVerification007ClearsObsoleteDisagreement` still fails; the CLI unconditionally renders the retained text.
+
+**Fix specification:** Clear current disagreement diagnostics whenever the comparison is no longer applicable; if retaining historical diagnostics is useful, expose them explicitly as historical with an observation time. Preserve qualification, locking, source selection, and existing current-field meanings.
+
+**Verification:** Make the existing fixture pass. Test disagreement → numbering loss → recovery/agreement, PPS reach zero, noselect, and clock-step invalidation; assert status and displayed reason describe the current state.
+
+## RA6X-052 — Monitoring server lifecycle does not fully own its listener and shutdown
+
+**Severity:** Low
+
+**Location:** `internal/monitor/server.go:119–142`, Close and Serve; main's constructor error cleanup.
+
+**Problem:** Close before Serve calls only http.Server.Close, which has not registered the already-bound listener, so the port remains occupied. During Serve cancellation, the AfterFunc runs Shutdown asynchronously; Serve may return before active handlers drain, and a shutdown timeout is logged without a forced close. Callers cannot rely on the advertised lifecycle completion.
+
+**Evidence:** `TestAstra6CloseBeforeServeReleasesListener` binds a monitor, calls Close without Serve, and cannot rebind its address. The underlying listener must be closed explicitly for probe cleanup. Serve stops the cancellation callback but never joins an already-running callback.
+
+**Fix specification:** Own and close the bound listener in all pre-Serve/error/Close paths. Join shutdown completion before reporting Serve finished, and force-close remaining connections after the bounded graceful deadline. Make repeated/concurrent cleanup safe. Preserve handlers, ACLs, status codes, and normal graceful request completion.
+
+**Verification:** Make the named probe pass; test construction followed by Close, startup failure after monitor binding, cancellation before Serve, repeated Close, and an active blocked handler at shutdown. Require released ports/connections and bounded completion.
+
+## RA6X-053 — Monitoring freshness and last-activity ordering break across wall-clock steps
+
+**Severity:** Low
+
+**Location:** `internal/monitor/model.go`, SnapshotOf and healthOf; `internal/server/stats.go`, storeLatest/later; `internal/engine/engine.go`, Status publication.
+
+**Problem:** A daemon designed to step wall time uses wall subtraction for snapshot freshness and maximum Unix time for last activity. A backward step makes an old snapshot appear fresh by clamping negative age to zero; last_request/last_served may remain pinned to a pre-step future timestamp. started_at is recomputed as current wall time minus uptime and changes when the clock steps, despite describing one process instance.
+
+**Evidence:** SnapshotOf strips monotonic information with UTC conversion before healthOf computes age. storeLatest refuses any timestamp below the previous UnixNano maximum. There is no immutable process-start wall timestamp or publication-monotonic timestamp in the status model. RA6X-044 makes reliable snapshot age safety-relevant.
+
+**Fix specification:** Track monotonic publication/event ordering independently of display wall timestamps, capture process identity/start metadata once with documented semantics, and preserve latest-event wall time even across steps. Handle concurrent listener updates by event ordering rather than maximum wall value. Preserve JSON/Prometheus field names and units; document what started_at means when boot time was initially wrong.
+
+**Verification:** Simulate forward/backward steps between publication and serving, between accepted requests, and after startup. Assert stale detection uses elapsed time, recent events replace older events, and instance identity remains stable.
+
+## RA6X-054 — ABI verification tests cannot be built because they import C in test files
+
+**Severity:** Medium
+
+**Location:** `internal/pps/pps_linux_cgo_test.go`; `internal/pps/pps_freebsd_cgo_test.go`; `internal/clock/timex_freebsd_cgo_test.go`.
+
+**Problem:** The intended native-header comparisons for hand-written syscall layouts never run: Go rejects import C in _test.go files. Ordinary pure-Go compilation therefore gives false confidence about the independently declared PPS/timex ABI, a particularly important boundary for a clock daemon.
+
+**Evidence:** Safe package-loading commands, without executing tests or hardware operations, fail for Linux with `use of cgo in test pps_linux_cgo_test.go not supported` and for FreeBSD with corresponding PPS and timex filenames. The failure happens before checking native headers or comparing any layout.
+
+**Fix specification:** Put minimal C-backed layout helpers in non-test files guarded by the appropriate platform, cgo, and explicit verification tags, or compile a standalone C layout probe and compare its output. Keep production and cross-builds pure Go with CGO_ENABLED=0. Separate header-only ABI checks from tests that can touch a device or clock, so safe verification does not require enabling hardware mutations.
+
+**Verification:** On native Linux and FreeBSD, compile and run only the layout comparisons for supported architectures against system headers. Require sizes, alignments, offsets, constants, and ioctl argument sizes to match; also rebuild ordinary CGO_ENABLED=0 binaries and confirm no C dependency enters them.
+
+## RA6X-055 — The documented race-test Make target fails on deployment platforms
+
+**Severity:** Medium
+
+**Location:** `Makefile`, global CGO_ENABLED export and test target.
+
+**Problem:** Make exports CGO_ENABLED=0 but its test recipe requests -race. On Linux and FreeBSD the Go race build requires cgo, so make test stops before executing the suite. Successful macOS testing with this particular toolchain does not validate the target-host command.
+
+**Evidence:** With Go 1.27, `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -race ./internal/discipline` and the FreeBSD equivalent both return `go: -race requires cgo`. Native darwin/arm64 make test succeeds with this toolchain, so this is not claimed as a failure on every platform.
+
+**Fix specification:** Enable cgo specifically for supported native race-test invocations and require a suitable native compiler/runtime; retain CGO_ENABLED=0 for production builds. Document unsupported cross-race execution and keep the Go-version support matrix accurate. Do not weaken the test target by dropping -race silently.
+
+**Verification:** Run make test natively on Linux and FreeBSD with the supported Go/compiler setup, plus the development host. Re-run all four pure-Go production cross-builds and inspect that their linking properties remain unchanged.
+
+## RA6X-056 — The serial EOF regression asserts the wrong kernel event path
+
+**Severity:** Low
+
+**Location:** `internal/serial/read_unix_test.go`, TestReadTimeoutReportsEOF; `internal/serial/read_unix.go`, POLLHUP handling.
+
+**Problem:** Closing a pipe writer causes poll to report HUP, which production intentionally converts to a device-unavailable error before calling read. The test insists on io.EOF, so it fails on the supported hosts while not exercising the repaired zero-length-read path at all. This is a test defect; the actual HUP path already avoids the busy loop.
+
+**Evidence:** The prior Linux/FreeBSD target results show this assertion failing. Current ReadTimeout checks POLLERR/POLLHUP/POLLNVAL before unix.Read. This review cross-built the code but did not execute those kernels' serial tests.
+
+**Fix specification:** Keep a real closed-pipe test asserting prompt non-timeout disconnect, and add an injected poll/read seam or equivalent controlled fixture that actually produces n=0, err=nil after readable polling. Preserve existing production disconnect classification unless an explicit error-contract change is intended; do not alter correct HUP behavior solely to satisfy this assertion.
+
+**Verification:** Run both tests on Linux and FreeBSD. Confirm the zero-read path wraps io.EOF, HUP is a non-timeout error, cancellation remains bounded, and neither path busy-spins.
+
+## RA6X-057 — Source-count validation does not express an achievable or independent quorum
+
+**Severity:** Medium — **Needs investigation: quorum/configuration policy**
+
+**Location:** `internal/config/config.go`, Validate; `internal/discipline/select.go`, Select/intersect/cluster; `internal/source/ntp.go`, endpoint resolution.
+
+**Problem:** Validation accepts min_survivors larger than the available selectable sources, all-noselect configurations, and bare PPS without any numbering source. These can remain permanently unsynchronized with no startup explanation. Conversely, distinct source names resolving to the same endpoint count as separate votes; GPS NMEA/PPS also share a physical clock. The actual meaning of a source quorum is under-specified.
+
+**Evidence:** Validate only checks that some source block exists, names are unique, and MinSurvivors>=1. Selection counts SourceState entries. No physical/endpoint identity contributes to the vote count, and cluster's stopping floor is a fixed three rather than a general configured quorum policy. A high minimum can legitimately choose to refuse after clustering; that behavior alone is not proof of a clustering bug.
+
+**Fix specification:** Define whether min_survivors means surviving associations or independent clocks and document dependent refclock roles. Diagnose statically impossible synchronization configurations, while preserving any intentionally supported monitoring-only configuration through an explicit policy. Detect/report duplicate resolved endpoints and avoid presenting them as independent agreement if independence is promised. Do not automatically raise/lower quorum or keep a falseticker just to meet the count.
+
+**Verification:** Test impossible minima, all-noselect, sole bare PPS, valid PPS plus numbering, multiple names for one endpoint, DNS convergence/divergence, and four-or-more-source clustering. Require actionable diagnostics and behavior consistent with the documented quorum definition.
+
+## RA6X-058 — Drift replacement lacks an explicit power-loss durability contract
+
+**Severity:** Low — **Needs investigation: supported-filesystem durability**
+
+**Location:** `internal/engine/engine.go:275–305`, writeDrift.
+
+**Problem:** The temporary file is synced before chmod/rename, but the containing directory is never synced after replacement. Atomic visibility during normal execution does not itself establish that the new directory entry survives power loss on every supported filesystem. A last-known-good calibration can revert or disappear after a crash even though writeDrift returned success.
+
+**Evidence:** The syscall sequence ends at os.Rename; there is no parent-directory sync or stated filesystem-specific durability guarantee. This review did not simulate power loss. The source promises atomic replacement, so the unresolved point is whether restart calibration requires durable replacement too, not whether rename is normally atomic.
+
+**Fix specification:** Decide the required persistence guarantee and verify it on supported Linux/FreeBSD filesystems. If successful persistence must survive power loss, order metadata changes and file/directory syncing appropriately and handle unsupported/error cases explicitly. Preserve atomic reader visibility, known-good contents on pre-rename failure, file mode, and stable-write gating; coordinate with RA6X-015/044 so durability work cannot block discipline.
+
+**Verification:** Use filesystem fault/crash testing in a disposable environment and injected syscall failures around write, sync, chmod, rename, and directory sync. Require either the old complete value or the newly committed complete value according to the documented guarantee, with no falsely reported durable success.
+
+## Reproducible Astra6 probes
+
+These review fixtures were run only in a temporary copy with fake clocks and temporary files/sockets. They are embedded here to keep the repository change limited to this report. The assertions express desired behavior and **fail on the reviewed baseline**. The receiver-validity assertion for RA6X-021 demonstrates the admitted contradictory state; finalize the receiver policy before making that assertion normative. These are focused counterexamples, not complete future regression suites.
+
+From the repository root, the following runner extracts the nine fixtures into a temporary directory and adds them to the Go build with an overlay. It does not edit any repository source or existing tests. It requires Python 3, a compatible Go installation, native race support, and permission to bind temporary local sockets. Short temporary paths avoid Unix-socket path-length skips on macOS. Exit status 1 is expected on this baseline.
+
+```python
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+
+root = Path.cwd()
+report = root / "review/2026/09/REVIEW_ASTRA6_XHIGH.md"
+fixtures = re.findall(
+    r"^### Probe file: `([^`]+)`\n\n```go\n(.*?)^```$",
+    report.read_text(), re.MULTILINE | re.DOTALL,
+)
+assert len(fixtures) == 9, "Review fixture inventory changed; inspect before running"
+with tempfile.TemporaryDirectory(prefix="ra6x-", dir="/tmp") as name:
+    temporary = Path(name)
+    mapping = {}
+    packages = set()
+    for relative, code in fixtures:
+        path = Path(relative)
+        assert path.parts[0] == "internal" and ".." not in path.parts
+        assert path.name.startswith("astra6") and path.name.endswith("_test.go")
+        assert not (root / path).exists(), f"Refusing to hide existing file: {path}"
+        target = temporary / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(code)
+        mapping[str(root / path)] = str(target)
+        packages.add("./" + str(path.parent))
+    overlay = temporary / "overlay.json"
+    overlay.write_text(json.dumps({"Replace": mapping}))
+    env = os.environ.copy()
+    env["CGO_ENABLED"] = "1"
+    env["TMPDIR"] = "/tmp"
+    command = [shutil.which("go") or "/opt/local/bin/go", "test", "-race",
+               "-overlay", str(overlay), "-run", "^TestAstra6", "-count=1", "-v",
+               *sorted(packages)]
+    raise SystemExit(subprocess.run(command, cwd=root, env=env).returncode)
+```
+
+### Probe file: `internal/config/astra6_review_test.go`
+
+```go
+package config
+
+import (
+	"math"
+	"testing"
+)
+
+func TestAstra6ConfigurationRejectsInfinity(t *testing.T) {
+	mutations := map[string]func(*Config){
+		"drift_seconds": func(c *Config) { c.Daemon.DriftStableSeconds = math.Inf(1) },
+		"drift_spread":  func(c *Config) { c.Daemon.DriftStableSpreadPPM = math.Inf(1) },
+		"holdover":      func(c *Config) { c.Discipline.HoldoverMax = math.Inf(1) },
+		"panic":         func(c *Config) { c.Step.Panic = math.Inf(1) },
+		"rate":          func(c *Config) { c.Serve.RateLimitPPS = math.Inf(1) },
+		"burst":         func(c *Config) { c.Serve.RateBurst = math.Inf(1) },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			c := Default()
+			c.Servers = []Server{{Name: "a", Address: "192.0.2.1", PollMin: 6, PollMax: 10}}
+			c.Serve.Allow = []string{"127.0.0.0/8"}
+			c.Serve.Listen = []string{"127.0.0.1:123"}
+			if err := Validate(c); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			mutate(c)
+			if err := Validate(c); err == nil {
+				t.Fatal("infinite setting accepted")
+			}
+		})
+	}
+}
+```
+
+### Probe file: `internal/control/astra6_review_test.go`
+
+```go
+package control
+
+import (
+	"context"
+	"net"
+	"os"
+	"testing"
+	"time"
+)
+
+func TestAstra6ListenPreservesRegularFile(t *testing.T) {
+	p := socketPath(t)
+	if err := os.WriteFile(p, []byte("valuable contents"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := Listen(p, newEngine(t), nil, "v", nil)
+	if srv != nil {
+		defer srv.ln.Close()
+	}
+	b, readerr := os.ReadFile(p)
+	if err == nil || readerr != nil || string(b) != "valuable contents" {
+		t.Fatalf("existing file replaced: Listen=%v, read=%v, contents=%q", err, readerr, b)
+	}
+}
+
+func TestAstra6CallHonorsCancellation(t *testing.T) {
+	p := socketPath(t)
+	ln, err := net.Listen("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, e := Call(ctx, p, Request{Command: CmdWaitSync}); done <- e }()
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	b := make([]byte, 256)
+	c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err = c.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		c.Close()
+		<-done
+		t.Fatal("Call still blocked 200 ms after context cancellation")
+	}
+}
+```
+
+### Probe file: `internal/discipline/astra6_review_test.go`
+
+```go
+package discipline
+
+import (
+	"carillon/internal/ntp"
+	"testing"
+)
+
+func TestAstra6SettlingLossDoesNotSynchronize(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 3
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	s.Update(Measurement{Source: "a", Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone})
+	if s.State() != StateSettling {
+		t.Fatalf("setup state=%v", s.State())
+	}
+	s.Update(Measurement{Source: "a", Now: 2, Reach: 0, Poll: 6})
+	st := s.Status(2)
+	if st.State == StateHoldover || st.Leap != ntp.LeapUnsync || st.Stratum != 16 {
+		t.Fatalf("never synchronized but loss yields state=%v LI=%v stratum=%d", st.State, st.Leap, st.Stratum)
+	}
+}
+
+func TestAstra6NeverStepIncludesPanicStartup(t *testing.T) {
+	cfg := loopCfg()
+	cfg.StepLimit = 0
+	cfg.PanicAtStartup = true
+	u := NewLoop(cfg, 0, true).Update(2000, 6, 1, false, true)
+	if u.Stepped {
+		t.Fatal("limit=0 and panic_at_startup=true issued a 2000-second step")
+	}
+}
+
+func TestAstra6MissIsNotSettlingEvidence(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 1
+	s := New(cfg, 0, true)
+	s.AddSource("a", Options{Numbering: true})
+	s.Update(Measurement{Source: "a", Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Offset: 0.001, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone})
+	s.Update(Measurement{Source: "a", Now: 65, Reach: 254, Poll: 6})
+	if s.State() == StateSynced {
+		t.Fatal("timeout-only measurement completed settling")
+	}
+}
+
+func TestAstra6LeapUpdatesWithoutSystemFeedback(t *testing.T) {
+	s := New(simConfig(), 0, true)
+	s.AddSource("a", Options{Numbering: true, Prefer: true})
+	s.AddSource("b", Options{Numbering: true})
+	s.AddSource("c", Options{Numbering: true})
+	m := Measurement{Now: 1, At: 1, Valid: true, Reach: 255, Poll: 6, Delay: 0.01, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone}
+	for _, name := range []string{"a", "b", "c"} {
+		m.Source = name
+		s.Update(m)
+	}
+	m.Now = 2
+	m.At = 2
+	m.Leap = ntp.LeapInsert
+	for _, name := range []string{"b", "c"} {
+		m.Source = name
+		s.Update(m)
+	}
+	if s.leap != ntp.LeapInsert {
+		t.Fatalf("2/3 survivors announce insertion, system still LI=%v", s.leap)
+	}
+}
+```
+
+### Probe file: `internal/engine/astra6_bounds_review_test.go`
+
+```go
+package engine
+
+import (
+	"carillon/internal/clock"
+	"carillon/internal/discipline"
+	"testing"
+	"time"
+)
+
+func TestAstra6StepRejectsUnrepresentableDuration(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	e, err := New(testConfig(""), clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.handle(discipline.Result{Actions: []discipline.Action{{Kind: discipline.ActionStep, Value: 1e20}}}, 1)
+	if err == nil || len(clk.Steps) != 0 {
+		t.Fatalf("unrepresentable positive step reached actuator: err=%v steps=%v", err, clk.Steps)
+	}
+}
+```
+
+### Probe file: `internal/engine/astra6_review_test.go`
+
+```go
+package engine
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestAstra6DriftRejectsNaN(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "drift")
+	if err := os.WriteFile(p, []byte("NaN\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := readDrift(p); err == nil {
+		t.Fatalf("non-finite drift accepted: %v", v)
+	}
+}
+```
+
+### Probe file: `internal/monitor/astra6_review_test.go`
+
+```go
+package monitor
+
+import (
+	"carillon/internal/engine"
+	"math"
+	"net"
+	"net/http/httptest"
+	"net/netip"
+	"testing"
+)
+
+func TestAstra6JSONEncodingFailureIsNotSuccess(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeJSON(w, 200, map[string]float64{"frequency": math.NaN()})
+	if w.Code == 200 {
+		t.Fatalf("encoding failure returned HTTP %d with body %q", w.Code, w.Body.String())
+	}
+}
+func TestAstra6CloseBeforeServeReleasesListener(t *testing.T) {
+	s, err := Listen(Config{Listen: netip.MustParseAddrPort("127.0.0.1:0"), Allow: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")}, Status: func() *engine.Status { return &engine.Status{} }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.ln.Close()
+	addr := s.Addr().String()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("Close before Serve retained the bound port: %v", err)
+	}
+	ln.Close()
+}
+```
+
+### Probe file: `internal/refclock/astra6_review_test.go`
+
+```go
+package refclock
+
+import (
+	"carillon/internal/discipline"
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+type astraSerial struct{ close func() }
+
+func (r *astraSerial) ReadTimeout([]byte, time.Duration) (int, error) {
+	return 0, errors.New("device disconnected")
+}
+func (r *astraSerial) Close() error { r.close(); return nil }
+
+func TestAstra6NMEACancelDuringReconnect(t *testing.T) {
+	n, _, _ := testNMEA(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n.reader = &astraSerial{close: cancel}
+	n.opener = func() (serialReader, error) { return nil, errors.New("absent") }
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("cancellation panicked: %v", p)
+		}
+	}()
+	if err := n.Run(ctx, make(chan discipline.Measurement, 1)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAstra6NMEASilenceRequiresFreshWindow(t *testing.T) {
+	n, _, _ := testNMEA(t)
+	base := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	feed := func(stamp time.Time, mono float64, offset time.Duration) discipline.Measurement {
+		m, ok := n.acceptLine(sentence("GPRMC,"+stamp.Format("150405")+",A,,,,,,,"+stamp.Format("020106")+",,,"), stamp.Add(150*time.Millisecond-offset), mono)
+		if !ok {
+			t.Fatal("sentence rejected")
+		}
+		return m
+	}
+	for i := 0; i < 16; i++ {
+		feed(base.Add(time.Duration(i)*time.Second), float64(i+1), 0)
+	}
+	n.tick(100)
+	if n.reach != 0 {
+		t.Fatalf("setup reach=%d", n.reach)
+	}
+	m := feed(base.Add(100*time.Second), 101, 100*time.Millisecond)
+	if m.Valid {
+		t.Fatalf("one fresh sample after silence is valid with historical offset=%g, current=0.1", m.Offset)
+	}
+}
+
+func TestAstra6NMEARecoversAfterFutureDate(t *testing.T) {
+	n, _, _ := testNMEA(t)
+	arrival := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	n.acceptLine(sentence("GPZDA,120000,23,08,2099,00,00"), arrival, 1)
+	n.resetWindow()
+	if _, ok := n.acceptLine(sentence("GPZDA,120001,23,08,2026,00,00"), arrival.Add(time.Second), 2); !ok {
+		t.Fatalf("correct time rejected after reset; lastStamp=%v", n.lastStamp)
+	}
+}
+
+func TestAstra6ZDAHonorsKnownInvalidTime(t *testing.T) {
+	n, _, _ := testNMEA(t)
+	arrival := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	n.acceptLine(sentence("GPRMC,120000,V,,,,,,,230826,,,"), arrival, 1)
+	for i := 0; i < 4; i++ {
+		stamp := arrival.Add(time.Duration(i) * time.Second)
+		m, ok := n.acceptLine(sentence("GPZDA,"+stamp.Format("150405")+",23,08,2026,00,00"), stamp.Add(150*time.Millisecond), float64(i+2))
+		if ok && m.Valid {
+			t.Fatalf("ZDA admitted while latest RMC status V; FixValid=%v", n.Info().Refclock.FixValid)
+		}
+	}
+}
+```
+
+### Probe file: `internal/server/astra6_review_test.go`
+
+```go
+package server
+
+import (
+	"carillon/internal/ntp"
+	"net/netip"
+	"testing"
+	"time"
+)
+
+func TestAstra6AuthenticatedRATEIsAuthenticated(t *testing.T) {
+	h, _ := newTestHandler(t, func(c *Config) {
+		c.RateBurst = 1
+		c.RateLimitPPS = 1
+		c.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.0/24"): 1}
+	})
+	req := testKey.Append(request(4))
+	h.Handle(req, from("192.0.2.1"), testWall, testMono)
+	got := h.Handle(req, from("192.0.2.1"), testWall, testMono.Add(time.Millisecond))
+	p, mac, off, err := ntp.Decode(got)
+	if err != nil || p.ReferenceID != ntp.KissRATE {
+		t.Fatalf("setup no RATE: %v %+v", err, p)
+	}
+	if !testKey.Verify(got[:off], mac) {
+		t.Fatal("authenticated client's RATE response has no valid MAC")
+	}
+}
+
+func TestAstra6OptionalAuthHasIndependentBucket(t *testing.T) {
+	h, _ := newTestHandler(t, func(c *Config) { c.RateBurst = 1; c.RateLimitPPS = 1; c.KoD = false })
+	h.Handle(request(4), from("192.0.2.1"), testWall, testMono)
+	if got := h.Handle(testKey.Append(request(4)), from("192.0.2.1"), testWall, testMono); len(got) == 0 {
+		t.Fatal("unsigned request drained optional authenticated client's bucket")
+	}
+}
+```
+
+### Probe file: `internal/stats/astra6_review_test.go`
+
+```go
+package stats
+
+import (
+	ntpserver "carillon/internal/server"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestAstra6UntrustedWallTimeDoesNotPrune(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "2026", "09", "05", "loop.tsv")
+	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("evidence\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r := New(Config{Dir: dir, KeepDays: 7, Now: func() time.Time { return time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC) }, Server: func() ntpserver.StatsSnapshot { return ntpserver.StatsSnapshot{} }})
+	defer r.closeFiles()
+	if err := r.recordServer(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("untrusted future RTC deleted retained evidence: %v", err)
+	}
+}
+```
