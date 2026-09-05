@@ -35,6 +35,13 @@ const maxKernelError = 16 * time.Second
 // itself, so the shutdown path knows not to make the same call again.
 var errFrequencyRefused = errors.New("kernel refused a frequency change")
 
+// minDriftUpdates is how many accepted loop updates must span the stability
+// window before the frequency estimate is worth persisting. Two is enough to
+// distinguish "the loop has been running and the estimate held still" from
+// "nothing has been measured for the whole window". At the default 900 s
+// window an ordinary poll-6 association delivers about fourteen.
+const minDriftUpdates = 2
+
 // Bounds on the delay before a source whose Run returned is started again.
 const (
 	sourceRestartMin = time.Second
@@ -175,15 +182,24 @@ type Engine struct {
 	// until it does, so health rests on fresh evidence.
 	restarting map[string]bool
 
-	// freqHistory is the recent base frequency, for the drift-file gate.
+	// freqHistory is the recent base frequency, for the drift-file gate,
+	// and freqSource/freqSteps are what produced it: a change in either
+	// partitions the evidence.
 	freqHistory    []freqSample
+	freqSource     string
+	freqSteps      int
 	driftSkipShown bool
 }
 
-// freqSample is one reading of the loop's base frequency.
+// freqSample is one reading of the loop's base frequency, together with the
+// number of loop updates that had been accepted when it was taken. The count
+// is what tells a genuinely settled estimate from a frozen one: a flat run of
+// readings taken while nothing was being measured looks identical to a
+// converged loop, and is not (RA6X-013).
 type freqSample struct {
-	at  float64 // monotonic seconds
-	ppm float64
+	at      float64 // monotonic seconds
+	ppm     float64
+	updates int
 }
 
 // New builds an engine. It loads the initial frequency (drift file, then the
@@ -865,7 +881,7 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 		e.lastLoopUpdate = st.LastUpdate
 		e.refWall = e.clk.Now()
 	}
-	e.noteFrequency(now, st.Frequency)
+	e.noteFrequency(now, &st)
 	if err := e.syncKernel(&st); err != nil {
 		return err
 	}
@@ -987,8 +1003,22 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 
 // noteFrequency records the base frequency for the drift-file stability gate,
 // keeping only the last DriftStableWindow of history.
-func (e *Engine) noteFrequency(now, ppm float64) {
-	e.freqHistory = append(e.freqHistory, freqSample{at: now, ppm: ppm})
+func (e *Engine) noteFrequency(now float64, st *discipline.Status) {
+	// Only a synchronized daemon's frequency is evidence about this host's
+	// oscillator. While settling, in holdover, or unsynchronized, the word
+	// in the kernel is a guess being carried, not a measurement.
+	if st.State != discipline.StateSynced {
+		e.freqHistory = e.freqHistory[:0]
+		return
+	}
+	// Evidence is partitioned by what produced it. A different system
+	// source is a different measurement chain, and a step means the loop
+	// was re-seeded, so neither may be averaged with what came before.
+	if st.SystemSource != e.freqSource || st.Steps != e.freqSteps {
+		e.freqHistory = e.freqHistory[:0]
+		e.freqSource, e.freqSteps = st.SystemSource, st.Steps
+	}
+	e.freqHistory = append(e.freqHistory, freqSample{at: now, ppm: st.Frequency, updates: st.Updates})
 	// Keep the newest sample at or before the cut, so the retained history
 	// spans the whole window rather than starting inside it.
 	cut := now - e.cfg.DriftStableWindow.Seconds()
@@ -1016,7 +1046,18 @@ func (e *Engine) frequencySettled(now float64) (bool, string) {
 	if len(e.freqHistory) == 0 || now-e.freqHistory[0].at < window {
 		return false, fmt.Sprintf("less than %s of frequency history", e.cfg.DriftStableWindow)
 	}
-	lo, hi := e.freqHistory[0].ppm, e.freqHistory[0].ppm
+	first, last := e.freqHistory[0], e.freqHistory[len(e.freqHistory)-1]
+	// Independent fresh evidence spanning the interval. Without this the
+	// gate measured only whether the *readings* were flat, which they are
+	// by construction when nothing is being measured: a bad transient left
+	// standing during filter starvation or source silence looks perfectly
+	// stable after the window and overwrites a known-good drift file
+	// (RA6X-013).
+	if got := last.updates - first.updates; got < minDriftUpdates {
+		return false, fmt.Sprintf("only %d loop updates in the last %s; a frequency nothing is measuring is not settled, it is frozen",
+			got, e.cfg.DriftStableWindow)
+	}
+	lo, hi := first.ppm, first.ppm
 	for _, f := range e.freqHistory[1:] {
 		lo = math.Min(lo, f.ppm)
 		hi = math.Max(hi, f.ppm)

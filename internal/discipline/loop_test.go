@@ -77,26 +77,34 @@ func TestLoopJitterSeedAndStep(t *testing.T) {
 	}
 }
 
-// TestLoopTickChargesRealElapsedTime covers RF5X-011: the kernel runs at the
-// transient for however long the engine's ticker actually took, so a late
-// tick must debit the phase for that interval, not for a nominal second.
+// TestLoopTickChargesRealElapsedTime covers RF5X-011 and RA6X-008: the kernel
+// runs at whatever transient is actually in it, for however long the engine's
+// ticker actually took. A late tick must debit that word for that interval —
+// not a nominal second, and not the word it is about to issue.
 func TestLoopTickChargesRealElapsedTime(t *testing.T) {
 	l := NewLoop(loopCfg(), 0, true)
 	l.Update(0.010, 6, 0, false, true) // tau = 256
-	l.Tick(1)                          // first tick: charged one second
-	adj := l.Pending / l.tau
+
+	// The first tick issues a transient but charges nothing: until it does,
+	// the kernel is holding the base and no transient has run (RA6X-008).
+	l.Tick(1)
+	if l.Pending != 0.010 {
+		t.Fatalf("the first tick debited a transient that had not run yet: %v", l.Pending)
+	}
+	applied := l.applied - l.appliedBase
+
 	pending := l.Pending
 	l.Tick(1 + maxTickInterval) // late, but inside the accounting window
-	if want := pending - maxTickInterval*adj; math.Abs(l.Pending-want) > 1e-15 {
+	if want := pending - maxTickInterval*applied*1e-6; math.Abs(l.Pending-want) > 1e-15 {
 		t.Fatalf("pending %v after a %.0f s tick, want %v", l.Pending, maxTickInterval, want)
 	}
 
-	// A stall of unknown length is charged one second rather than
-	// over-debiting a correction that was never applied.
+	// A stall longer than the accounting window is charged at the window,
+	// not reduced to a nominal second: the word really did stay applied.
 	pending = l.Pending
-	adj = pending / l.tau
+	applied = l.applied - l.appliedBase
 	l.Tick(1 + maxTickInterval + 10)
-	if want := pending - adj; math.Abs(l.Pending-want) > 1e-15 {
+	if want := pending - maxTickInterval*applied*1e-6; math.Abs(l.Pending-want) > 1e-15 {
 		t.Fatalf("pending %v after a stall, want %v", l.Pending, want)
 	}
 
@@ -189,11 +197,13 @@ func TestLoopTickSlew(t *testing.T) {
 	if math.Abs(a.Value-(10+wantAdj*1e6)) > 1e-9 {
 		t.Fatalf("transient: got %v want %v", a.Value, 10+wantAdj*1e6)
 	}
+	// The debit lands on the tick after the word has run for a second.
+	l.Tick(2)
 	if math.Abs(l.Pending-(0.010-wantAdj)) > 1e-15 {
 		t.Fatalf("pending %v", l.Pending)
 	}
 	// Exponential approach: after 256 ticks about 1/e remains.
-	for i := 2; i <= 256; i++ {
+	for i := 3; i <= 257; i++ {
 		l.Tick(float64(i))
 	}
 	if r := l.Pending / 0.010; r < 0.35 || r > 0.38 {
@@ -211,7 +221,9 @@ func TestLoopTickClamps(t *testing.T) {
 	if a.Value != 500 {
 		t.Fatalf("total must clamp at 500 ppm, got %v", a.Value)
 	}
-	// Only the 100 ppm the kernel clamp let through was slewed.
+	// Only the 100 ppm the kernel clamp let through was slewed, and it is
+	// charged on the following tick, once it has actually run for a second.
+	l.Tick(2)
 	if math.Abs(l.Pending-(10-100e-6)) > 1e-12 {
 		t.Fatalf("pending %v", l.Pending)
 	}

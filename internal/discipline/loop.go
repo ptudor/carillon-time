@@ -119,20 +119,41 @@ type Loop struct {
 	Updates int
 	Steps   int
 
-	lastUpdate float64
-	lastOffset float64
-	tau        float64
-	applied    float64 // frequency word most recently issued
-	haveApply  bool
-	lastTick   float64 // monotonic time of the previous Tick
-	haveTick   bool
-	skipJitter bool // the next update follows a step; lastOffset means nothing
+	lastUpdate  float64
+	lastOffset  float64
+	tau         float64
+	applied     float64 // frequency word most recently issued
+	appliedBase float64 // the base frequency that word was computed against
+	haveApply   bool
+	chargeFrom  float64 // monotonic time from which `applied` is unaccounted
+	haveTick    bool
+	skipJitter  bool // the next update follows a step; lastOffset means nothing
 
 	// Bootstrap frequency measurement state.
 	firstTime   float64
 	firstOffset float64
 	slewed      float64
+
+	// slewLog is the cumulative phase this loop has applied, sampled at
+	// every accounting point, newest last. It answers "how much of an
+	// observation's offset has this loop already corrected since that
+	// observation was taken", which is what makes a historical filter
+	// output usable as present-time feedback (RA6X-001). The word is
+	// constant between accounting points, so interpolating within one is
+	// exact.
+	slewLog []slewPoint
+	cumSlew float64
 }
+
+// slewPoint is the cumulative applied phase at one accounting point.
+type slewPoint struct {
+	at  float64
+	cum float64
+}
+
+// slewLogSpan bounds the history kept. Nothing older than the Allan intercept
+// can win the clock filter's ranking, so an observation cannot need more.
+const slewLogSpan = 2 * AllanIntercept
 
 // NewLoop returns a loop starting from the given frequency; known reports
 // whether that value came from a drift file or the kernel rather than being
@@ -267,6 +288,12 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 			l.FreqKnown = true
 		}
 	}
+	// A new observation *replaces* the residual phase: whatever the loop
+	// corrected before the observation was taken is already reflected in
+	// the offset it reports. Move the accounting point here so the next
+	// tick charges only the interval since, and that correction is not
+	// debited a second time (RA6X-008).
+	l.chargeApplied(now)
 	l.Pending = offset
 	l.lastOffset = offset
 	l.lastUpdate = now
@@ -285,6 +312,17 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 func (l *Loop) step(offset float64, now float64) UpdateResult {
 	l.Steps++
 	l.Updates++
+	// The step supersedes the residual phase entirely. Start a fresh
+	// accounting interval, and stop treating the word still in the kernel
+	// as a transient: it is left running until the next tick issues one,
+	// but there is no longer a residual for it to be charged against, and
+	// the post-step observation will report wherever it has taken the
+	// clock.
+	l.elapsed(now)
+	l.appliedBase = l.applied
+	// The phase reference is gone, so the record of how much of it has been
+	// corrected means nothing to an observation taken after the step.
+	l.slewLog, l.cumSlew = l.slewLog[:0], 0
 	l.Pending = 0
 	l.lastOffset = 0
 	l.lastUpdate = now
@@ -298,14 +336,21 @@ func (l *Loop) step(offset float64, now float64) UpdateResult {
 	}
 }
 
-// Tick runs once per second: it slews a fraction of the pending phase by
-// issuing the base frequency plus a one-second transient. When nothing is
-// pending it re-issues the base frequency only if it changed.
+// Tick runs once per second: it charges the phase the transient already in
+// the kernel has moved since the last accounting point, then issues the base
+// frequency plus a fresh transient for whatever phase remains. When nothing
+// is pending it re-issues the base frequency only if it changed.
+//
+// The order matters. Charging first, against the word that actually ran, is
+// what makes the accounting agree with the kernel: the previous code computed
+// the *next* word and debited that instead, so even successive ordinary ticks
+// disagreed with the applied-word integral, and an intervening loop update or
+// a changed base made the discrepancy larger (RA6X-008).
 func (l *Loop) Tick(now float64) []Action {
-	dt := l.elapsed(now)
+	l.chargeApplied(now)
 	if l.Pending == 0 {
 		if !l.haveApply || l.applied != l.Freq {
-			l.applied, l.haveApply = l.Freq, true
+			l.setApplied(l.Freq)
 			return []Action{{ActionSetFrequency, l.Freq}}
 		}
 		return nil
@@ -317,36 +362,127 @@ func (l *Loop) Tick(now float64) []Action {
 		adj = l.Pending
 	}
 	total := clampFreq(l.Freq + adj*1e6)
-	actual := (total - l.Freq) * 1e-6 // what the kernel clamp lets through
-	// The transient the previous Tick issued was in the kernel for dt
-	// seconds, not for a nominal one: a late ticker moved the phase by
-	// adj·dt, and debiting only adj over-corrects by adj·(dt−1) — up to
-	// 500 µs per second of lateness during a saturated slew.
-	l.Pending -= actual * dt
-	l.slewed += actual * dt
-	if math.Abs(l.Pending) < 1e-12 {
-		l.Pending = 0
-	}
-	l.applied, l.haveApply = total, true
+	l.setApplied(total)
 	return []Action{{ActionSetFrequency, total}}
 }
 
-// elapsed returns the seconds to charge this tick with, and records now as
-// the accounting point. The first tick of a run is charged one second: there
-// is no previous tick to measure from.
+// chargeApplied debits the phase the currently applied transient has moved
+// since the last accounting point, and moves that point to now.
+//
+// The transient is the difference between the word that was issued and the
+// base that was in effect when it was issued — not the current base, which a
+// loop update may have changed since. Before anything has been issued there
+// is nothing to charge, so the first tick of a run charges nothing rather
+// than a nominal second for a transient that never ran.
+func (l *Loop) chargeApplied(now float64) {
+	dt := l.elapsed(now)
+	moved := 0.0
+	if l.haveApply && dt > 0 {
+		if ran := (l.applied - l.appliedBase) * 1e-6; ran != 0 {
+			moved = ran * dt
+			l.Pending -= moved
+			l.slewed += moved
+			if math.Abs(l.Pending) < 1e-12 {
+				l.Pending = 0
+			}
+		}
+	}
+	l.noteSlew(now, moved)
+}
+
+// noteSlew records the cumulative applied phase at an accounting point and
+// drops history that can no longer be asked about.
+func (l *Loop) noteSlew(now, moved float64) {
+	if n := len(l.slewLog); n > 0 && now < l.slewLog[n-1].at {
+		return // backward time: nothing ran, and the log must stay ordered
+	}
+	l.cumSlew += moved
+	l.slewLog = append(l.slewLog, slewPoint{at: now, cum: l.cumSlew})
+	cut := now - slewLogSpan
+	drop := 0
+	for drop+1 < len(l.slewLog) && l.slewLog[drop+1].at <= cut {
+		drop++
+	}
+	if drop > 0 {
+		l.slewLog = append(l.slewLog[:0], l.slewLog[drop:]...)
+	}
+}
+
+// cumulativeSlew is the phase this loop had applied, in total, at time t.
+// Before the first recorded point it is zero: nothing is known to have been
+// applied then.
+func (l *Loop) cumulativeSlew(t float64) float64 {
+	if len(l.slewLog) == 0 {
+		return 0
+	}
+	first, last := l.slewLog[0], l.slewLog[len(l.slewLog)-1]
+	if t <= first.at {
+		return first.cum
+	}
+	if t >= last.at {
+		// The currently applied word has been running since the last
+		// accounting point, at a constant rate.
+		if !l.haveApply {
+			return last.cum
+		}
+		return last.cum + (l.applied-l.appliedBase)*1e-6*(t-last.at)
+	}
+	lo, hi := 0, len(l.slewLog)-1
+	for lo+1 < hi {
+		mid := (lo + hi) / 2
+		if l.slewLog[mid].at <= t {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	a, b := l.slewLog[lo], l.slewLog[hi]
+	if b.at == a.at {
+		return b.cum
+	}
+	return a.cum + (b.cum-a.cum)*(t-a.at)/(b.at-a.at)
+}
+
+// AppliedSince returns the phase this loop has corrected between the two
+// times: exactly the amount by which an offset measured at `at` overstates
+// the error remaining at `now`.
+func (l *Loop) AppliedSince(at, now float64) float64 {
+	if now <= at {
+		return 0
+	}
+	return l.cumulativeSlew(now) - l.cumulativeSlew(at)
+}
+
+// setApplied records a word the loop is issuing, together with the base it
+// was computed against, and starts a fresh accounting interval for it.
+func (l *Loop) setApplied(total float64) {
+	l.applied, l.appliedBase, l.haveApply = total, l.Freq, true
+}
+
+// elapsed returns the seconds to charge, and records now as the accounting
+// point. The point is moved by every loop update as well as by every tick:
+// an update's offset was measured *after* whatever correction had run up to
+// that moment, so charging that interval again would debit it twice.
+//
+// Backward time charges nothing. An interval longer than maxTickInterval is
+// charged at maxTickInterval: the word really did stay in the kernel for the
+// whole stall, but a daemon stalled that long has a phase estimate the next
+// measurement will replace outright, and an unbounded charge from a
+// pathological monotonic jump would swing the residual wildly. Reducing it to
+// a nominal second, as this used to, under-charged a real stall instead.
 func (l *Loop) elapsed(now float64) float64 {
-	dt := 1.0
+	dt := 0.0
 	if l.haveTick {
-		switch d := now - l.lastTick; {
+		switch d := now - l.chargeFrom; {
 		case d < 0:
 			dt = 0
 		case d > maxTickInterval:
-			dt = 1
+			dt = maxTickInterval
 		default:
 			dt = d
 		}
 	}
-	l.lastTick, l.haveTick = now, true
+	l.chargeFrom, l.haveTick = now, true
 	return dt
 }
 
