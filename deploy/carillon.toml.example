@@ -286,5 +286,7 @@ limit = 3
 # Refuse to correct an offset larger than this (seconds) ...
 panic = 1000
 # ... except for the very first correction when this is true. Set it on
-# hosts without a battery-backed clock (some SBCs).
+# hosts without a battery-backed clock (some SBCs). It widens which offsets
+# may be corrected; it does not override limit, so with limit = 0 the daemon
+# still never steps and an offset beyond panic is still refused.
 panic_at_startup = false

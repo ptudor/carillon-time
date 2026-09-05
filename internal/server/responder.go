@@ -83,11 +83,15 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if len(cfg.Allow) == 0 {
 		errs = append(errs, errors.New("server: allow must contain at least one prefix"))
 	}
-	if !(cfg.RateLimitPPS > 0) {
-		errs = append(errs, fmt.Errorf("server: rate limit %v must be greater than zero", cfg.RateLimitPPS))
+	// The comparisons are two-sided on purpose: `!(v > 0)` rejects a NaN but
+	// accepts +Inf, and an infinite rate or burst is no rate limiting at all.
+	// This is a public constructor, so it cannot rely on config.Validate
+	// having run (RA6X-035).
+	if !(cfg.RateLimitPPS > 0 && cfg.RateLimitPPS <= maxRateLimit) {
+		errs = append(errs, fmt.Errorf("server: rate limit %v must be in (0, %v]", cfg.RateLimitPPS, maxRateLimit))
 	}
-	if !(cfg.RateBurst >= 1) {
-		errs = append(errs, fmt.Errorf("server: rate burst %v must be at least one", cfg.RateBurst))
+	if !(cfg.RateBurst >= 1 && cfg.RateBurst <= maxRateLimit) {
+		errs = append(errs, fmt.Errorf("server: rate burst %v must be in [1, %v]", cfg.RateBurst, maxRateLimit))
 	}
 	if cfg.MaxClients < 0 {
 		errs = append(errs, fmt.Errorf("server: max clients %d must not be negative", cfg.MaxClients))

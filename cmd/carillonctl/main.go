@@ -31,6 +31,26 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// maxWaitSyncSeconds is the largest waitsync timeout that survives conversion
+// to a time.Duration, with room for the control client's extra allowance.
+// About 292 years, so no real invocation is affected.
+const maxWaitSyncSeconds = 9.223372e9
+
+// parseWaitTimeout converts the waitsync argument to seconds. ParseFloat
+// accepts "NaN" and "Inf", and the old `secs < 0` test let both through to a
+// conversion that overflows time.Duration. Zero keeps its documented meaning:
+// wait for ever (RA6X-035).
+func parseWaitTimeout(arg string) (float64, error) {
+	secs, err := strconv.ParseFloat(arg, 64)
+	if err != nil || math.IsNaN(secs) || secs < 0 || secs > maxWaitSyncSeconds {
+		return 0, fmt.Errorf("bad timeout %q: want 0 (wait for ever) or a number of seconds up to %v", arg, maxWaitSyncSeconds)
+	}
+	if secs > 0 && time.Duration(secs*float64(time.Second)) <= 0 {
+		return 0, fmt.Errorf("timeout %q rounds to zero, which means wait for ever; use 0 if that is what you want", arg)
+	}
+	return secs, nil
+}
+
 func run(args []string) int {
 	fs := flag.NewFlagSet("carillonctl", flag.ContinueOnError)
 	sock := fs.String("socket", config.Default().Daemon.Control, "control socket path")
@@ -48,9 +68,9 @@ func run(args []string) int {
 	}
 	req := control.Request{Command: fs.Arg(0)}
 	if req.Command == control.CmdWaitSync && fs.NArg() == 2 {
-		secs, err := strconv.ParseFloat(fs.Arg(1), 64)
-		if err != nil || secs < 0 {
-			fmt.Fprintf(os.Stderr, "carillonctl: bad timeout %q\n", fs.Arg(1))
+		secs, err := parseWaitTimeout(fs.Arg(1))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "carillonctl: %v\n", err)
 			return 2
 		}
 		req.Timeout = secs
