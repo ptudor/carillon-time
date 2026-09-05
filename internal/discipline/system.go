@@ -345,6 +345,15 @@ func (s *System) reselect(now float64) Result {
 		if s.state == StateHoldover {
 			s.setState(StateSettling, &res)
 		}
+		// Settling progress is counted in measurements, not loop updates,
+		// so it must also be *checked* without one. A clock filter that is
+		// withholding updates — an early low-delay sample can do that for
+		// up to the Allan intercept — would otherwise pin the daemon in
+		// SETTLING for the whole drought, which is the outage this counter
+		// was changed to remove.
+		if s.state == StateSettling && s.settleDone(s.offset) {
+			s.setState(StateSynced, &res)
+		}
 		return res
 	}
 	s.lastUsedAt = sel.System.At

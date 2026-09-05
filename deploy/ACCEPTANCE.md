@@ -486,6 +486,41 @@ written. In steady state it sat at +6.127 ppm for days, a spread well under
 0.1 ppm, so the hourly write proceeds normally. The regression test drives the
 engine into a 61 ppm excursion and asserts the file keeps its earlier value.
 
+### Upgrading *to* the gate: the outgoing binary still poisons the file
+
+Deploying the drift-file gate has one step that is easy to miss and that this
+deployment got wrong the first time. The write that matters happens at
+**shutdown, in the binary being replaced** — which does not have the gate. So
+the sequence "install, restart" persists the transient one last time and the
+new binary starts from it:
+
+```
+msg="kernel frequency left at the base estimate" ppm=1.6378832867356365 ...
+msg="initial frequency" ppm=1.637883 known=true from="drift file"
+```
+
+`gummi` came up on +1.638 ppm when its true value was −15.42.
+
+For this upgrade only, restore the file between stop and start:
+
+```sh
+sudo systemctl stop carillon          # the old binary writes its transient here
+printf -- '-15.418252\n' | sudo tee /var/lib/carillon/drift
+sudo chown carillon:carillon /var/lib/carillon/drift
+sudo systemctl start carillon
+```
+
+Use the value the host held while it was settled, which is what the file
+contained before the first restart of the day. Afterwards the gate handles it:
+the second stop logged
+
+```
+msg="leaving the drift file alone" reason="less than 15m0s of frequency history"
+  current_ppm=1.5070742347860342
+```
+
+and `gummi` restarted on −15.418252, reaching −15.449 ppm immediately.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
