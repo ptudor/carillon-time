@@ -42,3 +42,28 @@ closed-loop `TestPPSSimClosesTheLoop` runs the real refclock against a real
 pre-fix the system source stays `"ntp"`, post-fix it is `pps0` at stratum 1
 refid PPS with reach `0xff` and a 0.05 µs steady-state RMS (limit 10 µs).
 `go vet ./...` and `go test -race ./...` pass.
+
+## RF5X-004 — Shutdown leaves the slew transient in the kernel — FIXED
+
+**Changed.** `Engine.Run` now calls `restoreBaseFrequency` after `wg.Wait()`
+and before the final drift write: if the loop has issued anything and the word
+it last issued differs from the base estimate, the base is written back and
+logged at INFO with the abandoned slew and the abandoned phase. The pending
+phase is not finished and the clock is not stepped. `Loop.Applied()` and the
+`System.Applied()`/`System.Pending()` accessors were added to expose what the
+kernel is actually holding. Per item 2, a fatal error that came from
+`SetFrequency` itself is now tagged with a sentinel (`errFrequencyRefused`) and
+suppresses the restore, so the exit path cannot produce a second failure of the
+same call. `STA_UNSYNC` handling on exit, the drift-file format and the
+never-step-on-exit rule are untouched.
+
+**Files.** `internal/engine/engine.go`, `internal/engine/engine_test.go`,
+`internal/discipline/loop.go`, `internal/discipline/system.go`, `DESIGN.md` §12.
+
+**Verification.** PASS. `TestEngineLeavesBaseFrequencyInKernel` asserts the
+last frequency written equals `Status().Frequency` while `Pending != 0`;
+without the fix it reports the review's evidence verbatim — *kernel left at
+500.000000 ppm with 0.292000 s of phase still pending; want the base estimate
+0.000000 ppm*. `TestEngineDoesNotRewriteFrequencyAfterTheKernelRefusedOne`
+asserts the refused call is not repeated on the way out. `go vet ./...` and
+`go test -race ./...` pass.

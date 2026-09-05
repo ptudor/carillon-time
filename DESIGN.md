@@ -1209,9 +1209,18 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
 - **Statistics writer:** receives immutable snapshots through a bounded
   non-blocking queue, owns its buffered daily files, flushes each minute, and
   drains queued snapshots on shutdown. It never calls into the engine.
-- **Shutdown:** `SIGTERM`/`SIGINT` cancel the root context; engine writes the
-  drift file, leaves the frequency word alone, closes sockets; `main` waits
-  with a 5 s deadline.
+- **Shutdown:** `SIGTERM`/`SIGINT` cancel the root context; the engine
+  rewrites the kernel frequency word with the *base* frequency estimate,
+  writes the drift file, closes sockets; `main` waits with a 5 s deadline.
+  The frequency estimate itself is kept — it is the best one anybody has —
+  but the word the kernel is holding at that instant is the base plus the
+  one-second phase-slew transient of the last tick, up to ±`max_slew_ppm`.
+  Leaving that behind would run the host up to 500 ppm (43 s/day) off from
+  the moment carillon stops until something else writes the frequency, and
+  would disagree with the base value just written to the drift file. The
+  residual phase is abandoned rather than slewed out: it can take arbitrarily
+  long, and exit never steps. If the fatal error that ended the run *was* a
+  refused frequency change, the restore is skipped rather than repeated.
 - **No `SIGHUP` reload** in v1. Restart.
 
 GC and scheduling jitter are not on the accuracy path: PPS and RX timestamps
