@@ -39,6 +39,15 @@ const (
 	// unreachable and the window is re-primed anyway, so letting the
 	// allowance grow without bound would only open a hole.
 	spikeSlewPulses = 8
+	// maxSequenceGap is the largest run of missed pulses treated as a gap.
+	// A larger jump is a device-side counter restart (ldattach restarting,
+	// a /dev/ppsN recreated under the same name, another process issuing
+	// PPS_IOC_DESTROY/CREATE on the same tty), not an hour of silence: the
+	// unsigned delta then reads as about 2^32, which would add four billion
+	// to a monotonic Gaps counter that could never look right again and
+	// overflow the emit cadence.
+	maxSequenceGap = 3600
+
 	// spikeResetAfter is the run of consecutive rejections that re-primes
 	// the window. A rejected pulse never enters the window, so without this
 	// a window that has drifted away from the signal can never recover.
@@ -351,6 +360,14 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 			p.reject("glitch", &m)
 			return m
 		}
+		if delta > maxSequenceGap {
+			// The kernel-side counter restarted. Treat it as a reopen:
+			// forget the previous sample rather than book four billion
+			// missed pulses.
+			p.sequenceRestart(s)
+			p.reject("glitch", &m)
+			return m
+		}
 		interval = s.Time.Sub(p.previousTime).Seconds()
 		if math.Abs(interval-float64(delta)) > maxPulseIntervalSkew.Seconds() {
 			p.accountSequence(s, delta, interval, false)
@@ -458,6 +475,20 @@ func (p *PPS) accountSequence(s pps.Sample, delta uint32, interval float64, vali
 	}
 	p.previousSeq = s.Sequence
 	p.previousTime = s.Time
+	p.havePrevious = true
+}
+
+// sequenceRestart handles a PPS sequence counter that jumped or went
+// backwards, which means the device was re-created under us. Everything
+// derived from the old counter is discarded and the next pulse starts a fresh
+// train; the normal gap accounting is left alone.
+func (p *PPS) sequenceRestart(s pps.Sample) {
+	p.log.Warn("PPS sequence counter restarted; re-priming",
+		"previous", p.previousSeq, "sequence", s.Sequence)
+	p.havePrevious = false
+	p.pendingMisses = 0
+	p.resetWindow()
+	p.previousSeq, p.previousTime = s.Sequence, s.Time
 	p.havePrevious = true
 }
 

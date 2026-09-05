@@ -5,6 +5,7 @@ package serial
 import (
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -37,6 +38,16 @@ func (p *Port) ReadTimeout(buf []byte, timeout time.Duration) (int, error) {
 	}
 	if err != nil {
 		return 0, fmt.Errorf("serial: read %s: %w", p.path, err)
+	}
+	if n == 0 {
+		// poll(2) said readable and read(2) returned nothing: end of file.
+		// A CLOCAL tty should never do this and a detached device should
+		// surface as POLLHUP or ENXIO above, but some USB-serial drivers
+		// return a single zero-length read after a hangup before EIO.
+		// Reporting it as success makes the caller poll again, find the
+		// descriptor readable-at-EOF at once, and spin at 100 % CPU with
+		// nothing in the log — on the GPS host, which is also the PPS host.
+		return 0, fmt.Errorf("serial: read %s: %w", p.path, io.EOF)
 	}
 	return n, nil
 }

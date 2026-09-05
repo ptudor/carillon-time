@@ -41,6 +41,11 @@ func TestSnapshotOf(t *testing.T) {
 	if s.Instance.ID != "twocom" || s.Instance.Version != "test-version" || !s.Instance.StartedAt.Equal(now.Add(-time.Hour)) {
 		t.Fatalf("instance: %+v", s.Instance)
 	}
+	// RF5X-015: a timestamp that has not happened is absent, not year 1.
+	if s.Tracking.RefTime != nil || s.Tracking.LeapExpiry != nil {
+		t.Fatalf("never-happened timestamps present: reftime=%v leapfile_expires=%v",
+			s.Tracking.RefTime, s.Tracking.LeapExpiry)
+	}
 	if s.Tracking.SystemSource != "home" || s.Server.Served != 12 || !s.Server.Enabled {
 		t.Fatalf("payload: %+v", s)
 	}

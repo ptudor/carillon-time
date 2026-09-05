@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -555,5 +556,43 @@ func TestEngineDropsStaleMeasurement(t *testing.T) {
 	}
 	if e.staleDrops["a"] != 1 {
 		t.Fatalf("stale drops %d, want 1", e.staleDrops["a"])
+	}
+}
+
+// TestEngineSweepsStaleDriftTemporaries covers RF5X-019. writeDrift is atomic
+// — write, fsync, rename — but a SIGKILL or a power cut between CreateTemp
+// and Rename leaves a .drift-NNNN file behind, and nothing ever removed one.
+func TestEngineSweepsStaleDriftTemporaries(t *testing.T) {
+	dir := t.TempDir()
+	drift := filepath.Join(dir, "drift")
+	if err := os.WriteFile(drift, []byte("3.25\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, ".drift-123456")
+	if err := os.WriteFile(stale, []byte("junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// A temporary that another instance may still be writing is left alone.
+	fresh := filepath.Join(dir, ".drift-999999")
+	if err := os.WriteFile(fresh, []byte("junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	clk := clock.NewFake(time.Now())
+	if _, err := New(testConfig(drift), clk, quietLog()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("stale drift temporary survived: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("a temporary less than a minute old must be left alone: %v", err)
+	}
+	if _, err := os.Stat(drift); err != nil {
+		t.Fatalf("the drift file itself must survive: %v", err)
 	}
 }

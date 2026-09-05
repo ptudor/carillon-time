@@ -143,7 +143,6 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 		return 0
 	}
-	timestamp := timestampSeconds
 
 	gauge(c.state, 1, t.State)
 	gauge(c.offset, t.Offset)
@@ -154,8 +153,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.steps, uint64(t.Steps))
 	counter(c.updates, uint64(t.Updates))
 	gauge(c.leapPending, boolValue(t.Leap == "insert" || t.Leap == "delete"))
-	gauge(c.leapfileExpiry, timestamp(t.LeapExpiry))
-	gauge(c.leapfileValid, boolValue(!t.LeapExpiry.IsZero() && t.LeapExpiry.After(t.Now)))
+	gauge(c.leapfileExpiry, optionalTimestampSeconds(t.LeapExpiry))
+	gauge(c.leapfileValid, boolValue(t.LeapExpiry != nil && t.LeapExpiry.After(t.Now)))
 	gauge(c.buildInfo, 1, t.Version)
 
 	for _, src := range s.Sources {
@@ -165,7 +164,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.sourceDistance, src.Distance, src.Name)
 		gauge(c.sourceReach, float64(src.Reach), src.Name)
 		gauge(c.sourceSelected, boolValue(src.Status == "system"), src.Name)
-		gauge(c.sourceLastRx, timestamp(src.LastRx), src.Name)
+		gauge(c.sourceLastRx, optionalTimestampSeconds(src.LastRx), src.Name)
 		counter(c.sourceNoKernelTS, src.NoKernelTS, src.Name)
 		for result, value := range map[string]uint64{
 			"sent": src.Sent, "received": src.Received, "timeout": src.Timeouts,

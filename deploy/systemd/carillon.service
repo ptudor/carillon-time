@@ -45,7 +45,11 @@ NoNewPrivileges=yes
 
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/carillon /run
+# RuntimeDirectory= above already makes /run/carillon writable under
+# ProtectSystem=strict. Listing /run as well would open every other daemon's
+# runtime directory to a compromised carillon; nothing here writes outside
+# /run/carillon (the control socket) and /var/lib/carillon (drift, stats).
+ReadWritePaths=/var/lib/carillon
 PrivateTmp=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
