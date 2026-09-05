@@ -59,6 +59,13 @@ type Refclock struct {
 	Stable    bool   `json:"stable"`
 	Locked    bool   `json:"locked"`
 
+	// DisagreesWith and Disagreement are set when a locked PPS source's
+	// offset is too far from the numbering source that should be vouching
+	// for it — the signature of a pulse captured on the wrong edge, or an
+	// inverted signal. Check edge, pps_mode 0x10 and offset.
+	DisagreesWith string  `json:"disagrees_with,omitempty"`
+	Disagreement  float64 `json:"disagreement_seconds,omitempty"`
+
 	WindowSamples  int       `json:"window_samples"`
 	WindowJitter   float64   `json:"window_jitter"`
 	IntervalJitter float64   `json:"interval_jitter"`
@@ -331,12 +338,16 @@ func RefclocksOf(st *engine.Status) []Refclock {
 		pulse := r.Type == "pps" || r.Type == "gps-pps"
 		qualified := s.Reach != 0
 		if pulse {
-			qualified = qualified && st.PPSQualified
+			// A pulse that disagrees with its numbering source is not
+			// qualified however stable it is: the seconds it marks are the
+			// wrong ones.
+			qualified = qualified && st.PPSQualified && s.Status != discipline.StatusFalseticker
 		}
 		out = append(out, Refclock{
 			Name: s.Name, Type: r.Type, Device: r.Device, Edge: r.Edge,
 			Reach: s.Reach, Poll: s.Poll, Sequence: r.Sequence,
 			Qualified: qualified, Stable: r.Stable, Locked: qualified && r.Stable,
+			DisagreesWith: s.DisagreesWith, Disagreement: s.Disagreement,
 			WindowSamples: r.WindowSamples, WindowJitter: r.WindowJitter,
 			IntervalJitter: r.IntervalJitter, LastInterval: r.LastInterval,
 			LastPulse: r.LastPulse, LastOffset: r.LastOffset, Samples: r.Samples, Timeouts: r.Timeouts,

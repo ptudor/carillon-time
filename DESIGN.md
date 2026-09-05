@@ -341,6 +341,27 @@ and reported by `carillonctl` but never fed to the loop. With no numbering sourc
 at all, the daemon logs once at ERROR: *PPS present but nothing to number its
 seconds — add an NTP server or use a gps refclock*.
 
+**Proximity is not agreement.** The guard band alone says only that the clock
+is roughly right, not that the *pulse* marks the second the numbering source
+thinks it does. A PPS captured on the wrong edge — `edge = "assert"` on a
+receiver whose second mark is the falling edge, or an inverted signal that
+`dev.uart.N.pps_mode` should have had `0x10` for — reports a rock-steady
+offset equal to the **pulse width**, typically 20–200 ms, with microsecond
+jitter. It locks, it qualifies, it becomes the system source, and the daemon
+disciplines the clock 20–200 ms wrong while advertising stratum 1, refid
+`PPS` and a few microseconds of root dispersion; the numbering source then
+reports roughly minus the pulse width, still inside the 0.4 s band, so the
+source that is *correct* is the one that looks wrong. Downstream instances
+that `prefer` this host inherit the error with a plausible root distance.
+
+So a PPS is qualified only when some **surviving** numbering source `n`
+satisfies `|θ_n − θ_pps| ≤ λ_n + max(4·ψ_n, 1 ms)`, where λ_n is that
+source's root distance. A locked, stable PPS that fails this is marked
+**falseticker** (not merely unqualified), which raises `EventFalseticker` —
+logged once at WARN — and `carillonctl refclock` shows *disagrees with
+&lt;source&gt; by X ms* so the operator is pointed at `edge`, `pps_mode 0x10`
+or `offset` rather than at the network.
+
 **Validation** (each applies before the sample enters the window):
 
 - `seq` must be `prev + 1`; a gap shifts the reach register by the number of
