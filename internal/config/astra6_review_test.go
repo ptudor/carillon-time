@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -248,4 +249,89 @@ func TestAstra6PanicStaysAboveThreshold(t *testing.T) {
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("valid step policy refused: %v", err)
 	}
+}
+
+// TestAstra6DeviceIdentityFollowsTheDevice covers RA6X-039. Identity used to
+// be path spelling, so a udev alias for the same node compared unequal.
+func TestAstra6DeviceIdentityFollowsTheDevice(t *testing.T) {
+	dir := t.TempDir()
+	alias := filepath.Join(dir, "gps-alias")
+	if err := os.Symlink(os.DevNull, alias); err != nil {
+		t.Skipf("cannot create a device alias here: %v", err)
+	}
+	direct, err := deviceIdentity(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaAlias, err := deviceIdentity(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if direct != viaAlias {
+		t.Fatalf("%s and its alias have different identities: %q vs %q", os.DevNull, direct, viaAlias)
+	}
+	if !strings.HasPrefix(direct, "chardev:") {
+		t.Fatalf("a character device was identified as %q, not by its device number", direct)
+	}
+
+	// A different device must not collide.
+	other, err := deviceIdentity("/dev/zero")
+	if err != nil {
+		t.Skipf("/dev/zero unavailable: %v", err)
+	}
+	if other == direct {
+		t.Fatal("two different devices share an identity")
+	}
+}
+
+// TestAstra6RejectsSharedDevices checks two refclocks cannot claim one
+// device, however it is spelled, while one refclock using a device for both
+// roles stays legitimate.
+func TestAstra6RejectsSharedDevices(t *testing.T) {
+	dir := t.TempDir()
+	alias := filepath.Join(dir, "gps-alias")
+	if err := os.Symlink(os.DevNull, alias); err != nil {
+		t.Skipf("cannot create a device alias here: %v", err)
+	}
+
+	t.Run("two refclocks, two names for one device", func(t *testing.T) {
+		errs := checkDeviceOwnership([]Refclock{
+			{Name: "gps0", Type: "gps", Device: os.DevNull, PPS: "none"},
+			{Name: "pps0", Type: "pps", Device: alias},
+		})
+		if len(errs) == 0 {
+			t.Fatal("two refclocks claimed one device under two names")
+		}
+	})
+
+	t.Run("one refclock using a device for both roles", func(t *testing.T) {
+		// The supported FreeBSD arrangement: one callout tty carries both
+		// the NMEA stream and the PPS edge.
+		errs := checkDeviceOwnership([]Refclock{
+			{Name: "gps0", Type: "gps", Device: os.DevNull, PPS: alias},
+		})
+		if len(errs) != 0 {
+			t.Fatalf("a refclock using one device for both roles was rejected: %v", errs)
+		}
+	})
+
+	t.Run("distinct devices are fine", func(t *testing.T) {
+		errs := checkDeviceOwnership([]Refclock{
+			{Name: "gps0", Type: "gps", Device: os.DevNull, PPS: "none"},
+			{Name: "pps0", Type: "pps", Device: "/dev/zero"},
+		})
+		if len(errs) != 0 {
+			t.Fatalf("distinct devices were reported as shared: %v", errs)
+		}
+	})
+
+	t.Run("keyword pps values are not devices", func(t *testing.T) {
+		errs := checkDeviceOwnership([]Refclock{
+			{Name: "a", Type: "gps", Device: os.DevNull, PPS: "dcd"},
+			{Name: "b", Type: "gps", Device: "/dev/zero", PPS: "cts"},
+		})
+		if len(errs) != 0 {
+			t.Fatalf("pps keywords were treated as device paths: %v", errs)
+		}
+	})
 }

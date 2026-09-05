@@ -546,8 +546,16 @@ func TestEngineStepsOnceWithTwoSources(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	if err := e.Wait(ctx, func(s *Status) bool { return s.Updates >= 6 }); err != nil {
-		t.Fatalf("never reached six updates: %v (status %+v)", err, e.Status().Status)
+	// Both sources deliver their whole script, and the engine works through
+	// it. The exact update count depends on which source is elected — with
+	// per-source consumption watermarks (RA6X-003) an already-used
+	// observation is no longer re-integrated when the system source changes
+	// — so wait for delivery and for the step, which is what this test is
+	// about.
+	if err := e.Wait(ctx, func(s *Status) bool {
+		return int(a.sent.Load()) == len(script) && int(b.sent.Load()) == len(script) && s.Steps >= 1 && s.Updates >= 5
+	}); err != nil {
+		t.Fatalf("run did not progress: %v (status %+v)", err, e.Status().Status)
 	}
 	cancel()
 	if err := <-done; err != nil {

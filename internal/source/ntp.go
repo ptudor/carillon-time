@@ -119,10 +119,17 @@ type NTP struct {
 
 	// lookup turns host:port into an address. Tests replace it to steer the
 	// poller between servers.
-	lookup func(ctx context.Context, host string, port uint16) (netip.AddrPort, error)
+	lookup func(ctx context.Context, host string, port uint16) ([]netip.AddrPort, error)
 
 	// Poller state, touched only by the Run goroutine.
-	addr                netip.AddrPort
+	addr netip.AddrPort
+
+	// addrs is every answer the last successful lookup returned, and
+	// addrIndex points at the one in use. Keeping the whole list is what
+	// makes recovery from an unusable first answer possible.
+	addrs     []netip.AddrPort
+	addrIndex int
+
 	haveAddr            bool
 	resolveFailing      bool
 	reach               uint8
@@ -257,7 +264,10 @@ func (n *NTP) ensureResolved(ctx context.Context) bool {
 	if n.haveAddr && n.consecutiveTimeouts < resolveAfterTimeouts {
 		return true
 	}
-	addr, err := n.lookup(ctx, n.host, n.port)
+	// The endpoint has failed often enough to be suspect. Refresh the answer
+	// list if DNS is working, then move on from the address that failed.
+	endpointFailed := n.haveAddr && n.consecutiveTimeouts >= resolveAfterTimeouts
+	addrs, err := n.lookup(ctx, n.host, n.port)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false
@@ -267,42 +277,105 @@ func (n *NTP) ensureResolved(ctx context.Context) bool {
 			n.resolveFailing = true
 		}
 		n.updateInfo(func(i *Info) { i.LastError = err.Error() })
-		// A stale address is better than none while DNS is unavailable.
+		// A temporary DNS failure is not an endpoint failure. Keep the
+		// answers already held — a stale address is better than none — but
+		// still move off one that is not working.
+		if endpointFailed {
+			n.rotateAddr()
+		}
 		return n.haveAddr
 	}
 	if n.resolveFailing {
-		n.log.Info("server resolves again", "address", n.cfg.Address, "resolved", addr)
+		n.log.Info("server resolves again", "address", n.cfg.Address, "resolved", addrs[0])
 		n.resolveFailing = false
 	}
-	switch {
-	case !n.haveAddr:
-		n.log.Info("resolved server", "address", n.cfg.Address, "resolved", addr)
-	case addr != n.addr:
-		// A different server has no opinion about our poll interval yet.
-		n.kodMinPoll = 0
-		n.filter.Reset()
-		n.log.Info("resolved server", "address", n.cfg.Address, "resolved", addr, "previous", n.addr)
+	n.setAddrs(addrs)
+	if endpointFailed {
+		n.rotateAddr()
 	}
-	n.addr = addr
-	n.haveAddr = true
 	n.consecutiveTimeouts = 0
-	n.updateInfo(func(i *Info) { i.Resolved = addr })
+	n.updateInfo(func(i *Info) { i.Resolved = n.addr })
 	return true
 }
 
-// resolve turns host:port into an address, taking the first answer.
-func resolve(ctx context.Context, host string, port uint16) (netip.AddrPort, error) {
+// setAddrs adopts a fresh answer list. The current address is kept if it is
+// still among the answers, so a re-resolution that changes nothing does not
+// disturb a healthy association; otherwise the first answer is taken and the
+// endpoint-specific state is reset.
+func (n *NTP) setAddrs(addrs []netip.AddrPort) {
+	n.addrs = addrs
+	if !n.haveAddr {
+		n.useAddr(addrs[0], "resolved server")
+		return
+	}
+	for i, a := range addrs {
+		if a == n.addr {
+			n.addrIndex = i
+			return
+		}
+	}
+	n.useAddr(addrs[0], "server address changed")
+}
+
+// rotateAddr moves to the next answer for this hostname. With one answer it
+// is a no-op, so a single-address server keeps its filter across a
+// re-resolution.
+func (n *NTP) rotateAddr() {
+	if len(n.addrs) < 2 {
+		return
+	}
+	n.addrIndex = (n.addrIndex + 1) % len(n.addrs)
+	n.useAddr(n.addrs[n.addrIndex], "trying the next address for this server")
+}
+
+// useAddr switches to addr and discards everything that belonged to the
+// previous peer: its clock filter samples, which describe a different path,
+// and any poll policy it demanded, which is not this server's opinion.
+func (n *NTP) useAddr(addr netip.AddrPort, why string) {
+	if n.haveAddr && addr == n.addr {
+		return
+	}
+	previous := n.addr
+	n.addr = addr
+	n.haveAddr = true
+	n.resetEndpointState()
+	n.updateInfo(func(i *Info) { i.Resolved = addr })
+	if previous.IsValid() {
+		n.log.Info(why, "address", n.cfg.Address, "resolved", addr, "previous", previous)
+	} else {
+		n.log.Info(why, "address", n.cfg.Address, "resolved", addr)
+	}
+}
+
+// resetEndpointState drops everything tied to the peer we were talking to.
+func (n *NTP) resetEndpointState() {
+	n.kodMinPoll = 0
+	n.filter.Reset()
+}
+
+// resolve turns host:port into every usable address, in the order the
+// resolver returned them. A literal address resolves to itself.
+//
+// All answers are kept, not just the first: a dual-stack or multihomed
+// hostname whose first answer is unroutable, or whose first answer stops
+// serving, could otherwise never be recovered from — re-resolution returned
+// the same unusable first answer for ever (RA6X-037).
+func resolve(ctx context.Context, host string, port uint16) ([]netip.AddrPort, error) {
 	if a, err := netip.ParseAddr(host); err == nil {
-		return netip.AddrPortFrom(a.Unmap(), port), nil
+		return []netip.AddrPort{netip.AddrPortFrom(a.Unmap(), port)}, nil
 	}
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("lookup %q: %w", host, err)
+		return nil, fmt.Errorf("lookup %q: %w", host, err)
 	}
 	if len(addrs) == 0 {
-		return netip.AddrPort{}, fmt.Errorf("lookup %q: no addresses", host)
+		return nil, fmt.Errorf("lookup %q: no addresses", host)
 	}
-	return netip.AddrPortFrom(addrs[0].Unmap(), port), nil
+	out := make([]netip.AddrPort, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, netip.AddrPortFrom(a.Unmap(), port))
+	}
+	return out, nil
 }
 
 // sample is a usable reply after filtering.
@@ -368,6 +441,12 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		n.consecutiveTimeouts++
 		n.updateInfo(func(i *Info) { i.Timeouts++; i.LastError = errUnreachable.Error() })
 		n.miss("connection refused")
+	case errors.Is(err, errNetworkUnreachable):
+		// The address is unroutable from here. Also an endpoint failure, so
+		// it counts toward rotating to another DNS answer (RA6X-037).
+		n.consecutiveTimeouts++
+		n.updateInfo(func(i *Info) { i.Timeouts++; i.LastError = errNetworkUnreachable.Error() })
+		n.miss("network unreachable")
 	case errors.Is(err, errBadAuth):
 		n.badAuthSeen++
 		if n.badAuthSeen == 1 || n.badAuthSeen%logEvery == 0 {
@@ -605,6 +684,13 @@ var (
 	// socket: the host answered, nothing is listening on 123. It counts as
 	// a miss like a timeout, but arrives immediately.
 	errUnreachable = errors.New("no NTP server at the address")
+
+	// errNetworkUnreachable is ENETUNREACH or EHOSTUNREACH: the address
+	// cannot be reached from here at all. It is an endpoint failure, so it
+	// counts toward re-resolution and rotation just as a timeout does;
+	// falling into the generic error branch meant a dual-stack hostname
+	// whose first answer was unroutable never re-resolved (RA6X-037).
+	errNetworkUnreachable = errors.New("address is not reachable from this host")
 )
 
 // bogusError is a reply that was addressed to us but is unusable.
@@ -703,6 +789,9 @@ func exchange(ctx context.Context, p exchangeParams) (exchangeResult, error) {
 		if errors.Is(err, syscall.ECONNREFUSED) {
 			return res, errUnreachable
 		}
+		if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+			return res, errNetworkUnreachable
+		}
 		return res, fmt.Errorf("send to %s: %w", addr, err)
 	}
 	res.Sent = true
@@ -726,6 +815,10 @@ func exchange(ctx context.Context, p exchangeParams) (exchangeResult, error) {
 				// the timeout for a reply that cannot come.
 				res.Sent = true
 				return res, errUnreachable
+			}
+			if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.EHOSTUNREACH) {
+				res.Sent = true
+				return res, errNetworkUnreachable
 			}
 			return res, fmt.Errorf("receive: %w", err)
 		}
@@ -811,10 +904,13 @@ type Result struct {
 // code, authentication failure, or unusable reply is returned as an error
 // that says why.
 func Query(ctx context.Context, host string, port uint16, key *auth.Key, clk clock.Clock, timeout time.Duration) (Result, error) {
-	addr, err := resolve(ctx, host, port)
+	addrs, err := resolve(ctx, host, port)
 	if err != nil {
 		return Result{}, err
 	}
+	// One-shot diagnostic: the first answer is what an operator means by
+	// "query this name".
+	addr := addrs[0]
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}

@@ -828,3 +828,333 @@ ordinary day, second 60 at an arbitrary minute, a malformed long fraction, and
 fractions at and beyond the supported precision.
 `TestAstra6TrueMidnightStaysUsable` confirms the real midnight sample is
 unaffected. `CGO_ENABLED=1 go test -race ./...` passes.
+
+---
+
+## Wave 4 — make eligibility and synchronized state truthful
+
+## RA6X-003 — Time-based source expiry never runs on engine ticks — FIXED
+
+**Changed.** Selection ages uncertainty and rejects over-distance sources, but
+it ran only on a measurement or an explicit lifecycle event. `System.Tick` did
+phase slewing and an already-entered holdover timeout and nothing else, so if
+every producer went silent a synchronized source stayed selected indefinitely
+and the holdover timer never started. Three changes:
+
+1. **`Tick` reselects.** Eligibility is now evaluated on every tick, so loss is
+   noticed at the loss boundary rather than never.
+2. **A per-source freshness deadline.** Phi ageing alone takes about 27 hours
+   to push a source past `MaxDistance`, which is not a loss boundary.
+   `freshnessDeadline(poll)` is eight poll intervals — the width of the reach
+   register, so it is exactly "as many missed slots as would empty reach if
+   anything were still reporting" — floored at 64 s so a very short poll cannot
+   be tripped by ordinary jitter, and clamped to the legal poll range. A
+   legitimately sparse poll-17 association is untouched; a 1 Hz refclock is not
+   carried for a day. A stale source is reported as `unreachable`, an existing
+   status value, so nothing public changed.
+3. **Consumption is tracked per source.** `System.lastUsedAt` was a single
+   watermark reset to zero on every system-source switch, so switching away
+   from a source and back re-applied an observation the loop had already
+   integrated — which a tick-driven reselection would have made far more
+   frequent. It moved to `SourceState.usedAt`. (This also closes the sub-item
+   RA6X-001 raises about the shared watermark; the rest of RA6X-001 is wave 5.)
+
+A tick brings no new sample, so the watermark guarantees it cannot re-integrate
+anything. Configured holdover duration, preference rules and the immutable
+snapshots are unchanged.
+
+**Files.** `internal/discipline/system.go`, `internal/discipline/select.go`,
+`internal/discipline/measurement.go`,
+`internal/discipline/astra6_review_test.go`,
+`internal/engine/engine_test.go`.
+
+**Verification.** `TestAstra6TickExpiresSilentSources` synchronizes, stops all
+measurements, and advances only `Tick`: it requires HOLDOVER within the
+source's own freshness deadline, then UNSYNCED after the configured holdover,
+with LI=3 and stratum 16. `TestAstra6TickKeepsSparseButLegalPolls` and
+`TestAstra6FreshnessDeadlineScales` guard the sparse-poll case and pin the
+deadline table. `TestAstra6TickDoesNotReintegrate` requires ten ticks after one
+observation to produce no further loop updates.
+`TestEngineStepsOnceWithTwoSources` was made deterministic: it waited for a
+sixth loop update that only existed because of the re-integration this fix
+removes, and now waits for both scripts to be delivered plus the step it is
+actually about. `CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-009 — Losing a source during settling promotes untrusted time to holdover — FIXED
+
+**Changed.** The no-system branch read `case StateSettling, StateSynced: →
+StateHoldover`, and HOLDOVER is served as synchronized by both the wire and
+the kernel — so losing the last source *increased* the trust placed in a clock
+the daemon had never finished settling, including immediately after a step.
+
+`System` now tracks `everSynced`: set on entering SYNCED, cleared by a step,
+which moves the clock out from under whatever synchronization preceded it.
+Serviceable holdover is entered from SYNCED, and from SETTLING only when
+`everSynced` still holds — the case where the filter withheld updates, or a
+leap resync is in progress, after a spell of real synchronization. Settling
+that never reached SYNCED goes to UNSYNCED with reason `INIT` instead. State
+names, wire field meanings and holdover expiry are unchanged, as is the
+previously-synced leap `Resync` path.
+
+**Files.** `internal/discipline/system.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6SettlingLossDoesNotSynchronize`
+passes: status is not holdover, LI is `unsynchronized`, stratum is 16.
+`TestAstra6HoldoverEntryRequiresSynchronization` covers the three remaining
+cases — an already-synced daemon still holds over, loss right after a step does
+not, and settling after a spell of synchronization still may.
+`CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-010 — Failed polls count as successful settling evidence — FIXED
+
+**Changed.** `if m.Source == s.sysName { s.sinceStep++ }` counted every
+Measurement naming the system source — timeouts, bad authentication, rejected
+packets and invalidation notices included — so a transport heartbeat could
+complete settling on its own. Testing `Valid` instead would not have worked
+either: a successful reply whose clock filter winner is unchanged is emitted
+with `Valid = false`.
+
+`Measurement` gained `Acquired`, which is deliberately a *third* thing beside
+`Valid` and the error heartbeat: it means "this event is a successful
+acquisition from the source in the current clock epoch". `Valid` implies it —
+there is no new estimate without an acquisition — so producers only set it for
+the acquisition-without-estimate case, and `Measurement.IsAcquisition()` reads
+both. The NTP source sets it on a reply that was authenticated, plausible and
+entered the filter, whether or not the filter winner changed; PPS sets it on an
+edge that passed the sequence, interval and spike checks; NMEA sets it on a
+sentence that passed parsing, validity, chronology and epoch checks. Misses,
+bad MACs, bogus packets, KoD, stale epochs and reset notices do not. Settling
+counts acquisitions. The earlier fix that made settling independent of
+minimum-delay winner turnover, and the configurable count, are preserved.
+
+**Files.** `internal/discipline/measurement.go`,
+`internal/discipline/system.go`, `internal/source/ntp.go`,
+`internal/refclock/pps.go`, `internal/refclock/nmea.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6MissIsNotSettlingEvidence`
+passes. `TestAstra6SettlingEvidenceKinds` tables the review's list — a good
+reply with an unchanged winner and a new estimate both count; a timeout, a bad
+MAC, an unusable stratum, a reset notice and a PPS spike do not.
+`TestSystemLeavesSettlingWithoutAFreshLoopUpdate` still passes and remains
+meaningful under the new semantics. `CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-023 — An expired authoritative leapfile can suppress valid upstream warnings — SKIPPED
+
+**Reason.** The fix specification presents a fork the maintainer has to choose:
+*"either cease synchronized service or allow explicitly configured fallback to
+current survivor consensus"*, and warns *"never silently change authority
+merely to make the test pass."* The two options have opposite operational
+consequences — one takes a working server out of service on a date nobody was
+watching, the other keeps serving on evidence the file itself says may be
+incomplete — and the second additionally implies a new configuration key,
+which the review's own preamble says should not appear incidentally. Picking
+one is a policy decision, not an implementation detail, so this is logged
+rather than guessed.
+
+**What is needed to close it.** A decision between the two policies. Once made,
+the implementation is small and the diagnostic half comes with it: `Indicator`
+gains an expiry test, `handle`/`publish` stop treating an expired table as
+authoritative, and runtime near-expiry and expiry transitions are logged rather
+than being reported only at startup — which is the part that reaches an
+operator whose daemon crosses expiry months after it started.
+
+**Present behaviour, unchanged.** `leap.Table.Indicator` never checks `Expiry`;
+`handle` and `publish` override the survivor majority with its result whenever
+`LeapTable` is non-nil. Monitor health already reports an expired file as
+unhealthy, and the expiry and provenance are already exposed in JSON and
+metrics, so the condition is observable even while the authority question is
+open.
+
+## RA6X-038 — Selection has no local timing-loop rejection — FIXED
+
+**Changed.** Nothing compared a peer's reference against this host's own
+identity, so after losing a real upstream two mutually configured instances
+could begin selecting each other's retained time while advertising
+independence, and a configured self-address was never rejected.
+
+`discipline.Config` gained `LocalRefIDs`, the set of RFC 5905 §7.3 reference
+identifiers naming this host — one per local unicast address, from
+`net.InterfaceAddrs` at startup, so a multihomed host is covered whichever
+address a peer reaches it on and a configuration pointing at the local server
+is caught. `SelectWithLocal` refuses a candidate in either direction:
+`SourceRefID` matching a local identity means the configured server *is* this
+host; `RefID` matching one means our own time would come back to us. The check
+is skipped for textual identifiers, so `GPS `, `PPS ` and kiss codes are never
+mistaken for addresses, and for stratum 1, which has no upstream reference.
+Two peers sharing a third upstream have equal RefIDs to each other and not to
+ours, so ordinary shared-upstream configurations are unaffected. The rejection
+reuses the existing `invalid` status — no new public vocabulary — and reports
+itself through new `EventTimingLoop` / `EventTimingLoopCleared` events, logged
+once per transition with a remediation hint. An empty identity set disables the
+check, so a host whose interfaces cannot be enumerated still keeps time.
+
+Documented limits, in the code: for IPv6 the identifier is a 32-bit hash, so a
+collision (≈2^-32 per local address) would reject a legitimate peer — which
+fails closed and costs one source; and a peer behind NAT reporting a public
+address this host does not itself hold cannot be detected here.
+
+**Files.** `internal/discipline/system.go`, `internal/discipline/select.go`,
+`internal/engine/engine.go`, `cmd/carillon/main.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** `TestAstra6RejectsTimingLoops` tables a peer synchronized to
+our IPv4 and IPv6 addresses, our own addresses configured as a server, a peer
+sharing a third upstream, and stratum-1 peers with textual reference ids —
+requiring rejection exactly in the first four and an event with each.
+`TestAstra6TimingLoopTransitions` requires the event once per transition and
+the peer usable again once its reference changes;
+`TestAstra6NoLocalIdentityDisablesTheCheck` covers the enumeration-failed case.
+**Deferred to the target hosts:** two real instances losing a shared upstream.
+
+## RA6X-050 — A preferred source that never answers is never reported lost — FIXED
+
+**Changed.** `reportPreferLost` required `preferSeen`, which came only from the
+preferred source's own `everReachable`, so a miswired, misconfigured or
+permanently unavailable preferred GPS stayed silently absent while fallback
+service was reported healthy. What the suppression is *for* is the initial
+acquisition phase, when nothing has established service yet and an ERROR at
+every daemon start would be a false page — and that is now all it does:
+`fallbackEstablished` (some source has survived, ever or now) gates the report,
+and the preferred source's own history no longer does. The now-unused
+`everReachable` field was removed. Exactly-once loss and recovery transitions,
+fallback selection, `noselect` behaviour and the multiple-prefer selector
+compatibility case are unchanged.
+
+**Files.** `internal/discipline/select.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** The probe `TestAstra6ReportsNeverReachablePreferAfterFallback`
+passes. `TestAstra6PreferLostPhases` covers initial acquisition staying quiet,
+a delayed first answer clearing the report, later loss and recovery, and a
+`noselect` preferred source not counting as a configured preference.
+
+## RA6X-051 — PPS disagreement diagnostics outlive the comparison that produced them — FIXED
+
+**Changed.** `DisagreesWith` and `Disagreement` were assigned only inside the
+PPS-qualified branch, so a PPS that was rejected as a candidate, or whose
+numbering source disappeared, kept a current-looking finding — sending an
+operator hunting for an edge or calibration error when the present problem was
+numbering loss. They are now cleared for every PPS source at the top of
+`Select` and re-derived only where a comparison actually happens, so they always
+describe the most recent selection or are empty. Qualification, locking, source
+selection and the fields' meanings are unchanged.
+
+**Files.** `internal/discipline/select.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** `TestAstra6ClearsObsoleteDisagreement` drives disagreement →
+numbering loss, PPS reach zero, agreement and `noselect`, requiring the fields
+to be empty in each.
+
+## RA6X-037 — DNS address choice can pin an association to an unusable endpoint — FIXED
+
+**Changed.** `resolve` returned `addrs[0]` and nothing else, so a hostname
+whose first answer was unroutable or had stopped serving could never be
+recovered from: re-resolution returned the same first answer. Worse,
+`ENETUNREACH`/`EHOSTUNREACH` fell into the generic error branch and never
+incremented `consecutiveTimeouts`, so re-resolution was not even attempted.
+
+`resolve` now returns every answer, and the source keeps the list with an
+index. `errNetworkUnreachable` classifies the two unreachable errnos and counts
+them with the timeouts, as `ECONNREFUSED` already was. `ensureResolved`
+separates the two failure kinds: a **temporary DNS failure** keeps the cached
+answers (a stale address is better than none), while a **failing endpoint**
+rotates to the next answer — refreshing the list first when DNS is working.
+`setAddrs` keeps the current address if it is still among the answers, so a
+re-resolution that changes nothing does not disturb a healthy association, and
+`useAddr` resets the endpoint-specific state — the clock filter, whose samples
+describe a different path, and `kodMinPoll`, which is not the new server's
+opinion — when the peer actually changes. Rotation happens only on failure, so
+a healthy association is never touched; a single-answer server keeps its filter
+across a re-resolution. Literal addresses, bounded retries, address families,
+request authentication and one active exchange per source are unchanged.
+`Query` still uses the first answer, which is what "query this name" means.
+
+**Files.** `internal/source/ntp.go`, `internal/source/source_test.go`,
+`internal/source/astra6_review_test.go` (new).
+
+**Verification.** `TestAstra6RotatesPastAnUnusableAnswer` runs the real poller
+against a stable answer list whose first entry never replies and requires it to
+reach the healthy second one. `TestAstra6EndpointRotation` covers a healthy
+association not being disturbed, rotation through three answers and wrapping,
+a single answer keeping its filter and poll policy, a peer change resetting
+them, a temporary DNS failure keeping the cached answers while still rotating
+away from a failing endpoint, a literal address, and a changed answer list.
+`CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-039 — Device identity checks use path spelling instead of the underlying device — FIXED
+
+**Changed.** Three separate consequences of comparing names instead of devices.
+
+1. **The Linux same-tty prohibition.** `r.PPS == r.Device` let any alias walk
+   past it — `/dev/serial/by-id/...` against `/dev/ttyUSB0` — after which N_PPS
+   replaces the line discipline delivering the NMEA bytes. It now compares
+   device identity, falling back to a literal comparison when a path cannot be
+   identified.
+2. **No ownership across refclocks.** Two configured refclocks could open one
+   device and compete for its bytes or overwrite its parameters. `Check` now
+   builds a device-identity map across every refclock and reports a conflict
+   naming both blocks and both paths. Sharing *within* one refclock is
+   explicitly allowed, which is the supported FreeBSD arrangement of one
+   callout tty carrying both the NMEA stream and the PPS edge.
+3. **PPS devices misclassified as ttys.** `linuxPPSPath` matched only a
+   `ppsN` basename, so a stable udev alias such as `/dev/pps-gps` was treated
+   as a tty and the daemon tried to attach N_PPS to a PPS device. The path is
+   now resolved first, and if the resolved name still does not look like one
+   the kernel is asked directly: a character device whose number appears under
+   `/sys/class/pps/*/dev` is a PPS device whatever it is called. Read-only, and
+   it opens no device.
+
+Identity is `chardev:<rdev>` for a character device — the driver's device
+number, shared by every name that reaches it — and the fully resolved path
+otherwise. Operator-facing aliases keep working, symlinks are not forbidden,
+and identity is re-derived on each open, so a retargeted alias is revalidated
+when a device is reopened.
+
+**Files.** `internal/config/config.go`,
+`internal/config/refclock_check_linux.go`, `internal/pps/pps_linux.go`,
+`internal/config/astra6_review_test.go`.
+
+**Verification.** `TestAstra6DeviceIdentityFollowsTheDevice` shows a device and
+a symlink to it sharing an identity, that it is the device number and not the
+path, and that two different devices do not collide.
+`TestAstra6RejectsSharedDevices` covers two refclocks claiming one device under
+two names (rejected), one refclock using a device for both roles (allowed),
+distinct devices, and `pps` keyword values not being treated as paths. The
+Linux-only and PPS-classification paths cross-compile and `go vet` cleanly for
+linux/amd64 and linux/arm64. **Deferred to the target hosts:** alias and
+hotplug behaviour against real `/dev/ppsN`, `/dev/serial/by-id` and
+`/sys/class/pps` entries, and confirmation of the supported FreeBSD sharing.
+
+## RA6X-057 — Source-count validation does not express an achievable or independent quorum — SKIPPED
+
+**Reason.** The fix specification opens with a definition the maintainer has
+to supply: *"Define whether min_survivors means surviving associations or
+independent clocks and document dependent refclock roles."* Everything else it
+asks for follows from that choice. Counting *associations* makes two names for
+one endpoint two votes, and a GPS's NMEA and PPS logical sources two votes for
+one physical clock; counting *independent clocks* changes what existing
+configurations mean — a working `min_survivors = 2` on a host with a GPS
+refclock could start refusing to synchronize after an upgrade. The
+specification also requires preserving *"any intentionally supported
+monitoring-only configuration through an explicit policy"*, which is a second
+decision about whether an all-`noselect` configuration is legal.
+
+Choosing either meaning silently would change the semantics of a documented
+configuration key, which the review's preamble rules out. Logged rather than
+guessed.
+
+**What is needed to close it.** A stated definition of `min_survivors` in
+`DESIGN.md`, and a decision on whether all-`noselect` and bare-PPS-without-
+numbering configurations are legal-but-idle or invalid. Given those, the rest
+is mechanical: static diagnosis of impossible minima at `-check` time,
+duplicate resolved-endpoint detection, and a documented note that a GPS's NMEA
+and PPS sources are one clock.
+
+**Present behaviour, unchanged.** `Validate` requires at least one source
+block, unique names and `MinSurvivors >= 1`; selection counts `SourceState`
+entries; `cluster`'s stopping floor is a fixed three. A `min_survivors` larger
+than the number of selectable sources is accepted and leaves the daemon
+permanently unsynchronized with no startup explanation.

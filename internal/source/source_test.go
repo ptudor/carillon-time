@@ -501,12 +501,12 @@ func TestReResolveAfterTimeouts(t *testing.T) {
 	var target atomic.Pointer[netip.AddrPort]
 	target.Store(&srvA.addr)
 	var lookups atomic.Int32
-	n.lookup = func(_ context.Context, host string, port uint16) (netip.AddrPort, error) {
+	n.lookup = func(_ context.Context, host string, port uint16) ([]netip.AddrPort, error) {
 		if host != "ntp.test" || port != 123 {
 			t.Errorf("lookup %s:%d, want ntp.test:123", host, port)
 		}
 		lookups.Add(1)
-		return *target.Load(), nil
+		return []netip.AddrPort{*target.Load()}, nil
 	}
 	// Poll without delay until the poller has moved to B, then park it so
 	// the assertions below see exactly one exchange with B.
