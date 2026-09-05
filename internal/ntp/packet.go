@@ -25,6 +25,10 @@ const (
 	// framing so such packets decode, never verified.
 	macSizeSHA1 = 4 + 20
 
+	// CryptoNAKSize is a MAC field consisting of a zero key id only, which a
+	// server sends when it cannot authenticate a request.
+	CryptoNAKSize = cryptoNAKSize
+
 	// cryptoNAKSize is a MAC field consisting of a zero key id only, which a
 	// server sends to say it could not authenticate the request.
 	cryptoNAKSize = 4

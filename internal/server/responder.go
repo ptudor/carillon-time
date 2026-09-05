@@ -5,6 +5,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -40,8 +41,11 @@ type Config struct {
 	RateLimitPPS float64
 	RateBurst    float64
 	MaxClients   int
-	KoD          bool
-	MinPoll      int8
+	// RateLimitV6Prefix is the IPv6 prefix length one bucket covers. Zero
+	// selects DefaultRateLimitV6Prefix (64).
+	RateLimitV6Prefix int
+	KoD               bool
+	MinPoll           int8
 
 	Status func() SystemStatus
 	Now    func() time.Time
@@ -111,7 +115,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		allow:   maskedPrefixes(cfg.Allow),
 		deny:    maskedPrefixes(cfg.Deny),
 		keys:    cfg.Keys,
-		limiter: newRateLimiter(cfg.RateLimitPPS, cfg.RateBurst, cfg.MaxClients),
+		limiter: newRateLimiter(cfg.RateLimitPPS, cfg.RateBurst, cfg.MaxClients, cfg.RateLimitV6Prefix),
 		kod:     cfg.KoD,
 		minPoll: cfg.MinPoll,
 		status:  cfg.Status,
@@ -181,10 +185,36 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 		c.denied.Add(1)
 		return nil
 	}
-	c.versions[pkt.Version].Add(1)
-	storeLatest(&c.lastRequest, receive)
+	// A source inside a require_key prefix has its MAC checked before the
+	// limiter is consulted. The bucket is keyed by source address, so
+	// anyone able to forge the peer's address could otherwise drain its
+	// tokens with rate_limit_pps packets a second from anywhere on the
+	// path, push its poll to poll_max, and take the trusted upstream out of
+	// the association the shared key exists to protect. The extra CMAC is
+	// bounded to the handful of addresses require_key names, so this is not
+	// a way to make a public listener do crypto on demand — and a hostile
+	// sender can already force one by sending a known key id with a bad MAC.
+	required := h.requiredKey(addr)
+	var replyKey *auth.Key
+	if required != 0 {
+		var ok bool
+		replyKey, ok = h.verify(request, macOffset, mac)
+		if !ok {
+			c.badAuth.Add(1)
+			return h.cryptoNAK(&pkt, request, mac, receive)
+		}
+		if replyKey == nil || replyKey.ID != required {
+			// A missing trailer, or a good MAC under a key this prefix is
+			// not allowed to use. Neither is a key the server does not
+			// know, so there is nothing a NAK would tell the client that
+			// its own configuration does not.
+			c.badAuth.Add(1)
+			return nil
+		}
+	}
 
-	allowed, sendKoD := h.limiter.allow(addr, monotonicNow)
+	limitKey := h.limiter.key(addr, keyIDOf(replyKey))
+	allowed, sendKoD := h.limiter.allow(limitKey, monotonicNow)
 	h.publishClients(c)
 	if !allowed {
 		c.rateLimited.Add(1)
@@ -195,22 +225,22 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 		return h.reply(&pkt, receive, h.status(), ntp.KissRATE, nil, true)
 	}
 
-	var replyKey *auth.Key
-	if mac != nil && !mac.IsCryptoNAK() {
-		if key, known := h.keys[mac.KeyID]; known {
-			if !key.Verify(request[:macOffset], mac) {
-				c.badAuth.Add(1)
-				return nil
-			}
-			replyKey = &key
-		}
-	}
-	if required := h.requiredKey(addr); required != 0 {
-		if replyKey == nil || replyKey.ID != required {
+	if required == 0 {
+		var ok bool
+		replyKey, ok = h.verify(request, macOffset, mac)
+		if !ok {
 			c.badAuth.Add(1)
-			return nil
+			return h.cryptoNAK(&pkt, request, mac, receive)
 		}
 	}
+
+	// A request that survived the ACL, the limiter and authentication is
+	// one we are about to answer, which is what the version histogram and
+	// last_request are documented to describe. Counting them earlier made a
+	// spoofed flood look like accepted traffic and advanced last_request
+	// while nothing was being served.
+	c.versions[pkt.Version].Add(1)
+	storeLatest(&c.lastRequest, receive)
 
 	st := h.status()
 	refID := st.ReferenceID
@@ -253,6 +283,53 @@ func matches(prefixes []netip.Prefix, addr netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+// verify checks a MAC trailer if there is one. ok is false when the trailer
+// is present but cannot be authenticated — an unknown key id or a digest that
+// does not match — which is what earns a crypto-NAK. A request with no
+// trailer at all is fine and returns (nil, true); whether that is acceptable
+// is the require_key rule's business, not this function's.
+func (h *Handler) verify(request []byte, macOffset int, mac *ntp.MAC) (*auth.Key, bool) {
+	if mac == nil || mac.IsCryptoNAK() {
+		return nil, true
+	}
+	key, known := h.keys[mac.KeyID]
+	if !known || !key.Verify(request[:macOffset], mac) {
+		return nil, false
+	}
+	return &key, true
+}
+
+// cryptoNAK answers a request this server cannot authenticate with the
+// 48-byte header plus a zero key id, as ntpd and chrony do. A plain reply
+// tells such a client only that the answer was unauthenticated; the NAK tells
+// it — and ntpq -p — that the *key* is the problem.
+//
+// The reply is 52 bytes, so it is only ever sent for a request that carried a
+// MAC trailer of its own and is therefore at least that long: the server is
+// never an amplifier.
+func (h *Handler) cryptoNAK(req *ntp.Packet, request []byte, mac *ntp.MAC, receive time.Time) []byte {
+	if mac == nil || mac.IsCryptoNAK() || len(request) < ntp.HeaderSize+ntp.CryptoNAKSize {
+		return nil
+	}
+	st := h.status()
+	refID := st.ReferenceID
+	if !st.Synced && refID == (ntp.RefID{}) {
+		refID = ntp.KissINIT
+	}
+	out := h.reply(req, receive, st, refID, nil, !st.Synced)
+	if out == nil {
+		return nil
+	}
+	return binary.BigEndian.AppendUint32(out, 0)
+}
+
+func keyIDOf(k *auth.Key) uint32 {
+	if k == nil {
+		return 0
+	}
+	return k.ID
 }
 
 func (h *Handler) requiredKey(addr netip.Addr) uint32 {

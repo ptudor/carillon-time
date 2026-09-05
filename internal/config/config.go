@@ -179,6 +179,13 @@ type Serve struct {
 	RateLimitPPS float64 `toml:"rate_limit_pps"`
 	RateBurst    float64 `toml:"rate_burst"`
 
+	// RateLimitV6Prefix is the IPv6 prefix length one token bucket covers.
+	// Zero selects 64: every residential IPv6 customer controls at least a
+	// /64, so a per-/128 bucket gives one host an unlimited supply of fresh
+	// buckets and fresh table slots with which to evict real clients.
+	// IPv4 is always per address.
+	RateLimitV6Prefix int `toml:"rate_limit_v6_prefix"`
+
 	// MaxClients bounds the per-listener rate-limit table. Entries expire
 	// after a minute and the least recently used is evicted when the table
 	// is full, so a flood of forged source addresses costs bounded memory
@@ -286,10 +293,11 @@ func Default() *Config {
 			LogLevel:  "info",
 		},
 		Serve: Serve{
-			RateLimitPPS: 8,
-			RateBurst:    16,
-			MaxClients:   DefaultMaxClients,
-			KoD:          true,
+			RateLimitPPS:      8,
+			RateBurst:         16,
+			RateLimitV6Prefix: ntpserver.DefaultRateLimitV6Prefix,
+			MaxClients:        DefaultMaxClients,
+			KoD:               true,
 		},
 		Monitor: Monitor{
 			Allow: []string{"127.0.0.0/8", "::1/128"},
@@ -779,6 +787,9 @@ func validateServe(s *Serve, needKeys *bool, fail func(string, ...any)) {
 	}
 	if !(s.RateBurst >= 1) {
 		fail("serve: rate_burst %v must be at least 1", s.RateBurst)
+	}
+	if s.RateLimitV6Prefix < 32 || s.RateLimitV6Prefix > 128 {
+		fail("serve: rate_limit_v6_prefix %d must be between 32 and 128", s.RateLimitV6Prefix)
 	}
 	if s.MaxClients < MinMaxClients || s.MaxClients > MaxMaxClients {
 		fail("serve: max_clients %d out of range %d..%d", s.MaxClients, MinMaxClients, MaxMaxClients)

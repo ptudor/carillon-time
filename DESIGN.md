@@ -852,24 +852,49 @@ good against bad traffic adds up (§10.4):
    host queries its own server over `127.0.0.1`, and the kernel already drops
    loopback-sourced packets arriving on a real interface.
 6. ACL: `deny` first, then `allow`; no match → drop, count `denied`.
-7. Rate limit per source address (token bucket, `rate_limit_pps`/
-   `rate_burst`, entries expire after 60 s idle, table bounded by
-   `max_clients` with LRU eviction). Over limit → count `rate_limited`, and
-   if `kod`, reply with stratum 0, refid `RATE`, poll = our suggested
-   minimum, LI=3, at most once per 4 s per client, counted as `kod`; else
-   drop. Under a flood of forged source addresses LRU eviction keeps the
-   heavy hitters tracked and discards the one-shot tail, which is the right
-   way round.
-8. Authentication: if the request carries a MAC and the key id is known,
-   verify; a bad MAC → drop, count `bad_auth`. If the source matches
-   `require_key` and the request has no valid MAC with *that* key → drop.
-   A valid MAC on the request produces a MAC on the reply with the same key.
-9. Build the reply (§7.3), count `served`. Its length is exactly the
+7. **Authentication first, for `require_key` sources only.** If the source
+   matches a `require_key` prefix, its MAC is verified *before* the limiter
+   is consulted. The bucket is keyed by source address, so anyone able to
+   forge the peer's address could otherwise drain its tokens with
+   `rate_limit_pps` packets a second from anywhere on the path, push its poll
+   to `poll_max`, and take the trusted upstream out of exactly the
+   association the shared key exists to protect. The extra CMAC is bounded to
+   the handful of addresses `require_key` names, so it is not a way to make a
+   public listener do crypto on demand — and a hostile sender can already
+   force one by sending a known key id with a bad MAC. No valid MAC with
+   *that* key → drop, count `bad_auth`.
+8. Rate limit (token bucket, `rate_limit_pps`/`rate_burst`, entries expire
+   after 60 s idle, table bounded by `max_clients` with LRU eviction). The
+   bucket is keyed by **(prefix, key id)**: the whole address for IPv4, the
+   `rate_limit_v6_prefix` (default /64) for IPv6, and a separate keyspace per
+   authenticated key id. A /128 key would give every residential IPv6
+   customer — who controls at least a /64 — an unlimited supply of fresh
+   buckets and fresh table slots to evict real clients with; a shared
+   address-only key would let a spoofed flood starve the authenticated peer.
+   Over limit → count `rate_limited`, and if `kod`, reply with stratum 0,
+   refid `RATE`, poll = our suggested minimum, LI=3, at most once per 4 s per
+   client, counted as `kod`; else drop. Under a flood of forged source
+   addresses LRU eviction keeps the heavy hitters tracked and discards the
+   one-shot tail, which is the right way round.
+9. Authentication for everyone else: if the request carries a MAC, the key id
+   must be known and the digest must verify. Otherwise → **crypto-NAK**: the
+   48-byte header plus a 4-byte zero key id, counted `bad_auth`. ntpd and
+   chrony do the same, and it tells the client (and `ntpq -p`) that the *key*
+   is the problem rather than leaving it to drop an unexplained
+   unauthenticated reply. The NAK is 52 bytes and is only ever sent for a
+   request that carried a MAC trailer of its own, so the length invariant
+   holds — asserted in the amplification fuzz. A valid MAC on the request
+   produces a MAC on the reply with the same key.
+10. Accounting. The version histogram and `last_request` are recorded here,
+   after the ACL, the limiter and authentication, so that a spoofed flood
+   does not appear as accepted traffic or advance `last_request` while
+   nothing is being served.
+11. Build the reply (§7.3), count `served`. Its length is exactly the
    request's: 48 bytes, or 48 + 20 when the request carried a MAC that
    verified. Extension fields in the request are never echoed, so a reply is
    never longer than what was received — a property fuzzed over arbitrary
    request bytes and arbitrary source addresses.
-10. Transmit timestamp is read immediately before `sendmsg`.
+12. Transmit timestamp is read immediately before `sendmsg`.
 
 Extension fields in requests are ignored (skipped to find a trailing MAC per
 RFC 7822 framing) and never echoed.
@@ -1195,8 +1220,8 @@ Server traffic is exported per address family, `family="ipv4"|"ipv6"`:
 | `carillon_server_unsynced_replies_total{family}` | subset of `result="served"`: answered with LI=3 |
 | `carillon_server_kod_replies_total{family}` | subset of `result="rate_limited"`: RATE kisses sent |
 | `carillon_server_refused_mode_total{family,mode}` | refusals broken out by NTP mode; `mode="control"` and `mode="private"` are amplification probes |
-| `carillon_server_client_version_total{family,version}` | accepted requests by client protocol version |
-| `carillon_server_clients{family}` | distinct clients in the rate-limit table as of the last request served. Entries expire after a minute, so this reads as "clients in the last minute" on a busy server and goes stale on an idle one — the table is owned by the listener goroutine and is only walked when a request arrives |
+| `carillon_server_client_version_total{family,version}` | requests by client protocol version, counted after the ACL, the rate limiter and authentication — what was actually answered |
+| `carillon_server_clients{family}` | rate-limit buckets in use as of the last request served: one per IPv4 address, one per `rate_limit_v6_prefix` (default /64) for IPv6, and a separate one per authenticated key id. Entries expire after a minute, so this reads as "clients in the last minute" on a busy server and goes stale on an idle one — the table is owned by the listener goroutine and is only walked when a request arrives |
 | `carillon_server_kernel_drops_total{family}` | receive-queue overflows (Linux `SO_RXQ_OVFL`; always 0 on FreeBSD) |
 | `carillon_server_kernel_timestamp_missing_total{family}` | requests received without a kernel timestamp |
 | `carillon_server_last_request_timestamp_seconds{family}` | last valid client request |

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -165,19 +166,104 @@ func TestAuthentication(t *testing.T) {
 	if !testKey.Verify(got[:off], mac) {
 		t.Fatal("reply MAC did not verify")
 	}
+	// A digest that does not verify earns a crypto-NAK: a plain reply tells
+	// the client only that the answer was unauthenticated, while the NAK
+	// says the key is the problem (RF5X-035).
 	bad := append([]byte(nil), signed...)
 	bad[len(bad)-1] ^= 1
-	if got := h.Handle(bad, client, testWall, testMono.Add(2*time.Second)); got != nil {
-		t.Fatal("bad known MAC received a reply")
-	}
-	// An unknown MAC does not make an otherwise-open association trusted,
-	// but it is ignored for clients that do not require a key.
+	nak := h.Handle(bad, client, testWall, testMono.Add(2*time.Second))
+	assertCryptoNAK(t, nak, bad)
+	// A key id this server does not have gets the same answer, and does
+	// not make an otherwise-open association trusted.
 	unknown := auth.Key{ID: 2, Secret: []byte("fedcba9876543210")}.Append(request(4))
-	if got := h.Handle(unknown, from("192.0.2.200"), testWall, testMono.Add(3*time.Second)); len(got) != ntp.HeaderSize {
-		t.Fatalf("unknown optional MAC reply length %d", len(got))
-	}
-	if got := stats.Snapshot().Total; got.BadAuth != 2 || got.Served != 2 {
+	nak = h.Handle(unknown, from("192.0.2.200"), testWall, testMono.Add(3*time.Second))
+	assertCryptoNAK(t, nak, unknown)
+	if got := stats.Snapshot().Total; got.BadAuth != 3 || got.Served != 1 {
 		t.Fatalf("stats %+v", got)
+	}
+}
+
+// assertCryptoNAK checks that response is a 48-byte header plus a zero key
+// id, and no longer than the request that produced it.
+func assertCryptoNAK(t *testing.T, response, request []byte) {
+	t.Helper()
+	if len(response) != ntp.HeaderSize+ntp.CryptoNAKSize {
+		t.Fatalf("crypto-NAK length %d, want %d", len(response), ntp.HeaderSize+ntp.CryptoNAKSize)
+	}
+	if len(response) > len(request) {
+		t.Fatalf("crypto-NAK of %d bytes for a %d-byte request amplifies", len(response), len(request))
+	}
+	_, mac, _, err := ntp.Decode(response)
+	if err != nil {
+		t.Fatalf("decoding the crypto-NAK: %v", err)
+	}
+	if !mac.IsCryptoNAK() {
+		t.Fatalf("trailer %+v is not a crypto-NAK", mac)
+	}
+}
+
+// TestAuthenticatedPeerSurvivesASpoofedFlood covers RF5X-008. The rate-limit
+// bucket is keyed by source address, so anyone able to forge the peer's
+// address could drain it and take the trusted upstream out of the
+// association the shared key exists to protect. Verifying first, and giving
+// verified requests their own bucket, makes the flood cost the attacker one
+// CMAC each and touch nothing.
+func TestAuthenticatedPeerSurvivesASpoofedFlood(t *testing.T) {
+	h, stats := newTestHandler(t, func(c *Config) {
+		c.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.7/32"): 1}
+		c.RateLimitPPS = 1
+		c.RateBurst = 4
+	})
+	peer := from("192.0.2.7")
+	now := testMono
+	for i := range 100 {
+		// A spoofed, unsigned request claiming to be the peer.
+		if got := h.Handle(request(4), peer, testWall, now.Add(time.Duration(i)*time.Millisecond)); got != nil {
+			t.Fatalf("unsigned request %d from a require_key address was answered", i)
+		}
+	}
+	total := stats.Snapshot().Total
+	if total.BadAuth != 100 || total.RateLimited != 0 {
+		t.Fatalf("the flood must all be bad_auth and never reach the limiter: %+v", total)
+	}
+	// The peer's own authenticated poll is still served.
+	signed := testKey.Append(request(4))
+	got := h.Handle(signed, peer, testWall, now.Add(200*time.Millisecond))
+	if len(got) != ntp.HeaderSize+ntp.MACSizeCMAC {
+		t.Fatalf("authenticated poll after the flood: reply length %d", len(got))
+	}
+	if s := stats.Snapshot().Total; s.Served != 1 {
+		t.Fatalf("served %d, want 1", s.Served)
+	}
+}
+
+// TestVersionHistogramCountsOnlyAcceptedRequests covers RF5X-023: a request
+// that is then rate-limited or fails require_key must not appear as accepted
+// traffic, nor advance last_request.
+func TestVersionHistogramCountsOnlyAcceptedRequests(t *testing.T) {
+	h, stats := newTestHandler(t, func(c *Config) {
+		c.RateLimitPPS = 1
+		c.RateBurst = 1
+	})
+	client := from("192.0.2.1")
+	if got := h.Handle(request(4), client, testWall, testMono); got == nil {
+		t.Fatal("the first request must be served")
+	}
+	before := stats.Snapshot().Total
+	for i := range 10 {
+		h.Handle(request(4), client, testWall, testMono.Add(time.Duration(i)*time.Millisecond))
+	}
+	after := stats.Snapshot().Total
+	if after.RateLimited == 0 {
+		t.Fatal("the burst was not rate limited")
+	}
+	if after.Versions[4] != before.Versions[4] {
+		t.Fatalf("version histogram counted rate-limited traffic: %d -> %d",
+			before.Versions[4], after.Versions[4])
+	}
+	if !after.LastRequest.Equal(before.LastRequest) {
+		t.Fatalf("last_request advanced while nothing was served: %v -> %v",
+			before.LastRequest, after.LastRequest)
 	}
 }
 
@@ -226,10 +312,10 @@ func TestRateLimitAndKoDThrottle(t *testing.T) {
 }
 
 func TestRateLimiterExpiryAndBound(t *testing.T) {
-	l := newRateLimiter(1, 1, 2)
-	a := netip.MustParseAddr("192.0.2.1")
-	b := netip.MustParseAddr("192.0.2.2")
-	c := netip.MustParseAddr("192.0.2.3")
+	l := newRateLimiter(1, 1, 2, 0)
+	a := l.key(netip.MustParseAddr("192.0.2.1"), 0)
+	b := l.key(netip.MustParseAddr("192.0.2.2"), 0)
+	c := l.key(netip.MustParseAddr("192.0.2.3"), 0)
 	l.allow(a, testMono)
 	l.allow(b, testMono.Add(time.Second))
 	l.allow(c, testMono.Add(2*time.Second))
@@ -239,6 +325,40 @@ func TestRateLimiterExpiryAndBound(t *testing.T) {
 	l.allow(a, testMono.Add(clientIdleExpiry+3*time.Second))
 	if len(l.clients) != 1 || l.clients[a] == nil {
 		t.Fatalf("idle expiry failed: %+v", l.clients)
+	}
+}
+
+// TestRateLimiterKeysIPv6ByPrefix covers RF5X-024: every residential IPv6
+// customer controls at least a /64, so a per-/128 bucket gives one host an
+// unlimited supply of fresh buckets and fresh LRU slots to evict real
+// clients with.
+func TestRateLimiterKeysIPv6ByPrefix(t *testing.T) {
+	l := newRateLimiter(1, 8, 100, 0)
+	now := testMono
+	for i := range 20 {
+		addr := netip.MustParseAddr(fmt.Sprintf("2001:db8:1:2::%x", i+1))
+		l.allow(l.key(addr, 0), now)
+	}
+	if len(l.clients) != 1 {
+		t.Fatalf("%d buckets for 20 addresses in one /64, want 1", len(l.clients))
+	}
+	// A different /64 is a different client.
+	l.allow(l.key(netip.MustParseAddr("2001:db8:1:3::1"), 0), now)
+	if len(l.clients) != 2 {
+		t.Fatalf("%d buckets after a second /64, want 2", len(l.clients))
+	}
+	// IPv4 is unchanged: one bucket per address.
+	l.allow(l.key(netip.MustParseAddr("192.0.2.1"), 0), now)
+	l.allow(l.key(netip.MustParseAddr("192.0.2.2"), 0), now)
+	if len(l.clients) != 4 {
+		t.Fatalf("%d buckets after two IPv4 addresses, want 4", len(l.clients))
+	}
+	// An authenticated request has its own bucket, so a spoofed flood on
+	// the same address cannot drain it.
+	addr := netip.MustParseAddr("192.0.2.1")
+	l.allow(l.key(addr, 7), now)
+	if len(l.clients) != 5 {
+		t.Fatalf("%d buckets after an authenticated request, want 5", len(l.clients))
 	}
 }
 
@@ -263,6 +383,11 @@ func FuzzReplyNeverAmplifies(f *testing.F) {
 		got := h.Handle(req, netip.AddrPortFrom(addr, 123), testWall, testMono)
 		if len(got) > len(req) {
 			t.Fatalf("amplified %d-byte request to %d bytes", len(req), len(got))
+		}
+		// A crypto-NAK is 52 bytes, so it may only ever answer a request
+		// that carried a MAC trailer of its own (RF5X-035).
+		if _, mac, _, err := ntp.Decode(got); err == nil && mac.IsCryptoNAK() && len(req) < ntp.HeaderSize+ntp.CryptoNAKSize {
+			t.Fatalf("crypto-NAK sent for a %d-byte request", len(req))
 		}
 	})
 }
