@@ -521,6 +521,51 @@ msg="leaving the drift file alone" reason="less than 15m0s of frequency history"
 
 and `gummi` restarted on −15.418252, reaching −15.449 ppm immediately.
 
+### Remediation, 13:47–13:52 UTC
+
+Redeployed `5561238` (the drift-file gate) to all three, restoring each drift
+file between stop and start because the outgoing binary poisons it. `twocom`'s
+read **32.106037** after its old binary stopped, against the 6.126572 it had
+held for days; `gummi`'s read 1.637883 against −15.418252.
+
+| host | frequency before | after |
+|---|---|---|
+| `gummi` | +1.64 ppm (transient) | **−15.74 ppm** |
+| `twocom` | +32.11 ppm (transient) | **+1.29 ppm**, converging to ~+6 |
+| `navlisten2026` | +9.39 ppm | +11.81 ppm |
+
+All three synced, no steps, `twocom` serving with zero unsynchronized replies.
+Restoring `gummi` also cleared its loop-update starvation: it had gone 14
+minutes with no update while carrying a 17 ppm error.
+
+The second stop of `gummi` — the first with the gate present — logged what it
+is for:
+
+```
+msg="leaving the drift file alone" reason="less than 15m0s of frequency history"
+  current_ppm=1.5070742347860342
+```
+
+### A defect the deployment found in the RF5X-006 fix
+
+`navlisten2026` came up in `settling` with `Updates = 1` and stayed there past
+a `waitsync 60`, reaching `synced` only at 2m18s. RF5X-006 moved the settling
+counter off loop updates and onto measurements for the system source, but left
+the *check* inside the branch of `reselect` that only runs when the clock
+filter yields a new lowest-delay sample — so a filter withholding updates
+still pinned the daemon in SETTLING, which is the outage RF5X-006 existed to
+remove. Under the drought documented in `DESIGN.md` §6.3 that is up to 34
+minutes of LI=3 on a serving host.
+
+Fixed in `751c23c`: the settling transition is evaluated on every reselect.
+`TestSystemLeavesSettlingWithoutAFreshLoopUpdate` feeds five samples that
+produce no loop update and requires SYNCED; it fails on `5561238`.
+
+**The hosts are running `5561238` and still carry this defect.** It costs
+nothing while running — settling only happens after a restart or a step — so
+it does not warrant a fourth restart today. Deploy `751c23c` at the next
+natural opportunity, and it will make that restart's settling robust.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
