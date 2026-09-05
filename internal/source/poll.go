@@ -35,11 +35,27 @@ func clampPoll(poll, min, max int8) int8 {
 
 // pollInterval returns 2^poll seconds with ±5 % random jitter so that many
 // clients started together do not stay synchronized to the same instant.
-func pollInterval(poll int8) time.Duration {
+//
+// floorPoll, when positive, is a minimum the server has demanded. The jitter
+// is applied first and then the floor, so a demanded interval is never
+// undercut by up to 5 % — which is exactly the sort of thing that earns a
+// second RATE, or a DENY (RA6X-030).
+func pollInterval(poll, floorPoll int8) time.Duration {
 	base := ntp.Log2Seconds(poll)
 	jitter := 1 + (rand.Float64()*2-1)*pollJitter
-	return time.Duration(base * jitter * float64(time.Second))
+	d := time.Duration(base * jitter * float64(time.Second))
+	if floorPoll > 0 {
+		if floor := time.Duration(ntp.Log2Seconds(floorPoll) * float64(time.Second)); d < floor {
+			return floor
+		}
+	}
+	return d
 }
+
+// maxRemoteBackoffPoll caps the poll exponent a server's RATE kiss may
+// demand. RFC 8633 §5.4 recommends a maximum no greater than 13 (8192 s);
+// carillon uses that, raised only if the operator's own poll_max is larger.
+const maxRemoteBackoffPoll = 13
 
 // clampPrecision bounds a peer's advertised precision to a sane range: a
 // positive exponent would mean a clock coarser than a second, and anything

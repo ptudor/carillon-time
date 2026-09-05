@@ -552,16 +552,49 @@ noselect = false
 - Reply sanity: mode 4, stratum 1..15, LI ≠ 3, `δ ≥ 0` (else drop as
   "bogus"), root distance sane (`< 1 s` unless configured otherwise),
   reference time not in the future by more than 1 s.
+- **Rate limiting and authentication.** Authentication is decided *before* the
+  service bucket is chosen, so the bucket is keyed by the identity that was
+  actually verified rather than by one a request merely claims — an optional
+  key that verifies gets its own allowance instead of sharing the unsigned
+  client's. The cost of verifying is metered from a **separate keyspace**, so
+  invalid-authentication work and crypto-NAK emission can never spend the
+  tokens a legitimate authenticated peer needs. Within that: an address the
+  configuration does not expect to authenticate has its CMAC metered, so a
+  public listener cannot be made to do crypto on demand; a `require_key` peer
+  is always verified, because refusing to verify it while someone floods its
+  address is precisely the starvation the separate keyspace exists to avoid,
+  and only the *failures* spend a token. `RATE` replies to a request whose MAC
+  and permitted identity were verified are themselves signed — an unsigned
+  kiss is rejected by carillon's own authenticated client before it ever reads
+  the kiss code, so two instances could not otherwise honour their own
+  rate-control protocol.
 - **Kiss-o'-Death** (stratum 0): `RATE` → double the poll interval and honour
   the packet's poll field as a new **minimum** that persists for as long as
-  we are talking to that server (cleared only when re-resolution yields a
-  different address). It bounds `adaptPoll` from below and survives a loss of
-  reachability; without that, the next noisy update drops the poll straight
-  back under what the server demanded, earns another kiss, and the client
-  oscillates at the server's limit instead of backing off (RFC 8633 §5.4). A
-  demand longer than `poll_max` raises the effective maximum — with one log
-  line — rather than being silently clamped, since continuing to poll faster
-  than a server asked is how a client earns a `DENY`.
+  we are talking to that server. It bounds `adaptPoll` from below and survives
+  a loss of reachability; without that, the next noisy update drops the poll
+  straight back under what the server demanded, earns another kiss, and the
+  client oscillates at the server's limit instead of backing off (RFC 8633
+  §5.4).
+
+  What a *remote* may demand is capped at poll **13** (8192 s), RFC 8633
+  §5.4's recommended maximum, raised only if the operator's own `poll_max` is
+  already larger — an operator's long poll is their decision, a server's
+  demand is not. Without that cap a correctly matched but unauthenticated
+  kiss could push a short configured poll to exponent 17, 131072 s, and take
+  an association out of service for a day and a half.
+
+  A demand longer than `poll_max` raises the **effective** maximum for that
+  association — with one log line — rather than being silently clamped, since
+  continuing to poll faster than a server asked is how a client earns a
+  `DENY`. The configured `poll_max` itself never changes, and everything a
+  peer demanded is discarded when the endpoint changes: a replacement server
+  has no opinion yet, and inheriting the previous one's expanded maximum left
+  a healthy new peer being polled once a day.
+
+  A `RATE` accepted during an `iburst` ends the burst: the remaining
+  two-second requests are exactly what the server asked us to stop sending.
+  The ±5 % scheduling jitter is applied before a demanded minimum, never
+  after, so a demanded interval is never undercut.
   `DENY`/`RSTR` → stop polling that server and log ERROR. Any KoD packet that carries a valid MAC is honoured;
   unauthenticated KoDs are honoured only for `RATE`.
 - `iburst`: a burst of 4 requests 2 s apart on start-up and whenever the
@@ -1079,11 +1112,21 @@ good against bad traffic adds up (§10.4):
    too; that is the same conservative trade ntpd makes.) **FreeBSD reports
    only the header destination** (`IP_RECVDSTADDR`) with no local-address
    companion, and has no `MSG_BCAST`/`MSG_MCAST` receive flags — those are
-   NetBSD/OpenBSD — so the directed-broadcast case is *not yet* handled
-   there. It matters more on FreeBSD than on Linux, because
-   `in_pcbbind_setup` accepts a broadcast address as local and the reply
-   actually leaves the host with a broadcast source. See RF5X-003 in
-   `FIXES_FABLE5_XHIGH.md`.
+   NetBSD/OpenBSD constants that appear in no FreeBSD header. It matters more
+   there than on Linux, because `in_pcbbind_setup` accepts a broadcast address
+   as local, so the reply actually leaves the host with a broadcast source.
+
+   The mechanism that works on both is to compare the reported destination
+   against **this host's own interface broadcast addresses**, read from the
+   interface list and cached for a minute: `192.0.2.255` is the broadcast of a
+   /24 and an ordinary host address on a /23, so nothing but the interface
+   configuration can tell them apart, and no address-suffix heuristic is used.
+   A /31 or /32 has no broadcast address (RFC 3021) and contributes none. If
+   the interface list cannot be read at all, the destination is treated as
+   *not* a broadcast and the failure is logged once: failing closed would stop
+   the server answering anything, which is worse than the narrow case this
+   guards. A later failed refresh keeps the last known configuration rather
+   than losing the check.
 3. Decode. Shorter than 48 bytes, or a malformed extension field or MAC
    trailer → drop, count `malformed`. Version 0 or above 4 → drop, count
    `bad_version`; versions 1–4 are accepted and the reply carries the

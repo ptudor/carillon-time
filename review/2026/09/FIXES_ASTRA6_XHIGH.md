@@ -1473,3 +1473,225 @@ whose `Run` deliberately never returns alongside a working one, synchronizes
 so a nonzero transient is applied, then cancels: `Run` must return within the
 bounded drain and the last actuator write must be the base estimate. No real
 clock or driver hang is involved, as the review requires.
+
+---
+
+## Wave 7 — protocol and authenticated limiting
+
+## RA6X-026 — FreeBSD answers directed broadcasts as unicast requests — FIXED
+
+**Changed.** `192.0.2.255` is the directed broadcast of a /24 and an ordinary
+host address on a /23, so nothing but the interface configuration can tell
+them apart. Linux reports the delivery in `recvmsg`'s flags word; FreeBSD does
+not — `MSG_BCAST` and `MSG_MCAST` are NetBSD/OpenBSD constants that appear in
+no FreeBSD header — and it matters more there, because `in_pcbbind_setup`
+accepts a broadcast address as local, so the reply actually left the host with
+a broadcast source copied from `IP_RECVDSTADDR` into `IP_SENDSRCADDR`.
+
+`localBroadcasts` reads this host's interface addresses and computes their
+IPv4 directed-broadcast addresses, cached for a minute and refreshed lazily on
+the receive path — so an interface change is picked up without any
+platform-specific network-change notification. The listener consults it on
+every platform, after the existing address-based and flags-based checks, and
+counts exactly one martian outcome. A /31 or /32 contributes no broadcast
+address (RFC 3021). No `MSG_BCAST` constant is imported and no address-suffix
+heuristic is used; valid unicast addresses ending in `.255`, non-/24 subnets,
+IPv6, wildcard binding and multihomed reply-source selection are unaffected.
+
+**Policy when the metadata is unavailable**, as the finding requires: if the
+interface list cannot be read at all, the destination is treated as *not* a
+broadcast and the failure is logged once — failing closed would stop the
+server answering anything, which is worse than the narrow case this guards. A
+*later* failed refresh keeps the last known configuration rather than losing
+the check.
+
+**Files.** `internal/server/broadcast.go` (new),
+`internal/server/listener.go`, `internal/server/pktinfo_freebsd.go`,
+`DESIGN.md`, `internal/server/astra6_review_test.go`.
+
+**Verification.** `TestAstra6DirectedBroadcastIsRecognised` tables a /24, a
+/23 (whose broadcast is *not* the `.255` of the address's own third octet), a
+/31, loopback and IPv6, requiring exactly the broadcast addresses to be
+recognised and ordinary hosts not to be.
+`TestAstra6BroadcastMetadataPolicy` covers enumeration failing before anything
+is known, the cache not re-enumerating inside the refresh window, and a later
+failure keeping the last known configuration. **Deferred to the target hosts:**
+FreeBSD packet captures for /24 and non-/24 directed broadcasts, limited
+broadcast, multicast and valid secondary unicast addresses, and the existing
+FreeBSD martian fixture.
+
+## RA6X-027 — Required-key authentication failures bypass all response limiting — FIXED
+
+**Changed.** The crypto-NAK for a bad MAC from a `require_key` prefix was
+returned *before* the limiter was consulted, so 100 bad-MAC requests produced
+100 NAKs at arrival rate with burst 8. The rate limiter gained a second
+keyspace, `spaceCrypto`, separate from the service buckets, so
+invalid-authentication work and NAK emission can never spend the tokens a
+legitimate authenticated peer needs.
+
+Two things are bounded, and only one of them can be bounded per address
+without starving the very peer a spoofer is impersonating — the fix is
+explicit about which is which:
+
+- **Replies.** A crypto-NAK is emitted only while the crypto budget has a
+  token, and only a *failure* spends one. That bounds the reflection the
+  finding demonstrates.
+- **Work.** An address the configuration does not expect to authenticate has
+  its CMAC metered, so a public listener cannot be made to do crypto on
+  demand. A `require_key` peer is always verified: refusing to verify it
+  because someone is flooding its address is exactly the starvation the
+  separate keyspace exists to avoid, and the finding's own verification step
+  requires a valid required-key request to succeed after such a flood.
+
+Silent rejection of a missing or wrong-but-permitted key, MAC verification
+before trusting any key identity, ACL order, response-size bounds and
+exactly-one-terminal-outcome accounting are preserved.
+
+**Files.** `internal/server/ratelimit.go`, `internal/server/responder.go`,
+`DESIGN.md`, `internal/server/astra6_review_test.go`,
+`internal/server/responder_test.go`.
+
+**Verification.** The existing flood probe
+`TestVerification035CryptoNAKFloodIsBounded` passes, and
+`TestAstra6CryptoNAKFloodIsBounded` repeats it with the added requirement that
+the peer's own authenticated request is still served afterwards.
+`TestAstra6AuthBudgetsAreSeparate` floods absent, unknown and wrong keys in
+turn and requires a valid required-key request to succeed after each.
+`TestAstra6LimiterKeyspacesAreDistinct` pins the separation.
+`TestAuthenticatedPeerSurvivesASpoofedFlood` was updated: it asserted that the
+flood "never reaches the limiter", which is the property RA6X-027 says must
+change; it now requires every packet to be accounted for exactly once across
+`bad_auth` and `rate_limited`, the NAKs to be bounded, and the peer's own
+authenticated poll to be served — a stronger statement than before.
+
+## RA6X-028 — Optional authenticated clients share the unsigned client's bucket — FIXED
+
+**Changed.** With an optional key, `h.verify` ran *after* `limitKey` had been
+computed, so `replyKey` was nil and every request from the address used key id
+zero — spoofed unsigned traffic could exhaust a correctly authenticated
+client's allowance. Verification now happens before the service bucket is
+chosen for optional keys as well, so the bucket is keyed by the identity that
+was actually verified. The crypto work that makes that possible is metered
+from the separate keyspace (RA6X-027), so moving it earlier does not hand a
+public listener unbounded CMAC. Optional authentication is preserved:
+configuring keys alone still does not require clients to authenticate, and no
+unverified trailer id ever allocates privileged tokens.
+
+**Files.** `internal/server/responder.go`, `internal/server/ratelimit.go`,
+`DESIGN.md`, `internal/server/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6OptionalAuthHasIndependentBucket`
+passes: after an unsigned request has drained the burst, a valid optional-key
+request from the same address is still answered.
+`TestAstra6LimiterKeyspacesAreDistinct` and the RA6X-027 tests cover the rest.
+
+## RA6X-029 — Authenticated clients cannot authenticate this server's RATE replies — FIXED
+
+**Changed.** The RATE path passed `nil` as the reply key unconditionally, so a
+kiss to an authenticated client was unsigned; carillon's own client rejects a
+missing MAC before it interprets the kiss code, recorded bad authentication,
+and never executed the backoff — two instances could not honour their own
+rate-control protocol. The RATE reply is now signed with `replyKey`, which is
+non-nil only after a successful verification, so a reply is never signed on
+the strength of a key id a request merely claims. Unsigned clients still get
+an unsigned kiss, and KoD emission limits, anti-amplification bounds, origin
+echo and silent drops where no KoD is due are unchanged.
+
+**Files.** `internal/server/responder.go`, `DESIGN.md`,
+`internal/server/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6AuthenticatedRATEIsAuthenticated`
+passes — the RATE response verifies under the client's key.
+`TestAstra6UnsignedRATEStaysUnsigned` requires an unsigned client's kiss to
+remain a bare 48-byte header.
+
+## RA6X-030 — RATE backoff is not consistently applied or cleared — FIXED
+
+**Changed.** Four separate defects, all of them about a demand outliving the
+peer that made it or being undercut by scheduling:
+
+1. **The configured bound is immutable.** `handleKiss` assigned
+   `n.cfg.PollMax = want`. A new `effPollMax` carries the *association's*
+   effective maximum; `cfg.PollMax` never changes.
+2. **Endpoint change clears the demand.** `resetEndpointState` (shared with
+   RA6X-037) now resets `effPollMax`, the current poll, the burst flag, the
+   per-stage metadata and the stratum watermark alongside `kodMinPoll` and the
+   filter, so a replacement server does not inherit the previous one's
+   expanded maximum and long poll.
+3. **A RATE ends an iburst.** `handleKiss` sets `kissedRate`, and the burst
+   loop stops on it: the remaining two-second requests are exactly what the
+   server asked us to stop sending.
+4. **The jitter cannot undercut a demanded minimum.** `pollInterval` takes a
+   floor exponent and applies it *after* the ±5 % jitter, so an actual send
+   never precedes the interval a server demanded — which is how a client earns
+   a second kiss, or a `DENY`.
+
+Randomized scheduling, bounded DNS retry, ordinary iburst behaviour and
+legitimate configured long polls are preserved; `DESIGN.md` §5.4 states which
+state survives re-resolution to the same endpoint (all of it — `setAddrs`
+keeps the current address when it is still among the answers).
+
+**Files.** `internal/source/ntp.go`, `internal/source/poll.go`, `DESIGN.md`,
+`internal/source/astra6_review_test.go`.
+
+**Verification.** `TestVerification017AddressChangeDropsKissMaximum` (the
+review's own fixture, exercised through the same code path) and
+`TestAstra6RateBackoffIsAssociationScoped` require every demanded value to be
+dropped when the endpoint changes. `TestAstra6PollJitterRespectsADemandedFloor`
+runs 10 000 draws against a demanded floor and requires none to fall short,
+and separately confirms the jitter *is* free to go below when there is no
+floor, so the test proves something. `TestAstra6RateEndsAnIburst` drives the
+real poller against a server that answers every request with a RATE and
+requires exactly one request to have been sent.
+
+## RA6X-031 — An untrusted RATE can suppress polling for over a day — FIXED
+
+**Changed.** The only cap on a server's demanded exponent was
+`discipline.MaxPoll` = 17 — 131072 s, about 36.4 hours — and it overrode
+`poll_max`. `maxRemoteBackoffPoll` = 13 is now the ceiling on *remotely
+demanded* backoff, which is [RFC 8633 §5.4](https://www.rfc-editor.org/rfc/rfc8633.html#section-5.4)'s
+recommendation, raised only when the operator's own `poll_max` is already
+larger — an operator's long poll is their decision, a server's demand is not.
+The clamp is logged with the demanded value, the cap and whether the kiss was
+authenticated. Origin and address validation, authenticated `DENY`/`RSTR`
+semantics and continued bounded polling with visible state are unchanged: the
+association keeps polling at the capped interval rather than silently sleeping
+for an attacker-selected day-scale interval.
+
+**Files.** `internal/source/ntp.go`, `internal/source/poll.go`, `DESIGN.md`,
+`internal/source/astra6_review_test.go`.
+
+**Verification.** `TestAstra6RemoteBackoffIsCapped` tables a demand beyond the
+cap, at it, below it, inside `poll_max`, an operator's own poll-17
+configuration (kept), and an operator's poll-15 configuration with a smaller
+demand (not raised) — asserting in every case that `cfg.PollMax` itself was
+not mutated.
+
+## RA6X-040 — Negative root-delay interoperability needs an explicit representation policy — SKIPPED
+
+**Reason.** The fix specification's first instruction is to gather evidence
+this session cannot gather: *"Check supported ntpd/chrony implementations and
+relevant protocol versions"*, with a verification step of *"compare actual
+peer packets"* — and the review records that *"no affected live-peer capture
+was obtained in this review."* The two authorities also disagree: RFC 4330 §4
+describes root delay as signed and explicitly allows small negative values,
+while RFC 5905 describes the short format as unsigned, and which one carillon
+must interoperate with is a question about what real peers put on the wire,
+not one that can be settled from the source.
+
+Changing the shared `Short.Seconds` conversion without that evidence would
+either keep rejecting a legitimate peer or start accepting a field the current
+RFC says cannot be negative, in a type also used for root *dispersion*, which
+must stay unsigned and nonnegative.
+
+**What is needed to close it.** Captures from the ntpd and chrony versions
+carillon is expected to peer with, showing whether any of them ever emits a
+root delay with the high bit set. If they do, the fix is a field-specific
+signed decode for `RootDelay` only, with raw-bit tests around zero, small
+negatives, the maximum positive and negative-delay-plus-dispersion
+combinations per version, and a bound that rejects genuinely excessive
+negative values rather than letting them cancel uncertainty.
+
+**Present behaviour, unchanged.** A raw `RootDelay` of `0xffff0000` decodes as
++65535 s and is then rejected by the root-distance check, so such a peer is
+unusable rather than misinterpreted. Root dispersion is unaffected.

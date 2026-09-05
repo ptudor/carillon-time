@@ -1,10 +1,16 @@
 package server
 
 import (
+	"errors"
 	"math"
+	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"carillon/internal/ntp"
+	"carillon/internal/ntp/auth"
 )
 
 // TestAstra6HandlerRejectsUnboundedLimits covers RA6X-035 at the public
@@ -53,5 +59,233 @@ func TestAstra6HandlerRejectsUnboundedLimits(t *testing.T) {
 				t.Fatal("unbounded limits accepted")
 			}
 		})
+	}
+}
+
+// TestAstra6DirectedBroadcastIsRecognised covers RA6X-026. A directed
+// broadcast cannot be told from an ordinary unicast address without the
+// interface's own configuration: 192.0.2.255 is the broadcast of a /24 and a
+// perfectly ordinary host address on a /23. FreeBSD reports no MSG_BCAST, so
+// comparing against the interfaces' broadcast addresses is the mechanism that
+// works on both platforms.
+func TestAstra6DirectedBroadcastIsRecognised(t *testing.T) {
+	ifaces := []net.Addr{
+		&net.IPNet{IP: net.IPv4(192, 0, 2, 10), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.IPv4(198, 51, 100, 3), Mask: net.CIDRMask(23, 32)},
+		&net.IPNet{IP: net.IPv4(203, 0, 113, 5), Mask: net.CIDRMask(31, 32)},
+		&net.IPNet{IP: net.IPv4(127, 0, 0, 1), Mask: net.CIDRMask(8, 32)},
+	}
+	b := &localBroadcasts{enumerate: func() ([]net.Addr, error) { return ifaces, nil }}
+	now := time.Now()
+	cases := []struct {
+		addr  string
+		bcast bool
+	}{
+		{"192.0.2.255", true},    // the /24's directed broadcast
+		{"198.51.101.255", true}, // the /23's, which is not a .255 on its own prefix
+		{"127.255.255.255", true},
+		{"192.0.2.10", false},     // our own address
+		{"192.0.2.1", false},      // an ordinary host
+		{"198.51.100.255", false}, // an ordinary host on the /23
+		{"203.0.113.5", false},    // a /31 has no broadcast address
+		{"203.0.113.4", false},
+	}
+	for _, c := range cases {
+		t.Run(c.addr, func(t *testing.T) {
+			got, known := b.isBroadcast(netip.MustParseAddr(c.addr), now)
+			if !known {
+				t.Fatal("the interface configuration must be known here")
+			}
+			if got != c.bcast {
+				t.Fatalf("isBroadcast(%s) = %v, want %v", c.addr, got, c.bcast)
+			}
+		})
+	}
+	// IPv6 has no broadcast at all.
+	if got, known := b.isBroadcast(netip.MustParseAddr("2001:db8::1"), now); got || !known {
+		t.Fatalf("IPv6 destination reported bcast=%v known=%v", got, known)
+	}
+}
+
+// TestAstra6BroadcastMetadataPolicy pins the documented behaviour when the
+// interface list cannot be read, and the refresh.
+func TestAstra6BroadcastMetadataPolicy(t *testing.T) {
+	var fail atomic.Bool
+	var calls atomic.Int32
+	b := &localBroadcasts{enumerate: func() ([]net.Addr, error) {
+		calls.Add(1)
+		if fail.Load() {
+			return nil, errors.New("no interfaces")
+		}
+		return []net.Addr{&net.IPNet{IP: net.IPv4(192, 0, 2, 10), Mask: net.CIDRMask(24, 32)}}, nil
+	}}
+
+	// Enumeration failing before anything is known: not a broadcast, and
+	// the caller is told the metadata is unavailable.
+	fail.Store(true)
+	if got, known := b.isBroadcast(netip.MustParseAddr("192.0.2.255"), time.Now()); got || known {
+		t.Fatalf("with no interface information: bcast=%v known=%v, want false/false", got, known)
+	}
+
+	// Once it succeeds, the answer is cached and not re-enumerated.
+	fail.Store(false)
+	now := time.Now()
+	if got, known := b.isBroadcast(netip.MustParseAddr("192.0.2.255"), now); !got || !known {
+		t.Fatalf("bcast=%v known=%v", got, known)
+	}
+	before := calls.Load()
+	for i := 0; i < 100; i++ {
+		b.isBroadcast(netip.MustParseAddr("192.0.2.1"), now.Add(time.Duration(i)*time.Millisecond))
+	}
+	if calls.Load() != before {
+		t.Fatalf("the cache was re-enumerated %d times inside the refresh window", calls.Load()-before)
+	}
+
+	// A later failure keeps the last known configuration rather than losing
+	// the check entirely.
+	fail.Store(true)
+	if got, known := b.isBroadcast(netip.MustParseAddr("192.0.2.255"), now.Add(2*broadcastRefresh)); !got || !known {
+		t.Fatalf("after a failed refresh: bcast=%v known=%v, want the cached true/true", got, known)
+	}
+
+	// And a successful refresh past the window picks up a change.
+	fail.Store(false)
+	if calls.Load() == before {
+		t.Fatal("the refresh never happened")
+	}
+}
+
+// TestAstra6AuthenticatedRATEIsAuthenticated is the review's RA6X-029 probe.
+// RATE replies were always unsigned, so carillon's own authenticated client
+// recorded bad authentication and never executed the backoff — two instances
+// could not honour their own rate-control protocol.
+func TestAstra6AuthenticatedRATEIsAuthenticated(t *testing.T) {
+	h, _ := newTestHandler(t, func(c *Config) {
+		c.RateBurst = 1
+		c.RateLimitPPS = 1
+		c.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.0/24"): 1}
+	})
+	req := testKey.Append(request(4))
+	h.Handle(req, from("192.0.2.1"), testWall, testMono)
+	got := h.Handle(req, from("192.0.2.1"), testWall, testMono.Add(time.Millisecond))
+	p, mac, off, err := ntp.Decode(got)
+	if err != nil || p.ReferenceID != ntp.KissRATE {
+		t.Fatalf("setup no RATE: %v %+v", err, p)
+	}
+	if !testKey.Verify(got[:off], mac) {
+		t.Fatal("authenticated client's RATE response has no valid MAC")
+	}
+}
+
+// TestAstra6UnsignedRATEStaysUnsigned checks the other half: a reply is never
+// signed on the strength of a key id a request merely claims.
+func TestAstra6UnsignedRATEStaysUnsigned(t *testing.T) {
+	h, _ := newTestHandler(t, func(c *Config) { c.RateBurst = 1; c.RateLimitPPS = 1 })
+	plain := request(4)
+	h.Handle(plain, from("192.0.2.1"), testWall, testMono)
+	got := h.Handle(plain, from("192.0.2.1"), testWall, testMono.Add(time.Millisecond))
+	if len(got) == 0 {
+		t.Fatal("no RATE reply")
+	}
+	p, _, _, err := ntp.Decode(got)
+	if err != nil || p.ReferenceID != ntp.KissRATE {
+		t.Fatalf("no RATE: %v %+v", err, p)
+	}
+	if len(got) != ntp.HeaderSize {
+		t.Fatalf("an unsigned client's RATE reply is %d bytes, want a bare header", len(got))
+	}
+}
+
+// TestAstra6OptionalAuthHasIndependentBucket is the review's RA6X-028 probe.
+// With an optional key, verification happened after the bucket was chosen, so
+// every request from an address used key id zero and spoofed unsigned traffic
+// could exhaust a correctly authenticated client's allowance.
+func TestAstra6OptionalAuthHasIndependentBucket(t *testing.T) {
+	h, _ := newTestHandler(t, func(c *Config) { c.RateBurst = 1; c.RateLimitPPS = 1; c.KoD = false })
+	h.Handle(request(4), from("192.0.2.1"), testWall, testMono)
+	if got := h.Handle(testKey.Append(request(4)), from("192.0.2.1"), testWall, testMono); len(got) == 0 {
+		t.Fatal("unsigned request drained optional authenticated client's bucket")
+	}
+}
+
+// TestAstra6CryptoNAKFloodIsBounded is the review's RA6X-027 probe: invalid
+// MACs from a require_key prefix produced one crypto-NAK each, at arrival
+// rate, because the NAK was emitted before the limiter was consulted.
+func TestAstra6CryptoNAKFloodIsBounded(t *testing.T) {
+	h, stats := newTestHandler(t, func(c *Config) {
+		c.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.7/32"): 1}
+		c.RateLimitPPS, c.RateBurst = 1, 8
+	})
+	unknown := auth.Key{ID: 77, Secret: []byte("0123456789abcdef")}
+	req := unknown.Append(request(4))
+	replies := 0
+	for i := 0; i < 100; i++ {
+		if got := h.Handle(req, from("192.0.2.7"), testWall, testMono); len(got) > 0 {
+			replies++
+			if len(got) > len(req) {
+				t.Fatal("amplified reply")
+			}
+		}
+	}
+	if replies > 9 { // the burst, plus at most one throttled kiss
+		t.Fatalf("%d replies to 100 bad MACs at one instant with burst=8; counters=%+v",
+			replies, stats.Snapshot().Total)
+	}
+	// The peer's own authenticated request must still be served: a spoofer
+	// at its address must not be able to lock it out.
+	if got := h.Handle(testKey.Append(request(4)), from("192.0.2.7"), testWall, testMono); len(got) != 68 {
+		t.Fatalf("spoofed traffic starved the authenticated peer: reply length %d", len(got))
+	}
+}
+
+// TestAstra6AuthBudgetsAreSeparate covers the rest of RA6X-027 and RA6X-028:
+// each class of traffic gets its own allowance and cannot spend another's.
+func TestAstra6AuthBudgetsAreSeparate(t *testing.T) {
+	wrong := auth.Key{ID: 1, Secret: []byte("wrongwrongwrong!")}
+	unknown := auth.Key{ID: 77, Secret: []byte("0123456789abcdef")}
+
+	for _, c := range []struct {
+		name string
+		req  []byte
+	}{
+		{"absent key", request(4)},
+		{"unknown key", unknown.Append(request(4))},
+		{"wrong key", wrong.Append(request(4))},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, _ := newTestHandler(t, func(cfg *Config) {
+				cfg.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.7/32"): 1}
+				cfg.RateLimitPPS, cfg.RateBurst = 1, 4
+			})
+			for i := 0; i < 200; i++ {
+				h.Handle(c.req, from("192.0.2.7"), testWall, testMono)
+			}
+			// A valid required-key request still succeeds afterwards.
+			if got := h.Handle(testKey.Append(request(4)), from("192.0.2.7"), testWall, testMono); len(got) != 68 {
+				t.Fatalf("a valid required-key request was refused after the flood: %d bytes", len(got))
+			}
+		})
+	}
+}
+
+// TestAstra6LimiterKeyspacesAreDistinct pins the separation itself.
+func TestAstra6LimiterKeyspacesAreDistinct(t *testing.T) {
+	l := newRateLimiter(1, 1, 0, 0)
+	addr := netip.MustParseAddr("192.0.2.1")
+	now := testMono
+	keys := []bucketKey{
+		l.key(addr, 0),
+		l.key(addr, 1),
+		l.cryptoKey(addr),
+	}
+	for i, k := range keys {
+		if allowed, _ := l.allow(k, now); !allowed {
+			t.Fatalf("keyspace %d shares a bucket with another", i)
+		}
+	}
+	for i, k := range keys {
+		if allowed, _ := l.allow(k, now); allowed {
+			t.Fatalf("keyspace %d has more than its own burst", i)
+		}
 	}
 }

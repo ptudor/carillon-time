@@ -40,7 +40,27 @@ const (
 type bucketKey struct {
 	addr  netip.Addr // masked to the family's bucket prefix
 	keyID uint32     // 0 for unauthenticated traffic
+	space keyspace   // which budget this bucket belongs to
 }
+
+// keyspace separates the budgets a single address can draw on.
+type keyspace uint8
+
+const (
+	// spaceService is the ordinary budget for requests that will be
+	// answered, keyed by the address and, when authentication succeeded, by
+	// the verified key id.
+	spaceService keyspace = iota
+
+	// spaceCrypto bounds the *work and the replies* that unauthenticated or
+	// failing traffic can provoke: one MAC verification and at most one
+	// crypto-NAK per token. It is separate so a flood of bad MACs cannot
+	// consume the tokens a correctly authenticated peer needs, and so the
+	// NAK path is bounded at all — it used to reply before the limiter was
+	// consulted, producing one NAK per bad MAC at arrival rate (RA6X-027,
+	// RA6X-028).
+	spaceCrypto
+)
 
 // rateLimiter is a bounded per-address token-bucket table. It is owned by
 // one listener goroutine, so it needs no locks.
@@ -81,13 +101,23 @@ func newRateLimiter(rate, burst float64, maxClients, v6Prefix int) *rateLimiter 
 // key masks a client address down to the unit a bucket covers: the whole
 // address for IPv4, the configured prefix (a /64 by default) for IPv6.
 func (l *rateLimiter) key(addr netip.Addr, keyID uint32) bucketKey {
+	return l.spaceKey(addr, keyID, spaceService)
+}
+
+// cryptoKey is the bucket that bounds cryptographic work and NAK emission for
+// one address, independently of any key it claims.
+func (l *rateLimiter) cryptoKey(addr netip.Addr) bucketKey {
+	return l.spaceKey(addr, 0, spaceCrypto)
+}
+
+func (l *rateLimiter) spaceKey(addr netip.Addr, keyID uint32, space keyspace) bucketKey {
 	addr = addr.Unmap()
 	if addr.Is6() && l.v6Prefix < 128 {
 		if p, err := addr.Prefix(l.v6Prefix); err == nil {
 			addr = p.Addr()
 		}
 	}
-	return bucketKey{addr: addr, keyID: keyID}
+	return bucketKey{addr: addr, keyID: keyID, space: space}
 }
 
 // size reports how many clients the table is tracking. Entries expire after

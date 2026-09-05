@@ -147,6 +147,15 @@ type NTP struct {
 	// since the demand belongs to the server we were talking to.
 	kodMinPoll int8
 
+	// effPollMax is the maximum poll exponent this *association* may use.
+	// cfg.PollMax is the operator's configured bound and never changes; a
+	// RATE demand raises only this, and only for the peer that made it.
+	effPollMax int8
+
+	// kissedRate records that the peer asked us to slow down during the
+	// current burst, so the rest of the burst is abandoned.
+	kissedRate bool
+
 	// meta pairs each filter stage with the association metadata of the
 	// exchange that produced it. See stageMeta.
 	meta        []stageMeta
@@ -192,15 +201,16 @@ func NewNTP(cfg NTPConfig, clk clock.Clock, log *slog.Logger) (*NTP, error) {
 		log = slog.New(slog.DiscardHandler)
 	}
 	n := &NTP{
-		cfg:    cfg,
-		host:   cfg.Host,
-		port:   cfg.Port,
-		clk:    clk,
-		log:    log.With("source", cfg.Name),
-		filter: discipline.NewFilter(ntp.Log2Seconds(clk.Precision())),
-		sleep:  realSleep,
-		lookup: resolve,
-		poll:   cfg.PollMin,
+		cfg:        cfg,
+		host:       cfg.Host,
+		port:       cfg.Port,
+		clk:        clk,
+		log:        log.With("source", cfg.Name),
+		filter:     discipline.NewFilter(ntp.Log2Seconds(clk.Precision())),
+		sleep:      realSleep,
+		lookup:     resolve,
+		poll:       cfg.PollMin,
+		effPollMax: cfg.PollMax,
 	}
 	n.info.Store(&Info{Name: cfg.Name, Address: cfg.Address, Poll: cfg.PollMin})
 	return n, nil
@@ -241,7 +251,8 @@ func (n *NTP) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 				return nil
 			}
 		case n.cfg.IBurst && n.reach == 0:
-			for i := 0; i < burstCount && !n.denied; i++ {
+			n.kissedRate = false
+			for i := 0; i < burstCount && !n.denied && !n.kissedRate; i++ {
 				if i > 0 && !n.sleep(ctx, burstSpacing) {
 					return nil
 				}
@@ -257,7 +268,10 @@ func (n *NTP) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 		if n.denied {
 			continue
 		}
-		if !n.sleep(ctx, pollInterval(n.poll)) {
+		// The ±5 % jitter must not schedule a send earlier than a poll the
+		// server has demanded, so the floor is applied to the actual
+		// interval, not only to the exponent (RA6X-030).
+		if !n.sleep(ctx, pollInterval(n.poll, n.kodMinPoll)) {
 			return nil
 		}
 	}
@@ -355,9 +369,18 @@ func (n *NTP) useAddr(addr netip.AddrPort, why string) {
 	}
 }
 
-// resetEndpointState drops everything tied to the peer we were talking to.
+// resetEndpointState drops everything tied to the peer we were talking to:
+// its clock filter samples, which describe a different path, and every poll
+// policy it demanded. A replacement server has no opinion yet, and inheriting
+// the previous one's expanded maximum and current long poll left a healthy
+// new peer being polled once a day (RA6X-030).
 func (n *NTP) resetEndpointState() {
 	n.kodMinPoll = 0
+	n.effPollMax = n.cfg.PollMax
+	n.poll = n.cfg.PollMin
+	n.kissedRate = false
+	n.meta, n.metaNext = n.meta[:0], 0
+	n.haveStratum = false
 	n.filter.Reset()
 }
 
@@ -559,23 +582,42 @@ func (n *NTP) handleKiss(k *kissError) {
 		if k.pkt.Poll > want {
 			want = k.pkt.Poll
 		}
-		if want > n.cfg.PollMax {
-			// The server is asking for longer than poll_max allows. Honour
-			// it anyway: continuing to poll faster than a server has asked
-			// is how a client earns a DENY.
-			n.log.Warn("server demands a poll beyond poll_max; honouring it",
-				"demanded", want, "poll_max", n.cfg.PollMax)
-			if want > discipline.MaxPoll {
-				want = discipline.MaxPoll
-			}
-			n.cfg.PollMax = want
+		// A remotely demanded backoff is capped, independently of the legal
+		// operator-configured range. A correctly matched but unauthenticated
+		// RATE could otherwise raise a short configured poll to exponent 17
+		// — 131072 s, about 36.4 hours — which is an availability loss an
+		// on-path sender or a faulty server can inflict for free. RFC 8633
+		// §5.4 recommends bounding accepted backoff at no more than 13
+		// (RA6X-031). An operator who configured a longer poll keeps it:
+		// that is their decision, not a remote one.
+		remoteCap := int8(maxRemoteBackoffPoll)
+		if n.cfg.PollMax > remoteCap {
+			remoteCap = n.cfg.PollMax
 		}
-		want = clampPoll(want, n.cfg.PollMin, n.cfg.PollMax)
+		if want > remoteCap {
+			n.log.Warn("server demands a poll beyond the accepted backoff cap; clamping",
+				"demanded", want, "cap", remoteCap, "poll_max", n.cfg.PollMax, "authenticated", k.authenticated)
+			want = remoteCap
+		}
+		if want > n.effPollMax {
+			// Honour a demand longer than poll_max: continuing to poll
+			// faster than a server has asked is how a client earns a DENY.
+			// It raises the *effective* maximum for this association only —
+			// the configured bound is immutable, so a replacement server
+			// does not inherit the previous one's demand (RA6X-030).
+			n.log.Warn("server demands a poll beyond poll_max; honouring it for this association",
+				"demanded", want, "poll_max", n.cfg.PollMax)
+			n.effPollMax = want
+		}
+		want = clampPoll(want, n.cfg.PollMin, n.effPollMax)
 		if want > n.kodMinPoll {
 			n.kodMinPoll = want
 		}
 		n.log.Warn("server asked us to slow down", "old_poll", n.poll, "new_poll", want)
 		n.poll = want
+		// End an iburst here: the remaining two-second burst requests are
+		// exactly what the server has just asked us to stop sending.
+		n.kissedRate = true
 		n.miss("kiss RATE")
 	case "DENY", "RSTR":
 		if k.authenticated {
@@ -652,7 +694,7 @@ func (n *NTP) hit(res exchangeResult) *sample {
 		n.updateInfo(func(i *Info) { i.Reach = n.reach; i.Poll = n.poll })
 		return nil
 	}
-	n.poll = adaptPoll(n.poll, f.Offset, f.Jitter, n.pollFloor(), n.cfg.PollMax)
+	n.poll = adaptPoll(n.poll, f.Offset, f.Jitter, n.pollFloor(), n.effPollMax)
 	n.updateInfo(func(i *Info) { i.Reach = n.reach; i.Poll = n.poll })
 	meta, ok := n.metaAt(f.At)
 	if !ok {
@@ -699,7 +741,7 @@ func (n *NTP) miss(reason string) {
 		if wasReachable {
 			n.log.Warn("server unreachable", "reason", reason)
 		}
-		if n.consecutiveMisses >= unreachableBackoff && n.poll < n.cfg.PollMax {
+		if n.consecutiveMisses >= unreachableBackoff && n.poll < n.effPollMax {
 			n.poll++
 		}
 	}
