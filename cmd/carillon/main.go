@@ -262,7 +262,7 @@ func runDaemon(args []string) int {
 	var statsRecorder *stats.Recorder
 	var observe func(*engine.Status)
 	if cfg.Stats.Enabled() {
-		scfg := stats.Config{Dir: cfg.Stats.Dir, Now: clk.Now, Log: log}
+		scfg := stats.Config{Dir: cfg.Stats.Dir, KeepDays: cfg.Stats.KeepDays, Now: clk.Now, Log: log}
 		if cfg.Serve.Enabled() {
 			scfg.Server = serverStats.Snapshot
 		}

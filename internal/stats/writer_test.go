@@ -2,6 +2,8 @@ package stats
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,10 +44,12 @@ func TestRecorderWritesAndDeduplicatesDailyFiles(t *testing.T) {
 	cancel()
 	r.Run(ctx)
 
+	// Files live under Dir/YYYY/MM/DD so that a directory never collects a
+	// year of them and retention is a per-day removal (RF5X-029).
 	want := map[string][]string{
-		"loop.2026-08-23.tsv":    {"time\tstate", "pps\\t0", "\t2.5\t"},
-		"sources.2026-08-23.tsv": {"time\tsource\tstatus", "pps\\t0\tsystem\t255"},
-		"pps.2026-08-23.tsv":     {"time\tsource\toffset_seconds\tsequence", "pps\\t0\t9e-07\t42"},
+		"2026/08/23/loop.tsv":    {"time\tstate", "pps\\t0", "\t2.5\t"},
+		"2026/08/23/sources.tsv": {"time\tsource\tstatus", "pps\\t0\tsystem\t255"},
+		"2026/08/23/pps.tsv":     {"time\tsource\toffset_seconds\tsequence", "pps\\t0\t9e-07\t42"},
 	}
 	for name, parts := range want {
 		b, err := os.ReadFile(filepath.Join(dir, name))
@@ -74,10 +78,63 @@ func TestRecorderRotatesAtUTCMidnight(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.Run(ctx)
-	for _, name := range []string{"loop.2026-08-23.tsv", "loop.2026-08-24.tsv"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+	for _, name := range []string{"2026/08/23/loop.tsv", "2026/08/24/loop.tsv"} {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); err != nil {
 			t.Errorf("missing %s: %v", name, err)
 		}
+	}
+}
+
+// TestRecorderPrunesExpiredDays covers the retention half of RF5X-029: four
+// files a day with pps.tsv at 86,400 rows is tens of GB over a soak, and
+// there was no way to age any of it out.
+func TestRecorderPrunesExpiredDays(t *testing.T) {
+	dir := t.TempDir()
+	planted := filepath.Join(dir, "2026", "08", "20")
+	if err := os.MkdirAll(planted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "loop.tsv"), []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "2026", "08", "23")
+	if err := os.MkdirAll(keep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(Config{Dir: dir, KeepDays: 1})
+	at := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	r.Record(&engine.Status{Status: discipline.Status{State: discipline.StateSynced, Updates: 1}, Now: at, Infos: map[string]source.Info{}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Run(ctx)
+
+	if _, err := os.Stat(planted); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("expired day survived: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("a day inside keep_days was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "2026", "08", "24", "loop.tsv")); err != nil {
+		t.Errorf("today's file: %v", err)
+	}
+}
+
+// TestRecorderKeepsEverythingByDefault: keep_days 0 removes nothing.
+func TestRecorderKeepsEverythingByDefault(t *testing.T) {
+	dir := t.TempDir()
+	planted := filepath.Join(dir, "2020", "01", "01")
+	if err := os.MkdirAll(planted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := New(Config{Dir: dir})
+	at := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	r.Record(&engine.Status{Status: discipline.Status{State: discipline.StateSynced, Updates: 1}, Now: at, Infos: map[string]source.Info{}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.Run(ctx)
+	if _, err := os.Stat(planted); err != nil {
+		t.Errorf("keep_days 0 must keep everything: %v", err)
 	}
 }
 
@@ -102,7 +159,7 @@ func TestRecorderWritesServerTrafficPerFamily(t *testing.T) {
 	cancel()
 	r.Run(ctx)
 
-	text, err := os.ReadFile(filepath.Join(dir, "server.2026-08-24.tsv"))
+	text, err := os.ReadFile(filepath.Join(dir, "2026", "08", "24", "server.tsv"))
 	if err != nil {
 		t.Fatal(err)
 	}

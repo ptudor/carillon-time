@@ -47,3 +47,44 @@ func TestMeasurePrecisionFrozenClock(t *testing.T) {
 		t.Fatalf("frozen clock: got %d want -30", got)
 	}
 }
+
+// TestMeasurePrecisionIsNotTheMinimum covers RF5X-020. A clock that mostly
+// ticks in microseconds but occasionally shows a one-nanosecond difference —
+// which is what a TSC-backed CLOCK_REALTIME does between back-to-back reads —
+// must report its typical increment, not the smallest one ever seen.
+func TestMeasurePrecisionIsNotTheMinimum(t *testing.T) {
+	base := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
+	n := 0
+	occasionalNanosecond := func() time.Time {
+		n++
+		if n%50 == 0 {
+			base = base.Add(time.Nanosecond)
+		} else {
+			base = base.Add(time.Microsecond)
+		}
+		return base
+	}
+	if got := measurePrecision(occasionalNanosecond); got != -20 {
+		t.Fatalf("precision %d, want -20 (1 µs): a single 1 ns delta must not set it", got)
+	}
+}
+
+// TestMeasurePrecisionCoarseClockTerminates checks the read budget: a clock
+// that only moves every so often must not spin the startup path.
+func TestMeasurePrecisionCoarseClockTerminates(t *testing.T) {
+	base := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
+	n := 0
+	coarse := func() time.Time {
+		n++
+		if n%1000 == 0 {
+			base = base.Add(time.Millisecond)
+		}
+		return base
+	}
+	if got := measurePrecision(coarse); got != -10 {
+		t.Fatalf("precision %d, want -10 (1 ms)", got)
+	}
+	if n > precisionMaxReads+2 {
+		t.Fatalf("%d clock reads, budget is %d", n, precisionMaxReads)
+	}
+}

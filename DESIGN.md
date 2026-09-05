@@ -1306,8 +1306,14 @@ good-against-bad traffic chart.
   mode 6 and 7 probe counts and the version histogram; values are cumulative
   since startup, so a reader takes differences and treats a drop as a
   restart).
-  A new file per UTC day (`loop.2026-08-23.tsv`); buffered, flushed each
-  minute and on exit. Snapshot delivery to the writer is bounded and
+  A new file per UTC day, under a dated hierarchy:
+  `<dir>/YYYY/MM/DD/loop.tsv`, three zero-padded segments so the paths sort
+  lexically. A flat directory would collect four files a day — about 1,500 a
+  year, `pps.tsv` alone carrying 86,400 rows a day — with no cheap way to age
+  any of it out; a dated tree keeps each directory small and makes retention
+  a per-day `rm -rf`. `[stats] keep_days` (default 0 = keep everything)
+  removes day directories older than that at rotation, and prunes the month
+  and year directories it empties. Buffered, flushed each minute and on exit. Snapshot delivery to the writer is bounded and
   non-blocking: a stalled disk drops and counts statistics snapshots rather
   than delaying the engine. Output errors are rate-limited WARNs and retried;
   they never stop clock discipline. This is what gets plotted when tuning.

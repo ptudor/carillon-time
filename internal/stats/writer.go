@@ -35,6 +35,10 @@ type Config struct {
 	// rows are timestamped from the engine snapshot instead.
 	Now func() time.Time
 
+	// KeepDays, when positive, removes day directories older than that many
+	// days at each rotation. Zero keeps everything.
+	KeepDays int
+
 	Log *slog.Logger
 }
 
@@ -54,6 +58,8 @@ type Recorder struct {
 	now    func() time.Time
 	ch     chan *engine.Status
 
+	keepDays int
+
 	dropped atomic.Uint64
 	files   map[string]*dailyFile
 
@@ -71,7 +77,7 @@ func New(cfg Config) *Recorder {
 		cfg.Now = time.Now
 	}
 	return &Recorder{
-		dir: cfg.Dir, log: cfg.Log, server: cfg.Server, now: cfg.Now,
+		dir: cfg.Dir, log: cfg.Log, server: cfg.Server, now: cfg.Now, keepDays: cfg.KeepDays,
 		ch:    make(chan *engine.Status, queueSize),
 		files: make(map[string]*dailyFile), lastPulse: make(map[string]time.Time),
 	}
@@ -237,7 +243,7 @@ func (r *Recorder) writeSources(st *engine.Status) error {
 }
 
 func (r *Recorder) write(kind string, at time.Time, header, line string) error {
-	df, err := r.file(kind, at.UTC().Format(time.DateOnly), header)
+	df, err := r.file(kind, at.UTC(), header)
 	if err != nil {
 		return err
 	}
@@ -247,7 +253,16 @@ func (r *Recorder) write(kind string, at time.Time, header, line string) error {
 	return nil
 }
 
-func (r *Recorder) file(kind, day, header string) (*dailyFile, error) {
+// file returns the open file for kind on the UTC day of at, rotating and
+// pruning as the day changes.
+//
+// Files live in Dir/YYYY/MM/DD/<kind>.tsv. A flat directory would collect
+// four files a day — about 1,500 a year, with pps.tsv alone at 86,400 rows a
+// day — with no cheap way to age anything out; a dated hierarchy keeps each
+// directory small and makes retention a per-day removal. Three zero-padded
+// segments so the paths sort lexically.
+func (r *Recorder) file(kind string, at time.Time, header string) (*dailyFile, error) {
+	day := at.Format(time.DateOnly)
 	if old := r.files[kind]; old != nil {
 		if old.day == day {
 			return old, nil
@@ -257,7 +272,12 @@ func (r *Recorder) file(kind, day, header string) (*dailyFile, error) {
 		}
 		delete(r.files, kind)
 	}
-	path := filepath.Join(r.dir, kind+"."+day+".tsv")
+	dir := filepath.Join(r.dir, at.Format("2006"), at.Format("01"), at.Format("02"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("stats: creating %s: %w", dir, err)
+	}
+	r.prune(at)
+	path := filepath.Join(dir, kind+".tsv")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("stats: opening %s: %w", path, err)
@@ -277,6 +297,76 @@ func (r *Recorder) file(kind, day, header string) (*dailyFile, error) {
 	df := &dailyFile{day: day, f: f, w: w}
 	r.files[kind] = df
 	return df, nil
+}
+
+// prune removes day directories older than KeepDays, and any year and month
+// directories left empty behind them. It runs at rotation, which is at most
+// once a day per kind, so walking the tree costs nothing that matters.
+func (r *Recorder) prune(at time.Time) {
+	if r.keepDays <= 0 {
+		return
+	}
+	// Whole UTC days: keep_days = 1 keeps today and yesterday.
+	cutoff := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -r.keepDays)
+	years, err := os.ReadDir(r.dir)
+	if err != nil {
+		return
+	}
+	for _, y := range years {
+		if !y.IsDir() || !fourDigits(y.Name()) {
+			continue
+		}
+		yearDir := filepath.Join(r.dir, y.Name())
+		months, err := os.ReadDir(yearDir)
+		if err != nil {
+			continue
+		}
+		for _, m := range months {
+			if !m.IsDir() || len(m.Name()) != 2 {
+				continue
+			}
+			monthDir := filepath.Join(yearDir, m.Name())
+			days, err := os.ReadDir(monthDir)
+			if err != nil {
+				continue
+			}
+			for _, d := range days {
+				if !d.IsDir() || len(d.Name()) != 2 {
+					continue
+				}
+				day, err := time.Parse(time.DateOnly, y.Name()+"-"+m.Name()+"-"+d.Name())
+				if err != nil || !day.Before(cutoff) {
+					continue
+				}
+				path := filepath.Join(monthDir, d.Name())
+				if err := os.RemoveAll(path); err != nil {
+					r.log.Warn("cannot remove an expired statistics day", "path", path, "error", err)
+					continue
+				}
+				r.log.Info("removed expired statistics", "path", path, "keep_days", r.keepDays)
+			}
+			removeIfEmpty(monthDir)
+		}
+		removeIfEmpty(yearDir)
+	}
+}
+
+func fourDigits(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func removeIfEmpty(dir string) {
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
+		_ = os.Remove(dir)
+	}
 }
 
 func (r *Recorder) flushAndReport() {

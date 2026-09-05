@@ -225,6 +225,10 @@ func (m *Monitor) Enabled() bool { return m.Listen != "" }
 // Stats configures optional daily UTC TSV statistics files.
 type Stats struct {
 	Dir string `toml:"dir"`
+
+	// KeepDays removes day directories older than this many days at each
+	// rotation. Zero (the default) keeps everything.
+	KeepDays int `toml:"keep_days"`
 }
 
 // Enabled reports whether daily statistics should be recorded.
@@ -572,6 +576,25 @@ func Validate(cfg *Config) error {
 			names[name] = true
 		}
 		if r.Type == "pps" {
+			// Unknown keys are errors (DESIGN.md §9), and a key that is
+			// silently ignored is the same mistake with a friendlier face.
+			// None of these are defaulted for type = "pps", so a non-zero
+			// value here can only have been written by the operator.
+			for _, k := range []struct {
+				name string
+				set  bool
+			}{
+				{"baud", r.Baud != 0},
+				{"pps", r.PPS != ""},
+				{"pps_edge", r.PPSEdge != ""},
+				{"pps_offset", r.PPSOffset != 0},
+				{"nmea_offset", r.NMEAOffset != 0},
+				{"sentences", len(r.Sentences) != 0},
+			} {
+				if k.set {
+					fail("%s: %s applies only to type gps and would be ignored here", label, k.name)
+				}
+			}
 			if r.Edge != "assert" && r.Edge != "clear" {
 				fail("%s: edge %q is not assert or clear", label, r.Edge)
 			}
@@ -627,6 +650,9 @@ func Validate(cfg *Config) error {
 	}
 	if cfg.Step.Limit < -1 {
 		fail("step: limit %d must be -1 (always), 0 (never), or a positive count", cfg.Step.Limit)
+	}
+	if cfg.Stats.KeepDays < 0 {
+		fail("stats: keep_days %d must be 0 (keep everything) or positive", cfg.Stats.KeepDays)
 	}
 	if cfg.Stats.Enabled() && filepath.Clean(cfg.Stats.Dir) == "." {
 		fail("stats: dir must name a directory")

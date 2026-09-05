@@ -387,6 +387,27 @@ func TestValidateRules(t *testing.T) {
 		{"duplicate source name", func(c *Config) {
 			c.Refclocks = []Refclock{{Name: "a", Type: "pps", Device: "/dev/null", Edge: "assert", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
 		}, "duplicate name"},
+		// RF5X-021(a): GPS-only keys on a bare PPS refclock were accepted
+		// and silently ignored, which the strict-configuration promise says
+		// they must not be.
+		{"pps with baud", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", Baud: 9600, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "baud applies only to type gps"},
+		{"pps with nmea_offset", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", NMEAOffset: 0.15, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "nmea_offset applies only to type gps"},
+		{"pps with pps path", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PPS: "/dev/pps0", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "pps applies only to type gps"},
+		{"pps with pps_edge", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PPSEdge: "clear", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "pps_edge applies only to type gps"},
+		{"pps with pps_offset", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PPSOffset: 1e-3, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "pps_offset applies only to type gps"},
+		{"pps with sentences", func(c *Config) {
+			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", Sentences: []string{"RMC"}, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
+		}, "sentences applies only to type gps"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -584,5 +605,22 @@ func TestServeTableAndBufferDefaults(t *testing.T) {
 	}
 	if bare.Serve.MaxClients != DefaultMaxClients || bare.Serve.RecvBuffer != 0 {
 		t.Fatalf("defaults %+v", bare.Serve)
+	}
+}
+
+// TestGPSWithSeparatePPSDeviceValidates covers RF5X-021(b): a GPS receiver on
+// one tty with the pulse on a second callout tty is what main.go supports and
+// what the Linux platform check accepts. It must validate everywhere; the
+// FreeBSD check then reads that device's pps_mode sysctl rather than the
+// receiver's.
+func TestGPSWithSeparatePPSDeviceValidates(t *testing.T) {
+	cfg := validConfig()
+	cfg.Refclocks = []Refclock{{
+		Name: "gps", Type: "gps", Device: "/dev/cuaU0", Baud: 9600,
+		PPS: "/dev/cuau1", PPSEdge: "assert", Sentences: []string{"RMC", "ZDA"},
+		LockJitter: 1e-6, PollMin: 4, PollMax: 7,
+	}}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("a separate PPS tty must validate: %v", err)
 	}
 }
