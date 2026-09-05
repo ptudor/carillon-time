@@ -115,6 +115,17 @@ type Daemon struct {
 	// restart does not start from zero.
 	DriftFile string `toml:"drift_file"`
 
+	// DriftStableSeconds and DriftStableSpreadPPM gate the drift-file write:
+	// the frequency estimate must have stayed inside a band of
+	// DriftStableSpreadPPM for DriftStableSeconds before it is worth
+	// persisting. A daemon locked to an upstream that is itself slewing
+	// follows that upstream's rate, so its frequency word can sit tens of
+	// ppm from this host's own crystal error until the upstream settles;
+	// writing that would start the next run from a frequency nothing here
+	// needs. Zero selects 900 s and 1 ppm.
+	DriftStableSeconds   float64 `toml:"drift_stable_seconds"`
+	DriftStableSpreadPPM float64 `toml:"drift_stable_spread_ppm"`
+
 	// Control is the unix socket path carillonctl talks to.
 	Control string `toml:"control"`
 
@@ -292,9 +303,11 @@ func Default() *Config {
 	}
 	return &Config{
 		Daemon: Daemon{
-			DriftFile: drift,
-			Control:   "/var/run/carillon/carillon.sock",
-			LogLevel:  "info",
+			DriftFile:            drift,
+			DriftStableSeconds:   900,
+			DriftStableSpreadPPM: 1.0,
+			Control:              "/var/run/carillon/carillon.sock",
+			LogLevel:             "info",
 		},
 		Serve: Serve{
 			RateLimitPPS:      8,
@@ -505,6 +518,12 @@ func Validate(cfg *Config) error {
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
+	if !(cfg.Daemon.DriftStableSeconds > 0) {
+		fail("daemon: drift_stable_seconds %v must be greater than zero", cfg.Daemon.DriftStableSeconds)
+	}
+	if !(cfg.Daemon.DriftStableSpreadPPM > 0) {
+		fail("daemon: drift_stable_spread_ppm %v must be greater than zero", cfg.Daemon.DriftStableSpreadPPM)
+	}
 	if cfg.Daemon.DriftFile == "" {
 		fail("daemon: drift_file must be set")
 	}

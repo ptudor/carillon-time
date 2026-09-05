@@ -13,6 +13,15 @@
 #   FreeBSD default: /var/db/carillon/drift
 #   Linux default:   /var/lib/carillon/drift
 #drift_file = "/var/db/carillon/drift"
+# The drift file is only rewritten while the frequency estimate has held
+# still: its spread must stay within drift_stable_spread_ppm across the last
+# drift_stable_seconds. A daemon locked to an upstream that is itself slewing
+# follows that upstream's rate, so its frequency word can sit tens of ppm from
+# this host's own crystal error until the upstream settles; persisting that
+# would start the next run from a frequency nothing here needs. When the gate
+# blocks, the previous contents stand.
+#drift_stable_seconds = 900
+#drift_stable_spread_ppm = 1.0
 
 # Unix socket used by carillonctl.
 #control = "/var/run/carillon/carillon.sock"

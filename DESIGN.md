@@ -562,6 +562,26 @@ Implemented as in RFC 5905 §11.2, no deviations:
   `[θ−λ, θ+λ]`; find the largest set of intervals with a common point,
   tolerating `f` falsetickers where `f < n/2`. Candidates outside are
   falsetickers and are logged at WARN the first time they become one.
+**Known limitation — loop-update starvation.** A loop update happens only when
+a source's clock filter selects a sample it has not reported before, which
+means a *new lowest-delay* sample. On a path where an early reply happens to
+have the best delay, every later one is withheld until that sample is demoted
+at the Allan intercept: at poll 8 that is **2048 s — 34 minutes — with no loop
+update at all**, whatever the clock is doing meanwhile. RF5X-006 removed the
+consequence for the state machine (SETTLING no longer counts loop updates) but
+deliberately left the gate itself alone, because re-running the loop on the
+same sample would double-integrate it.
+
+The cost is real and was measured on 2026-09-05: after a restart, `gummi`
+carried a frequency 17 ppm from what it needed and took no loop update for ten
+minutes, drifting about 7 ms while its downstream followed it. See
+`TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands` for the bound and
+`deploy/ACCEPTANCE.md` for the live trace. A fix needs to let the loop run on
+a stale-but-current estimate without winding up on it — for instance by
+integrating only the elapsed time since the last *loop* update rather than
+re-integrating the sample — and is a discipline-core change that wants its own
+design pass and simulation work, not a patch.
+
 - **Cluster:** repeatedly discard the survivor with the largest *selection
   jitter* (RMS distance to the other survivors) while it exceeds the smallest
   filter jitter among the survivors, and while more than **3** remain. Three
@@ -1299,6 +1319,19 @@ good-against-bad traffic chart.
 
 - **Drift file:** one line, frequency in ppm, written atomically (temp +
   rename) every hour and at shutdown, read at start. Same format as chrony's.
+  The write is **gated on the estimate having stopped moving**: the engine
+  keeps the last `drift_stable_seconds` (default 900) of base-frequency
+  readings and writes only while that history spans the window and its spread
+  is within `drift_stable_spread_ppm` (default 1). A daemon locked to an
+  upstream that is itself slewing follows that upstream's rate — correctly,
+  that is what a PLL does — so its frequency word can sit tens of ppm from
+  this host's own crystal error until the upstream settles. Persisting that
+  would start the next run from a frequency nothing here needs and provoke
+  the same excursion again. When the gate blocks, the file keeps what it has,
+  which by construction is the last estimate that did hold still; a stale
+  drift file costs one convergence the loop performs anyway. Observed on
+  2026-09-05: a host went 6.13 → 32.28 ppm in four minutes after a restart of
+  its upstream (`deploy/ACCEPTANCE.md`).
 - **Statistics** (optional, `[stats] dir`): `loop.tsv` (per update: time, θ,
   freq, ψ, poll, state), `pps.tsv` (per accepted pulse: time, θ),
   `sources.tsv`, and `server.tsv` (one row per address family per minute
