@@ -145,7 +145,15 @@ type NTP struct {
 	// earning another kiss, and the client oscillates at the server's limit
 	// instead of backing off. Reset only when the address is re-resolved,
 	// since the demand belongs to the server we were talking to.
-	kodMinPoll  int8
+	kodMinPoll int8
+
+	// meta pairs each filter stage with the association metadata of the
+	// exchange that produced it. See stageMeta.
+	meta        []stageMeta
+	metaNext    int
+	lastStratum uint8
+	haveStratum bool
+
 	badAuthSeen uint64
 	bogusSeen   uint64
 	staleSeen   uint64
@@ -378,10 +386,58 @@ func resolve(ctx context.Context, host string, port uint16) ([]netip.AddrPort, e
 	return out, nil
 }
 
-// sample is a usable reply after filtering.
+// sample is a usable reply after filtering. meta is the association metadata
+// belonging to the *observation the filter chose*, which is not necessarily
+// the packet that has just arrived.
 type sample struct {
-	out exchangeResult
-	f   discipline.Output
+	out  exchangeResult
+	f    discipline.Output
+	meta stageMeta
+}
+
+// stageMeta is everything a measurement reports about a peer that is a
+// property of one exchange rather than of the association: what the server
+// said about itself when that observation was taken.
+//
+// The clock filter can choose an observation several polls old, and the
+// measurement used to carry the *latest* packet's stratum, root delay, root
+// dispersion, reference identity, reference time, precision and leap bits
+// alongside that historical offset — so the measurement described no actual
+// sample (RA6X-025). Keeping the metadata beside the sample in a ring the
+// same depth as the filter pairs them again.
+type stageMeta struct {
+	at        float64
+	stratum   uint8
+	refID     ntp.RefID
+	rootDelay float64
+	rootDisp  float64
+	precision int8
+	leap      ntp.Leap
+	refTime   time.Time
+}
+
+// noteMeta records the metadata of the exchange that has just been added to
+// the filter, evicting the oldest entry.
+func (n *NTP) noteMeta(m stageMeta) {
+	if len(n.meta) < discipline.FilterStages {
+		n.meta = append(n.meta, m)
+		return
+	}
+	n.meta[n.metaNext] = m
+	n.metaNext = (n.metaNext + 1) % discipline.FilterStages
+}
+
+// metaAt returns the metadata of the observation taken at t. A miss means the
+// filter chose a stage older than the metadata ring still holds, which cannot
+// happen while the two are the same depth; the latest is then the honest
+// fallback.
+func (n *NTP) metaAt(t float64) (stageMeta, bool) {
+	for i := range n.meta {
+		if n.meta[i].at == t {
+			return n.meta[i], true
+		}
+	}
+	return stageMeta{}, false
 }
 
 // pollOnce performs one exchange, updates state, and emits a measurement.
@@ -557,7 +613,26 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	disp := ntp.Log2Seconds(n.clk.Precision()) +
 		ntp.Log2Seconds(clampPrecision(pkt.Precision)) +
 		discipline.Phi*res.T4.Sub(res.T1).Seconds()
-	f, updated := n.filter.Add(res.Offset, res.Delay, disp, n.clk.Monotonic())
+	// A material change in what the upstream says about itself means the
+	// samples already in the register describe a different quality of
+	// service. Stratum is the coarse, rare signal for that; a reference-id
+	// change at a stable address is ordinary for a stratum-2 peer and is
+	// handled by keeping metadata per stage rather than by resetting
+	// (RA6X-025).
+	if n.haveStratum && pkt.Stratum != n.lastStratum {
+		n.log.Info("upstream stratum changed; re-priming the clock filter",
+			"from", n.lastStratum, "to", pkt.Stratum)
+		n.filter.Reset()
+		n.meta, n.metaNext = n.meta[:0], 0
+	}
+	n.lastStratum, n.haveStratum = pkt.Stratum, true
+	at := n.clk.Monotonic()
+	n.noteMeta(stageMeta{
+		at: at, stratum: pkt.Stratum, refID: pkt.ReferenceID,
+		rootDelay: pkt.RootDelay.Seconds(), rootDisp: pkt.RootDispersion.Seconds(),
+		precision: pkt.Precision, leap: pkt.Leap, refTime: pkt.ReferenceTime.Time(res.T1),
+	})
+	f, updated := n.filter.Add(res.Offset, res.Delay, disp, at)
 	n.updateInfo(func(i *Info) {
 		i.Received++
 		i.LastRx = res.T4
@@ -579,7 +654,15 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	}
 	n.poll = adaptPoll(n.poll, f.Offset, f.Jitter, n.pollFloor(), n.cfg.PollMax)
 	n.updateInfo(func(i *Info) { i.Reach = n.reach; i.Poll = n.poll })
-	return &sample{out: res, f: f}
+	meta, ok := n.metaAt(f.At)
+	if !ok {
+		meta = stageMeta{
+			at: f.At, stratum: pkt.Stratum, refID: pkt.ReferenceID,
+			rootDelay: pkt.RootDelay.Seconds(), rootDisp: pkt.RootDispersion.Seconds(),
+			precision: pkt.Precision, leap: pkt.Leap, refTime: pkt.ReferenceTime.Time(res.T1),
+		}
+	}
+	return &sample{out: res, f: f, meta: meta}
 }
 
 // pollFloor is the shortest poll interval this source may use: the
@@ -634,21 +717,24 @@ func (n *NTP) emit(ctx context.Context, out chan<- discipline.Measurement, s *sa
 		Acquired:   acquired,
 	}
 	if s != nil {
-		pkt := s.out.Packet
 		m.Valid = true
 		m.At = s.f.At
 		m.Offset = s.f.Offset
 		m.Delay = s.f.Delay
 		m.Dispersion = s.f.Dispersion
 		m.Jitter = s.f.Jitter
-		m.Leap = pkt.Leap
-		m.Stratum = pkt.Stratum
-		m.RefID = pkt.ReferenceID
+		// Metadata from the exchange this offset came from, not from
+		// whichever packet happened to arrive last (RA6X-025).
+		m.Leap = s.meta.leap
+		m.Stratum = s.meta.stratum
+		m.RefID = s.meta.refID
+		m.RootDelay = s.meta.rootDelay
+		m.RootDisp = s.meta.rootDisp
+		m.Precision = s.meta.precision
+		m.RefTime = s.meta.refTime
+		// The peer's own identity is a property of the association, not of
+		// one exchange: it is the address we are talking to.
 		m.SourceRefID = ntp.RefIDFromAddr(n.addr.Addr())
-		m.RootDelay = pkt.RootDelay.Seconds()
-		m.RootDisp = pkt.RootDispersion.Seconds()
-		m.Precision = pkt.Precision
-		m.RefTime = pkt.ReferenceTime.Time(s.out.T1)
 	}
 	select {
 	case out <- m:

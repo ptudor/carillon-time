@@ -17,8 +17,46 @@ func TestFilterSingleSample(t *testing.T) {
 	if out.Jitter != 1e-6 {
 		t.Fatalf("jitter must floor at precision, got %v", out.Jitter)
 	}
-	if out.Dispersion != 0.0005 { // 0.001 · 2^-1
-		t.Fatalf("dispersion got %v", out.Dispersion)
+	// One real stage contributes 0.001·2^-1; the seven unfilled ones
+	// contribute primingDispersion·(2^-1 − 2^-8). A single sample must not
+	// be reported as *more* certain than the one measurement it rests on
+	// (RA6X-024).
+	want := 0.001/2 + primingDispersion*(0.5-math.Ldexp(1, -8))
+	if math.Abs(out.Dispersion-want) > 1e-12 {
+		t.Fatalf("dispersion got %v want %v", out.Dispersion, want)
+	}
+	if out.Dispersion < 0.001 {
+		t.Fatalf("an unprimed filter reported %v, less than its single sample's own %v", out.Dispersion, 0.001)
+	}
+}
+
+// TestFilterPrimingDispersionDecays checks the priming term shrinks as the
+// register fills and vanishes once it is full, and that an unprimed source
+// stays admissible on an ordinary path.
+func TestFilterPrimingDispersionDecays(t *testing.T) {
+	f := NewFilter(1e-6)
+	previous := math.Inf(1)
+	for i := 1; i <= FilterStages; i++ {
+		out, _ := f.Add(0.010, 0.020, 0.001, float64(i))
+		if out.Dispersion >= previous {
+			t.Fatalf("dispersion did not fall with %d samples: %v then %v", i, previous, out.Dispersion)
+		}
+		previous = out.Dispersion
+		// An unprimed source must still be able to bootstrap a clock that
+		// has nothing else: root distance stays inside MaxDistance.
+		lambda := 0.020/2 + out.Dispersion + out.Jitter
+		if lambda >= MaxDistance {
+			t.Fatalf("with %d samples the root distance is %v, past the %v admission limit", i, lambda, MaxDistance)
+		}
+	}
+	// Full register: the priming term is gone entirely.
+	out, _ := f.Add(0.010, 0.020, 0.001, 100)
+	full := 0.0
+	for i := 0; i < FilterStages; i++ {
+		full = 0.5 * (full + 0.001)
+	}
+	if math.Abs(out.Dispersion-full) > 1e-3 {
+		t.Fatalf("a full register still carries a priming term: %v vs %v", out.Dispersion, full)
 	}
 }
 
@@ -59,7 +97,7 @@ func TestFilterJitter(t *testing.T) {
 	}
 	// RMS of the other two offsets against the best (-0.004):
 	// sqrt((4² + 8²)/2) ms.
-	if want := math.Sqrt((16 + 64) / 2.0) * 1e-3; math.Abs(out.Jitter-want) > 1e-9 {
+	if want := math.Sqrt((16+64)/2.0) * 1e-3; math.Abs(out.Jitter-want) > 1e-9 {
 		t.Fatalf("jitter got %v want %v", out.Jitter, want)
 	}
 	if out.Samples != 3 {
@@ -73,8 +111,9 @@ func TestFilterDispersionAges(t *testing.T) {
 	out, _ := f.Add(0, 0.010, 0.001, 1000)
 	// The old sample's dispersion grew by Phi·1000 = 15 ms. With equal
 	// delays the fresher sample ranks first and contributes ε/2; the old
-	// one ranks second and contributes ε/4.
-	want := 0.001/2 + (0.001+Phi*1000)/4
+	// one ranks second and contributes ε/4. The six unfilled stages
+	// contribute primingDispersion·(2^-2 − 2^-8) on top (RA6X-024).
+	want := 0.001/2 + (0.001+Phi*1000)/4 + primingDispersion*(math.Ldexp(1, -2)-math.Ldexp(1, -8))
 	if math.Abs(out.Dispersion-want) > 1e-12 {
 		t.Fatalf("dispersion got %v want %v", out.Dispersion, want)
 	}

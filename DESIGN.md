@@ -618,41 +618,81 @@ Implemented as in RFC 5905 §11.2, no deviations:
   `[θ−λ, θ+λ]`; find the largest set of intervals with a common point,
   tolerating `f` falsetickers where `f < n/2`. Candidates outside are
   falsetickers and are logged at WARN the first time they become one.
-**Known limitation — loop-update starvation.** A loop update happens only when
-a source's clock filter selects a sample it has not reported before, which
-means a *new lowest-delay* sample. On a path where an early reply happens to
-have the best delay, every later one is withheld until that sample is demoted
-at the Allan intercept: at poll 8 that is **2048 s — 34 minutes — with no loop
-update at all**, whatever the clock is doing meanwhile. RF5X-006 removed the
-consequence for the state machine (SETTLING no longer counts loop updates) but
-deliberately left the gate itself alone, because re-running the loop on the
-same sample would double-integrate it.
+**Observation time.** A clock filter output describes the moment its chosen
+sample was taken, not the moment it is released. Between the two the loop has
+already corrected part of that error, so feeding the stored offset to the loop
+as present-time feedback re-integrates a correction that has already been
+made. Every stored offset is therefore expressed at the selection instant
+before it is compared, clustered or combined:
 
-The cost is real, and larger than the bound above suggests. Measured on
-`gummi` on 2026-09-05: **2533 s — 42 minutes — between consecutive loop
-updates**, longer than the Allan intercept because the stale sample must both
-age past it *and* lose to a fresher one on delay. `gummi` drifted 18 ms blind
-in that window and 27 ms by the time it was restarted. Its two downstreams
-read the eventual correction as a rate change and integrated it:
-`navlisten2026` reached **−95.4 ppm** and `twocom` **+46.0 ppm**, against true
-values of about +10 and +6 — that is 8 s/day on a host that was healthy an
-hour earlier. A blind spell upstream becomes a frequency error downstream,
-and the chain amplifies it.
+```
+theta_now = theta_at - (phase the loop applied between `at` and now)
+```
 
-The ranking is what withholds the sample: `Filter.Add` ranks by raw `delay`
-until the Allan intercept, so a sample's growing dispersion — φ·age, already
-38 ms at 2533 s — does not cost it its place, and a 20 ms-delay sample from
-forty minutes ago still outranks a fresh 25 ms one. Ranking by root distance
-(`delay/2 + dispersion`) instead would demote it as soon as φ·age exceeds its
-delay advantage, which for a 10 ms advantage is about 11 minutes rather than
-34-plus. That is a deviation from RFC 5905 §10 and from ntpd, which have the
-same wart, so it wants a simulation pass before it is made. See
-`TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands` for the mechanism and
-`deploy/ACCEPTANCE.md` for the live trace. A fix needs to let the loop run on
-a stale-but-current estimate without winding up on it — for instance by
-integrating only the elapsed time since the last *loop* update rather than
-re-integrating the sample — and is a discipline-core change that wants its own
-design pass and simulation work, not a patch.
+The applied phase is known exactly — the loop records the cumulative
+correction at every accounting point and interpolates within one, where the
+frequency word is constant — so this introduces no new estimate. The
+oscillator's own drift over the interval is separate and is already carried by
+the dispersion the filter ages at phi. The raw stored offset is kept for
+status; only the selection algorithm sees the propagated one.
+
+Without this, symmetric round-trip variation alone was enough to destabilise a
+correctly seeded clock: in the twelve-hour simulation at poll 6 the frequency
+error peaked at **358 ppm** and the final hour's RMS offset was **167 ms**,
+from observations with no bias in them at all. With it, both are **3.6 ppm and
+0 ms**.
+
+**Filter ranking is by root distance.** RFC 5905 §10 and ntpd rank the eight
+stages by raw `delay`, so a sample's growing dispersion never costs it its
+place: one unusually fast early reply outranks every later one until the Allan
+intercept demotes it, and because a loop update happens only when the filter
+chooses a sample it has not reported before, the discipline loop does not run
+for that whole period. Measured on `gummi` on 2026-09-05 that was **2533 s —
+42 minutes — between consecutive loop updates**, longer than the Allan
+intercept because the stale sample had to both age past it *and* lose on
+delay. `gummi` drifted 18 ms blind in that window and 27 ms by the time it was
+restarted; its two downstreams read the eventual correction as a rate change
+and integrated it, reaching **-95.4 ppm** and **+46.0 ppm** against true values
+of about +10 and +6. A blind spell upstream becomes a frequency error
+downstream, and the chain amplifies it.
+
+carillon therefore ranks by `delay/2 + dispersion`. A delay advantage is worth
+delta/2 to the offset estimate, not delta, so a 20 ms advantage is spent once
+phi*age reaches 10 ms — about 11 minutes — rather than lasting past the
+34-minute Allan intercept. This is a deliberate deviation from RFC 5905 and
+from ntpd, made with the simulation pass this document previously said it
+wanted: in the twelve-hour reproduction it takes the maximum age of the
+selected observation from 448 s to 0 s at poll 6 and from 1792 s to 0 s at
+poll 8, delivers an update on essentially every poll, and leaves the symmetric
+cases converging exactly as before. It is safe **only** together with the
+observation-time propagation above; on its own it does not fix delayed
+feedback. See `TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands` and
+`TestAstra6FilterCadence` for the bound, and `deploy/ACCEPTANCE.md` for the
+live trace.
+
+**Priming uncertainty.** RFC 5905 initialises the absent stages to MAXDISP
+(16 s), which makes a single-sample filter report about 7.9 s — past
+`MaxDistance`, so a fresh association is inadmissible until five or six
+packets have arrived. carillon cannot afford that for a host without `iburst`.
+Omitting the absent stages entirely is the other extreme, and reported one
+packet carrying 1 ms of dispersion as 0.5 ms — *more* certain than the single
+measurement it rests on. The absent stages instead contribute a bounded
+`primingDispersion` of 1 s at their rank weight, so one sample is reported with
+at least 500 ms of uncertainty, decaying to 2 ms by the eighth. An unprimed
+source stays admissible (lambda ~ 0.51 s on an ordinary path) so a host with
+nothing else can still bootstrap from it, any primed source outranks it, and
+the root dispersion this host serves during acquisition is honest.
+
+**Metadata belongs to its observation.** Stratum, root delay, root dispersion,
+reference identity, reference time, precision and leap bits are properties of
+one exchange, so they are kept beside the sample in a ring the same depth as
+the filter and reported with the observation whose offset is used — not taken
+from whichever packet arrived last. The peer's own identity is a property of
+the association and comes from the address. A change of the upstream's
+*stratum* re-primes the filter: the samples already held describe a different
+quality of service. Advertised root dispersion ages from the moment the
+estimate was received, not from the moment the loop consumed it, so switching
+to an older survivor does not advertise less uncertainty than it has.
 
 - **Cluster:** repeatedly discard the survivor with the largest *selection
   jitter* (RMS distance to the other survivors) while it exceeds the smallest
@@ -721,19 +761,39 @@ the next one — about 6 % of the slew capacity with a PPS at poll 4 — so the
 new base plus the transient for the new pending phase is issued by the tick
 that follows, at most one tick away.
 
-Every second (engine ticker), charging the **real** elapsed time `dt` since
-the previous tick rather than a nominal second, because the kernel ran at the
-transient for however long the ticker actually took. `dt` is clamped to
-`[0, 2 s]`; a longer gap is a stall of unknown length and is charged one
-second, since over-debiting the phase would leave a correction that was never
-applied believed to be done.
+Every second (engine ticker). The tick **charges first, then issues**: it
+debits the phase the word already in the kernel has moved since the last
+accounting point, and only then computes the next word from what remains.
 
 ```
+dt       = clamp(now − charge_from, [0, 2 s])     # the real elapsed time
+pending -= (applied − applied_base)·1e-6 · dt     # the word that actually ran
+charge_from = now
 adj      = clamp(pending / τ, ±max_slew)          # max_slew = max_slew_ppm · 1e-6
 total    = clamp(freq + adj·1e6, ±500)            # the kernel's own limit
-pending -= (total − freq)·1e-6 · dt               # only what the clamp let through, for dt
+applied, applied_base = total, freq
 SetFrequency(total)                               # holds until the next tick
 ```
+
+The transient charged is `applied − applied_base`: the word that was issued,
+minus the base that was in effect *when it was issued*, which a loop update
+since may have changed. Debiting the newly computed word instead — as this
+used to — made even successive ordinary ticks disagree with the applied-word
+integral, and an intervening update or a changed base made the discrepancy
+larger.
+
+The accounting point moves on every loop **update** as well as on every tick.
+A new observation replaces the residual phase, and whatever the loop corrected
+before that observation was taken is already reflected in the offset it
+reports; charging that interval again would debit it twice. The first tick of
+a run therefore charges nothing — no transient has run yet — and a step starts
+a fresh interval and stops treating the word still in the kernel as a
+transient, because there is no longer a residual for it to be charged against.
+
+`dt` is clamped to `[0, 2 s]`. Backward time charges nothing. A longer gap is
+charged at the 2 s ceiling rather than reduced to a nominal second: the word
+really did stay in the kernel for the whole stall, and a daemon stalled that
+long has a phase estimate the next measurement will replace outright.
 
 **Why these gains.** With phase gain 1/τ and integral gain K, the closed
 loop is `s² + s/τ + K = 0`. `K = 1/(4τ²)` puts a double pole at `−1/(2τ)`:
@@ -1438,10 +1498,18 @@ good-against-bad traffic chart.
 
 - **Drift file:** one line, frequency in ppm, written atomically (temp +
   rename) every hour and at shutdown, read at start. Same format as chrony's.
-  The write is **gated on the estimate having stopped moving**: the engine
-  keeps the last `drift_stable_seconds` (default 900) of base-frequency
-  readings and writes only while that history spans the window and its spread
-  is within `drift_stable_spread_ppm` (default 1). A daemon locked to an
+  The write is **gated on the estimate having stopped moving *while it was
+  being measured***: the engine keeps the last `drift_stable_seconds`
+  (default 900) of base-frequency readings and writes only while that history
+  spans the window, its spread is within `drift_stable_spread_ppm`
+  (default 1), **and at least two accepted loop updates fall inside it**.
+  Readings are taken only in SYNCED, and the history is discarded when the
+  system source changes or the clock is stepped, because neither is the same
+  measurement chain. Without the update requirement the gate measured only
+  whether the *readings* were flat — which they are by construction when
+  nothing is being measured, so a bad transient left standing during filter
+  starvation or source silence looked perfectly stable after 900 s and
+  overwrote a known-good drift file. A daemon locked to an
   upstream that is itself slewing follows that upstream's rate — correctly,
   that is what a PLL does — so its frequency word can sit tens of ppm from
   this host's own crystal error until the upstream settles. Persisting that

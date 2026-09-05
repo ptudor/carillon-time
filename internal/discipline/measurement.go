@@ -50,6 +50,15 @@ const (
 	// minFreshness is the floor on the freshness deadline in seconds, so a
 	// very short poll cannot produce a deadline that ordinary jitter trips.
 	minFreshness = 64.0
+
+	// primingDispersion is the uncertainty an unfilled clock-filter stage
+	// contributes, in seconds. It stands in for RFC 5905's MAXDISP, which
+	// at 16 s would put a single-sample filter past MaxDistance and make a
+	// fresh association inadmissible for several polls. One second keeps an
+	// unprimed source admissible on an ordinary path while reporting it at
+	// least 500 ms of uncertainty, so any primed source outranks it and the
+	// root dispersion this host serves during acquisition is honest.
+	primingDispersion = 1.0
 )
 
 // Measurement is what a source delivers to the engine after its own clock

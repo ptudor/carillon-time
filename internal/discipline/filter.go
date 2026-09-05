@@ -135,9 +135,37 @@ func (f *Filter) Add(offset, delay, disp, now float64) (out Output, updated bool
 	}
 	best := &f.stages[order[0].idx]
 
-	// Filter dispersion: Σ ε_i · 2^-(i+1) in rank order. Jitter: RMS of the
-	// usable samples' offsets against the chosen one.
+	// Filter dispersion: Σ ε_i · 2^-(i+1) in rank order, plus a priming
+	// term for the stages that have never been filled.
+	//
+	// RFC 5905 initialises the absent stages to MAXDISP (16 s), so a
+	// single-sample filter reports about 7.9 s. carillon cannot do that:
+	// 7.9 s is past MaxDistance, so a fresh association would be
+	// inadmissible until five or six packets had arrived — several poll
+	// intervals for anyone without iburst. Omitting the absent stages
+	// entirely is the other extreme and is what the code did: one packet
+	// with 1 ms of dispersion was reported as 0.5 ms, *more* certain than
+	// the single measurement it rests on, which distorted admission,
+	// weighting and the root dispersion this host then served (RA6X-024).
+	//
+	// The policy is the conservative middle the finding allows: absent
+	// stages contribute primingDispersion at their rank weight, which is
+	// 2^-n of it in total. One sample is therefore reported with at least
+	// 500 ms of uncertainty — three orders of magnitude more honest than
+	// before — decaying to 2 ms by the eighth. primingDispersion is chosen
+	// so that an unprimed source stays admissible on an ordinary path
+	// (λ ≈ 0.51 s against a 1.5 s limit), so a host with no other evidence
+	// can still bootstrap from it, while any primed source outranks it.
+	// Seed the recurrence with what the absent stages would have
+	// accumulated: running d = (d + P)/2 over (FilterStages - n) of them
+	// from zero gives P·(1 - 2^(n-8)), and the loop below then halves it
+	// once per real stage, so the absent stages end up contributing
+	// P·(2^-n - 2^-8) in total — the same shape as the RFC's sum, with a
+	// bounded P in place of MAXDISP.
 	var dispersion, jitter float64
+	if f.n < FilterStages {
+		dispersion = primingDispersion * (1 - math.Ldexp(1, f.n-FilterStages))
+	}
 	for i := len(order) - 1; i >= 0; i-- {
 		s := &f.stages[order[i].idx]
 		dispersion = 0.5 * (dispersion + s.disp)
