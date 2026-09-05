@@ -1058,7 +1058,76 @@ func Check(cfg *Config) error {
 			errs = append(errs, fmt.Errorf("refclock %q: %w", r.Name, err))
 		}
 	}
+	errs = append(errs, checkDeviceOwnership(cfg.Refclocks)...)
 	return errors.Join(errs...)
+}
+
+// deviceUse records which refclock claimed a device, and under which key.
+type deviceUse struct {
+	refclock string
+	key      string
+	path     string
+}
+
+// deviceIdentity identifies the *device*, not the path spelling. For a
+// character device that is the driver's device number, which is shared by
+// every name that reaches it — a udev by-id symlink, a /dev/serial/by-path
+// alias, or the raw node — so two configured refclocks cannot claim the same
+// hardware under two names (RA6X-039). Anything that is not a character
+// device falls back to its fully resolved path.
+func deviceIdentity(path string) (string, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return "", err
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFCHR {
+		return fmt.Sprintf("chardev:%d", uint64(st.Rdev)), nil
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	return "path:" + resolved, nil
+}
+
+// checkDeviceOwnership rejects two refclocks claiming one device. Sharing
+// within a single refclock is legitimate — on FreeBSD one callout tty
+// carries both the NMEA stream and the PPS edge — so only claims from
+// *different* refclock blocks conflict. Aliases are preserved: the operator
+// keeps writing whichever name they prefer, and identity is compared behind
+// it.
+func checkDeviceOwnership(refclocks []Refclock) []error {
+	owners := make(map[string]deviceUse)
+	var errs []error
+	claim := func(r *Refclock, key, path string) {
+		if path == "" || !filepath.IsAbs(path) {
+			return
+		}
+		id, err := deviceIdentity(path)
+		if err != nil {
+			// The device check above already reports an unusable path.
+			return
+		}
+		prev, seen := owners[id]
+		if !seen {
+			owners[id] = deviceUse{refclock: r.Name, key: key, path: path}
+			return
+		}
+		if prev.refclock == r.Name {
+			return // one refclock may use one device for both roles
+		}
+		errs = append(errs, fmt.Errorf(
+			"refclock %q: %s %s is the same device as refclock %q %s (%s); two refclocks cannot share it",
+			r.Name, key, path, prev.refclock, prev.key, prev.path))
+	}
+	for i := range refclocks {
+		r := &refclocks[i]
+		claim(r, "device", r.Device)
+		if r.Type == "gps" {
+			claim(r, "pps", r.PPS)
+		}
+	}
+	return errs
 }
 
 func checkRefclockDevice(r *Refclock) error {

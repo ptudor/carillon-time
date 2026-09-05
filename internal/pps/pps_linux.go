@@ -5,6 +5,7 @@ package pps
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -85,13 +86,58 @@ func Open(path string, edge Edge) (Reader, error) {
 	return d, nil
 }
 
+// linuxPPSPath reports whether path names a kernel PPS device rather than a
+// tty that needs the N_PPS line discipline attached to it.
+//
+// The name is only a hint. An operator's stable alias — a udev symlink such
+// as /dev/pps-gps — was classified as a tty and the daemon then tried to
+// attach N_PPS to a PPS device, which fails (RA6X-039). So the path is
+// resolved first, and if the resolved name still does not look like a PPS
+// device the kernel is asked directly: every registered PPS device publishes
+// its device number under /sys/class/pps/ppsN/dev, and a character device
+// whose number is listed there is a PPS device whatever it is called.
 func linuxPPSPath(path string) bool {
+	resolved := path
+	if r, err := filepath.EvalSymlinks(path); err == nil {
+		resolved = r
+	}
+	if ppsBasename(resolved) || ppsBasename(path) {
+		return true
+	}
+	return registeredPPSDevice(resolved)
+}
+
+func ppsBasename(path string) bool {
 	base := filepath.Base(path)
 	if !strings.HasPrefix(base, "pps") {
 		return false
 	}
 	_, err := strconv.ParseUint(strings.TrimPrefix(base, "pps"), 10, 32)
 	return err == nil
+}
+
+// registeredPPSDevice compares the path's device number against the ones the
+// kernel lists under /sys/class/pps. It is read-only and opens no device.
+func registeredPPSDevice(path string) bool {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFCHR {
+		return false
+	}
+	want := fmt.Sprintf("%d:%d", unix.Major(uint64(st.Rdev)), unix.Minor(uint64(st.Rdev)))
+	entries, err := os.ReadDir("/sys/class/pps")
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		b, err := os.ReadFile(filepath.Join("/sys/class/pps", e.Name(), "dev"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(b)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *device) configure() error {
