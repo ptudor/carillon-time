@@ -25,6 +25,24 @@ const (
 	defaultFetchTimeout  = 1500 * time.Millisecond
 	maxPulseIntervalSkew = 100 * time.Millisecond
 	spikeFloor           = 1e-6
+	defaultMaxSlewPPM    = 500
+
+	// spikeFitMin is the number of accepted offsets below which no spike
+	// test runs at all: the trend line needs a few points before it means
+	// anything, and a freshly primed window must be allowed to fill.
+	spikeFitMin = 4
+	// spikeFitMax bounds the trend line to the recent past so that a slew
+	// that changes rate is tracked rather than averaged away.
+	spikeFitMax = 8
+	// spikeSlewPulses caps the slew allowance the gate grants for missed
+	// pulses. Beyond the depth of the reach register the source is
+	// unreachable and the window is re-primed anyway, so letting the
+	// allowance grow without bound would only open a hole.
+	spikeSlewPulses = 8
+	// spikeResetAfter is the run of consecutive rejections that re-primes
+	// the window. A rejected pulse never enters the window, so without this
+	// a window that has drifted away from the signal can never recover.
+	spikeResetAfter = 4
 )
 
 // PPSConfig configures a bare PPS reference clock.
@@ -37,6 +55,11 @@ type PPSConfig struct {
 	LockJitter float64
 	PollMin    int8
 	PollMax    int8
+	// MaxSlewPPM is the discipline loop's phase-slew ceiling. The spike
+	// gate widens its limit by the phase the loop can legitimately move
+	// between two pulses; without it the daemon's own correction of the
+	// offset the PPS reported looks like a spike.
+	MaxSlewPPM float64
 	OnPulse    func(time.Time)
 }
 
@@ -58,6 +81,7 @@ type PPS struct {
 	reach         uint8
 	poll          int8
 	window        []float64
+	windowSeq     []uint32
 	intervals     []float64
 	slots         int
 	pendingMisses int
@@ -66,6 +90,7 @@ type PPS struct {
 	previousTime  time.Time
 	stable        bool
 	haveEverPulse bool
+	rejectRun     int
 }
 
 // NewPPS validates cfg and opens its kernel PPS device. Opening at daemon
@@ -91,6 +116,7 @@ func newPPS(cfg PPSConfig, clk clock.Clock, log *slog.Logger, r pps.Reader, open
 		cfg: cfg, clk: clk, log: log.With("source", cfg.Name),
 		reader: r, opener: opener, poll: cfg.PollMin,
 		window:    make([]float64, 0, 1<<cfg.PollMax),
+		windowSeq: make([]uint32, 0, 1<<cfg.PollMax),
 		intervals: make([]float64, 0, 1<<cfg.PollMax),
 	}
 	p.info.Store(&source.Info{
@@ -133,6 +159,12 @@ func defaultAndValidatePPS(cfg *PPSConfig, clk clock.Clock) error {
 	}
 	if cfg.PollMin < discipline.MinPoll || cfg.PollMax > discipline.MaxPoll || cfg.PollMin > cfg.PollMax {
 		return fmt.Errorf("refclock %q: poll range %d..%d is invalid", cfg.Name, cfg.PollMin, cfg.PollMax)
+	}
+	if cfg.MaxSlewPPM == 0 {
+		cfg.MaxSlewPPM = defaultMaxSlewPPM
+	}
+	if !finite(cfg.MaxSlewPPM) || cfg.MaxSlewPPM <= 0 {
+		return fmt.Errorf("refclock %q: max_slew_ppm must be greater than zero", cfg.Name)
 	}
 	if clk == nil {
 		return fmt.Errorf("refclock %q: nil clock", cfg.Name)
@@ -244,9 +276,14 @@ func (p *PPS) timeout() {
 	p.reach <<= 1
 	p.pendingMisses++
 	p.slots++
-	if wasReachable && p.reach == 0 {
+	if p.reach == 0 {
+		// Re-prime on every unreachable fetch, not only on the transition
+		// into it: a window kept across a silent period is a window that
+		// predates whatever the clock has done since.
 		p.resetWindow()
-		p.log.Warn("PPS pulse lost")
+		if wasReachable {
+			p.log.Warn("PPS pulse lost")
+		}
 	}
 	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) {
 		i.Reach = p.reach
@@ -285,14 +322,11 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 	p.accountSequence(s, delta, interval, true)
 
 	theta := edgeOffset(s.Time)
-	if len(p.window) >= 4 {
-		med, mad := medianMAD(p.windowTail(1 << p.poll))
-		limit := math.Max(5*mad, spikeFloor)
-		if math.Abs(theta-med) > limit {
-			p.reject("spike", &m)
-			return m
-		}
+	if predicted, limit, ok := p.spikeGate(s.Sequence); ok && math.Abs(theta-predicted) > limit {
+		p.reject("spike", &m)
+		return m
 	}
+	p.rejectRun = 0
 	wasUnreachable := p.reach == 0
 	p.reach = p.reach<<1 | 1
 	if wasUnreachable && p.haveEverPulse {
@@ -303,7 +337,7 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 		p.cfg.OnPulse(s.Time)
 	}
 	m.Reach = p.reach
-	p.appendWindow(theta)
+	p.appendWindow(s.Sequence, theta)
 	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) {
 		i.Reach = p.reach
 		i.LastRx = s.Time
@@ -400,6 +434,15 @@ func (p *PPS) reject(kind string, m *discipline.Measurement) {
 			r.Glitches++
 		}
 	})
+	// A rejected pulse never enters the window, so a window that has stopped
+	// describing the signal would otherwise reject everything for ever. Give
+	// up on it well before the reach register empties and re-prime.
+	p.rejectRun++
+	if p.rejectRun >= spikeResetAfter {
+		p.rejectRun = 0
+		p.resetWindow()
+		p.log.Warn("PPS window re-primed after consecutive rejections", "rejections", spikeResetAfter)
+	}
 }
 
 func (p *PPS) emptyMeasurement() discipline.Measurement {
@@ -420,9 +463,11 @@ func (p *PPS) emit(ctx context.Context, out chan<- discipline.Measurement, m dis
 
 func (p *PPS) resetWindow() {
 	p.window = p.window[:0]
+	p.windowSeq = p.windowSeq[:0]
 	p.intervals = p.intervals[:0]
 	p.slots = 0
 	p.stable = false
+	p.rejectRun = 0
 	p.updateInfo(func(i *source.Info, r *source.RefclockInfo) {
 		r.WindowSamples = 0
 		r.WindowJitter = 0
@@ -431,14 +476,17 @@ func (p *PPS) resetWindow() {
 	})
 }
 
-func (p *PPS) appendWindow(v float64) {
+func (p *PPS) appendWindow(seq uint32, v float64) {
 	max := 1 << p.cfg.PollMax
 	if len(p.window) == max {
 		copy(p.window, p.window[1:])
 		p.window[len(p.window)-1] = v
+		copy(p.windowSeq, p.windowSeq[1:])
+		p.windowSeq[len(p.windowSeq)-1] = seq
 		return
 	}
 	p.window = append(p.window, v)
+	p.windowSeq = append(p.windowSeq, seq)
 }
 
 func (p *PPS) appendInterval(v float64) {
@@ -449,6 +497,67 @@ func (p *PPS) appendInterval(v float64) {
 		return
 	}
 	p.intervals = append(p.intervals, v)
+}
+
+// spikeGate predicts where the next edge offset should fall and returns the
+// distance beyond which it is treated as a spike. The prediction is a
+// least-squares line through the recent accepted offsets rather than their
+// median, because the discipline loop slews the local clock by up to
+// MaxSlewPPM while the PPS is the system source: a median of past offsets is
+// exactly as stale as the correction the daemon itself is applying, and
+// comparing against it rejects every pulse once a correction starts. The
+// limit is the residual scatter of that line widened by the phase the loop is
+// entitled to move between the last accepted pulse and this one.
+//
+// ok is false while the window is too short to fit, which is what lets a
+// re-primed window fill again.
+func (p *PPS) spikeGate(seq uint32) (predicted, limit float64, ok bool) {
+	n := len(p.window)
+	if n < spikeFitMin || len(p.windowSeq) != n {
+		return 0, 0, false
+	}
+	if n > spikeFitMax {
+		n = spikeFitMax
+	}
+	xs := p.windowSeq[len(p.windowSeq)-n:]
+	ys := p.window[len(p.window)-n:]
+
+	// Offsets are taken relative to the most recent sample so the sums stay
+	// small and the uint32 sequence counter's wrap is handled by int32
+	// arithmetic.
+	last := xs[n-1]
+	fn := float64(n)
+	var sx, sy, sxx, sxy float64
+	for i := range ys {
+		x := float64(int32(xs[i] - last))
+		sx += x
+		sy += ys[i]
+		sxx += x * x
+		sxy += x * ys[i]
+	}
+	den := fn*sxx - sx*sx
+	if den == 0 {
+		return 0, 0, false
+	}
+	slope := (fn*sxy - sx*sy) / den
+	intercept := (sy - slope*sx) / fn
+
+	residuals := make([]float64, n)
+	for i := range ys {
+		residuals[i] = ys[i] - (intercept + slope*float64(int32(xs[i]-last)))
+	}
+	_, mad := medianMAD(residuals)
+
+	ahead := float64(int32(seq - last))
+	if ahead < 1 {
+		ahead = 1
+	}
+	if ahead > spikeSlewPulses {
+		ahead = spikeSlewPulses
+	}
+	predicted = intercept + slope*float64(int32(seq-last))
+	limit = math.Max(5*mad, spikeFloor) + p.cfg.MaxSlewPPM*1e-6*ahead
+	return predicted, limit, true
 }
 
 func (p *PPS) windowTail(n int) []float64 {

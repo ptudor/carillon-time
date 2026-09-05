@@ -176,6 +176,7 @@ func runDaemon(args []string) int {
 			src, err := refclock.NewPPS(refclock.PPSConfig{
 				Name: r.Name, Device: r.Device, Edge: edge, Offset: r.Offset,
 				LockJitter: r.LockJitter, PollMin: int8(r.PollMin), PollMax: int8(r.PollMax),
+				MaxSlewPPM: cfg.Discipline.MaxSlewPPM,
 			}, clk, log)
 			if err != nil {
 				log.Error("refclock", "name", r.Name, "error", err)
@@ -223,6 +224,7 @@ func runDaemon(args []string) int {
 			Name: r.Name + "/pps", Type: "gps-pps", Device: ppsDevice,
 			Edge: edge, Offset: r.PPSOffset, LockJitter: r.LockJitter,
 			PollMin: int8(r.PollMin), PollMax: int8(r.PollMax), OnPulse: pulse.Observe,
+			MaxSlewPPM: cfg.Discipline.MaxSlewPPM,
 		}, clk, log)
 		if err != nil {
 			_ = nmea.Close()
