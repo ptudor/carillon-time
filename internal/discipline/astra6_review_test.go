@@ -979,3 +979,103 @@ func TestAstra6AccountingEdgeCases(t *testing.T) {
 		}
 	})
 }
+
+// TestAstra6ObservationsArePropagated covers the core of RA6X-001. The clock
+// filter can release an observation several polls old, and feeding its offset
+// to the loop as present-time feedback re-integrates a correction the loop has
+// already made. Selection now expresses every stored offset as the error
+// remaining *now*.
+func TestAstra6ObservationsArePropagated(t *testing.T) {
+	// A loop that has corrected 4 ms of phase between t=0 and t=100.
+	applied := func(at, now float64) float64 {
+		if now <= at {
+			return 0
+		}
+		clamp := func(v float64) float64 { return math.Max(0, math.Min(100, v)) }
+		return (clamp(now) - clamp(at)) * 4e-3 / 100
+	}
+	src := &SourceState{
+		Name: "a", Options: Options{Numbering: true},
+		Reach: 255, Poll: 6, Valid: true, At: 0, Updated: 0,
+		Offset: 0.010, Delay: 0.01, Jitter: 1e-6, Stratum: 2,
+	}
+	sel := SelectAt([]*SourceState{src}, 100, 1, SelectOptions{AppliedSince: applied})
+	if sel.System != src {
+		t.Fatal("the source was not selected")
+	}
+	if want := 0.010 - 4e-3; math.Abs(sel.Offset-want) > 1e-12 {
+		t.Fatalf("combined offset %v, want %v: the correction already applied must be subtracted", sel.Offset, want)
+	}
+	if src.Offset != 0.010 {
+		t.Fatalf("the stored estimate was mutated: %v", src.Offset)
+	}
+	// Without the propagation the raw offset is used, which is the defect.
+	plain := Select([]*SourceState{src}, 100, 1)
+	if math.Abs(plain.Offset-0.010) > 1e-12 {
+		t.Fatalf("with no applied-phase information the raw offset must be used, got %v", plain.Offset)
+	}
+}
+
+// TestAstra6PropagationUsesTheAppliedPhase checks the loop's own record is
+// what selection consumes, end to end: after the loop has slewed part of an
+// offset away, the residual it is told about is the part that remains.
+func TestAstra6PropagationUsesTheAppliedPhase(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	l.Update(0.010, 6, 0, false, true)
+	for i := 1; i <= 20; i++ {
+		l.Tick(float64(i))
+	}
+	moved := 0.010 - l.Pending
+	if moved <= 0 {
+		t.Fatal("the loop slewed nothing")
+	}
+	if got := l.AppliedSince(0, 20); math.Abs(got-moved) > 1e-12 {
+		t.Fatalf("AppliedSince(0,20) = %v, but the loop moved %v", got, moved)
+	}
+	// An interval entirely inside the run is a proper subset.
+	part := l.AppliedSince(5, 10)
+	if part <= 0 || part >= moved {
+		t.Fatalf("AppliedSince(5,10) = %v, outside (0, %v)", part, moved)
+	}
+	if l.AppliedSince(20, 5) != 0 {
+		t.Fatal("a backward interval must be zero")
+	}
+	if l.AppliedSince(10, 10) != 0 {
+		t.Fatal("an empty interval must be zero")
+	}
+}
+
+// TestAstra6FilterCadence covers RA6X-002: the run of polls during which the
+// clock filter withholds every output — and the discipline loop therefore
+// never runs — must be bounded by the point at which a stale sample's grown
+// dispersion outweighs half its delay advantage, not by the Allan intercept.
+func TestAstra6FilterCadence(t *testing.T) {
+	for _, poll := range []float64{16, 64, 256, 1024} {
+		t.Run(fmt.Sprintf("poll=%.0fs", poll), func(t *testing.T) {
+			f := NewFilter(1e-6)
+			// One unusually fast reply, then ordinary ones 20 ms slower.
+			if _, ok := f.Add(0.001, 0.010, 1e-4, poll); !ok {
+				t.Fatal("the first sample must update")
+			}
+			last, maxGap := poll, 0.0
+			for i := 2; i <= 24; i++ {
+				now := float64(i) * poll
+				if _, ok := f.Add(0.001, 0.030, 1e-4, now); ok {
+					if gap := now - last; gap > maxGap {
+						maxGap = gap
+					}
+					last = now
+				}
+			}
+			// The 20 ms delay advantage is worth 10 ms to the offset
+			// estimate, so the crossover is at φ·age = 10 ms.
+			crossover := 10e-3 / Phi
+			if maxGap > crossover+poll {
+				t.Fatalf("withheld for %.0f s, past the %.0f s crossover", maxGap, crossover)
+			}
+			if maxGap >= AllanIntercept {
+				t.Fatalf("withheld for %.0f s, still bounded by the Allan intercept", maxGap)
+			}
+		})
+	}
+}

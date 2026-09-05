@@ -466,11 +466,12 @@ loop:
 			// taken from the producer's enqueue-time reading, and a leap
 			// boundary is processed before the measurement is admitted:
 			// both change whether this observation may be used at all.
-			now := e.processing(e.clk.Monotonic())
-			e.crossLeap(now)
+			// stale establishes processing time and processes any pending
+			// discontinuity before judging the measurement.
 			if e.stale(m) {
 				continue
 			}
+			now := e.processing(e.clk.Monotonic())
 			e.noteSourceAlive(m.Source)
 			m.Now = now
 			if err := e.handle(e.sys.Update(m), now); err != nil {
@@ -564,6 +565,24 @@ func (e *Engine) setFrequency(ppm float64) error {
 // off the channel. Applying such a measurement is what stepped the clock a
 // second time by the same amount.
 func (e *Engine) stale(m discipline.Measurement) bool {
+	// Bring discontinuity state up to date before judging the measurement.
+	// A leap boundary the kernel has already applied makes an observation
+	// taken on the other side of it wrong by exactly one second, and doing
+	// this here rather than only at the call site means no caller can get
+	// the order wrong (RA6X-007).
+	e.crossLeap(e.processing(e.clk.Monotonic()))
+
+	// A measurement from a source whose run has stopped and has not been
+	// restarted belongs to the finished run: nothing legitimate can arrive
+	// between the stop and the restart, and admitting it revives a dead
+	// source (RA6X-017). Once the restart has been announced, the first
+	// measurement through here is the new run's and clears the record.
+	if e.sourceErrors[m.Source] != "" && !e.restarting[m.Source] {
+		e.staleDrops[m.Source]++
+		e.log.Debug("discarding a measurement from a stopped source", "source", m.Source)
+		return true
+	}
+
 	if m.Generation == 0 {
 		return false // the source does not stamp generations
 	}

@@ -1158,3 +1158,222 @@ block, unique names and `MinSurvivors >= 1`; selection counts `SourceState`
 entries; `cluster`'s stopping floor is a fixed three. A `min_survivors` larger
 than the number of selectable sources is accepted and leaves the daemon
 permanently unsynchronized with no startup explanation.
+
+---
+
+## Wave 5 — the coupled discipline redesign
+
+These six were resolved together, as the review requires. The acceptance gate
+is the review's own reproduction: `python3
+review/2026/09/takeover-repro/reproduce.py baseline`, which now **passes in
+full** — all twelve delayed-feedback cases and the drift-persistence case.
+
+## RA6X-008 — Phase debit uses the next frequency word for the previous interval — FIXED
+
+**Changed.** `Tick` computed the *next* frequency word and debited that from
+the pending phase, so the accounting disagreed with what the kernel had
+actually been running. It now **charges first, then issues**:
+
+- `chargeApplied` debits `(applied − appliedBase)·dt` — the word that was
+  issued, minus the base in effect *when it was issued*, which a loop update
+  since may have changed — and only then is the next word computed.
+- The accounting point (`chargeFrom`) moves on every loop **update** as well
+  as every tick. A new observation replaces the residual, and whatever was
+  corrected before that observation was taken is already in the offset it
+  reports; charging that interval again would debit it twice.
+- **First tick:** charges nothing. Nothing has been issued yet, so no
+  transient has run; the old code charged a nominal second for one that had
+  not.
+- **Step:** starts a fresh interval and stops treating the word still in the
+  kernel as a transient, since there is no residual left for it to be charged
+  against.
+- **Backward time:** charges nothing. **Long stall:** charged at the 2 s
+  ceiling rather than reduced to a nominal second — the word really did stay
+  applied — while still bounding a pathological monotonic jump.
+
+Sign conventions, the ±500 ppm total bound, the configured phase-slew ceiling
+and the absence of a base-only pulse between updates are unchanged. `DESIGN.md`
+§6.4 carries the corrected pseudocode.
+
+**Files.** `internal/discipline/loop.go`, `DESIGN.md`,
+`internal/discipline/loop_test.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** The review's probe `TestVerification011ChargesTheAppliedWord`
+passes — it derives its expectation from `Applied()`, so the corrected
+first-tick semantics do not disturb it.
+`TestAstra6ChargesTheAppliedWord` restates it with the 39.0625 ppm / 1.5 s
+arithmetic explicit. `TestAstra6AppliedWordIntegral` is the independent oracle
+the review asked for: it models the kernel word and requires, at every
+accounting point, that the phase the loop debited equals the integral of the
+word actually held over the interval it was actually held for — across
+irregular ticks, a tick past the accounting window, updates that change the
+base, a sign change and saturation, at four base frequencies.
+`TestAstra6NoDoubleDebitAcrossUpdate` and `TestAstra6AccountingEdgeCases`
+cover the reconciliation and the remaining semantics. Three existing loop
+tests were updated to the corrected first-tick behaviour, each with the reason
+in a comment.
+
+## RA6X-001 — Delayed filter observations destabilize the discipline loop — FIXED
+
+**Changed.** Observation-time semantics are now defined across filter,
+combination and loop, taking the review's second option: **propagate the
+observation to the current clock using the recorded applied corrections.**
+
+`Loop` keeps `slewLog`, the cumulative phase it has applied, sampled at every
+accounting point and bounded to twice the Allan intercept. `AppliedSince(at,
+now)` interpolates within an accounting interval, where the frequency word is
+constant, so the answer is exact rather than an estimate. Selection then
+expresses every stored offset at the selection instant — `Current = Offset −
+AppliedSince(At, now)` — and the intersection, clustering, PPS agreement,
+combination and prefer paths all use `Current`. The raw `Offset` is untouched
+and is what status reports. The oscillator's own drift over the interval is a
+separate uncertainty and is already carried by the dispersion the filter ages
+at φ, which is the explicit uncertainty model the finding asks for. Per-source
+consumption tracking, the other half of this finding, landed with RA6X-003.
+
+**Files.** `internal/discipline/loop.go`, `internal/discipline/select.go`,
+`internal/discipline/system.go`, `DESIGN.md`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** `python3 review/2026/09/takeover-repro/reproduce.py
+baseline` now passes all twelve `TestTakeoverDelayedFeedback` cases,
+including the four the review recorded as failing and the steeper symmetric
+RTT growth the distance-ranking experiment could not fix. At poll 6 with
+symmetric variation the peak frequency error falls from **358.227 ppm to 3.592
+ppm** and the final-hour RMS from **167.077 ms to 0.000 ms**; at poll 8 from
+224.474 ppm / 322.020 ms to 0.901 ppm / 0.012 ms. The asymmetric cases, which
+carry genuine measurement bias rather than a discipline defect, also improve
+markedly. `TestAstra6ObservationsArePropagated` and
+`TestAstra6PropagationUsesTheAppliedPhase` pin the mechanism.
+`CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-002 — The filter can withhold useful corrections for many polls — FIXED
+
+**Changed.** The clock filter ranks the eight stages by **root distance**
+(`delay/2 + dispersion`) instead of raw `delay`. A delay advantage is worth
+δ/2 to the offset estimate, not δ, so a fast early sample loses its place once
+φ·age outweighs half its advantage — about 11 minutes for a 20 ms advantage —
+rather than lasting past the 34-minute Allan intercept. This is the deviation
+from RFC 5905 §10 and ntpd that `DESIGN.md` said wanted a simulation pass
+first; the pass is the takeover reproduction, and it is applied together with
+RA6X-001's propagation, without which it does not fix delayed feedback. The
+eight-stage bound, the `MaxDispersion` and over-Allan handling, and the
+outlier rejection are unchanged.
+
+The design's two incorrect statements are corrected in place: the claim that
+an over-Allan observation "must also lose on raw delay" (line 90 explicitly
+re-ranks it to `MaxDistance + dispersion`), and the 11-minute figure for a
+10 ms RTT advantage, which omitted the half-delay factor — 11 minutes is the
+figure for a **20 ms** advantage.
+
+**Files.** `internal/discipline/filter.go`, `DESIGN.md`,
+`internal/discipline/filter_test.go`,
+`internal/discipline/astra6_review_test.go`.
+
+**Verification.** In the reproduction the maximum age of the selected
+observation falls from **448 s to 0 s at poll 6** and **1792 s to 0 s at poll
+8**, with an update on essentially every poll (675 of 676, 169 of 169).
+`TestFilterWithholdsUpdatesWhileAnEarlyBestSampleStands` was inverted from
+documenting the defect to bounding it: the withholding run must now be inside
+the distance crossover and must *not* reach the Allan intercept.
+`TestAstra6FilterCadence` repeats that at four poll intervals. Two other
+filter tests were updated to the new ranking with the arithmetic spelled out.
+
+## RA6X-024 — Filter startup uncertainty omits all unfilled stages — FIXED
+
+**Changed.** Neither extreme is usable here, so the finding's second option —
+a documented conservative admission policy — was taken. RFC 5905's MAXDISP
+stages report about 7.9 s for one sample, past `MaxDistance`, which makes a
+fresh association inadmissible for five or six packets; omitting the stages
+entirely reported one packet carrying 1 ms of dispersion as 0.5 ms, *more*
+certain than the single measurement it rests on. Absent stages now contribute
+a bounded `primingDispersion` of 1 s at their rank weight — seeded into the
+same halving recurrence, so the shape matches the RFC's sum — giving at least
+500 ms of uncertainty for one sample, decaying to 2 ms by the eighth. An
+unprimed source stays admissible (λ ≈ 0.51 s on an ordinary path) so a host
+with nothing else can bootstrap from it, any primed source outranks it, and
+the root dispersion served during acquisition is honest. Quality is refreshed
+on every selection through RA6X-001's propagation and RA6X-025's per-stage
+metadata, so evolving uncertainty is published without reintegrating old
+offsets. The one-line dispersion patch was not applied, and no falseticker or
+step assertion was weakened.
+
+**Files.** `internal/discipline/filter.go`,
+`internal/discipline/measurement.go`, `DESIGN.md`,
+`internal/discipline/filter_test.go`.
+
+**Verification.** `TestFilterSingleSample` now requires the one-sample
+dispersion to be at least the sample's own, with the exact expected value.
+`TestFilterPrimingDispersionDecays` requires the term to fall monotonically
+from one to eight samples, to vanish on a full register, and — at every count
+— to leave the root distance inside `MaxDistance` so an unprimed source can
+still bootstrap. `TestFilterDispersionAges` carries the priming term
+explicitly. The whole takeover reproduction still passes with the change in
+place, so admission and falseticker behaviour are unaffected.
+
+## RA6X-025 — Filtered offsets are paired with metadata from a different packet — FIXED
+
+**Changed.** `hit` obtained the filter output and then handed `emit` the
+*latest* exchange's packet, so a historical offset travelled with the newest
+stratum, root delay, root dispersion, reference identity, reference time,
+precision and leap bits — describing no actual sample. A `stageMeta` ring the
+same depth as the filter now records those fields for every exchange, and the
+emitted measurement carries the metadata of the observation whose offset is
+used. The peer's own identity (`SourceRefID`) stays a property of the
+association and comes from the address.
+
+For material quality changes, the coarse and rare signal is the upstream's
+**stratum**: a change re-primes the filter, since the samples already held
+describe a different quality of service. A reference-id change at a stable
+address is ordinary for a stratum-2 peer and is handled by the per-stage
+metadata rather than by resetting.
+
+Advertised root dispersion now ages from `rootDispAt`, the moment the estimate
+was *received* — which is what the filter aged its own dispersion to — instead
+of from the handover instant. Ageing from `now` discarded the elapsed age the
+source's selection distance had already accounted for, so switching to an
+older survivor advertised less uncertainty than it had; ageing from the
+sample's own `At` would have double-counted the interval the filter had
+already covered. External status names and the wire format are unchanged.
+
+**Files.** `internal/source/ntp.go`, `internal/discipline/system.go`,
+`DESIGN.md`, `internal/source/astra6_review_test.go`.
+
+**Verification.** `TestAstra6MetadataBelongsToItsObservation` runs the real
+poller against a server whose first reply is fast and low-delay with one
+reference identity and whose later replies are slow with another and wholly
+different root delay and dispersion; every valid measurement must carry a
+consistent pair. `TestAstra6StratumChangeReprimesTheFilter` observes the
+re-prime from outside, as the priming uncertainty returning.
+
+## RA6X-013 — A frozen transient frequency is accepted as stable drift — FIXED
+
+**Changed.** The gate measured the spread of repeated base-frequency readings,
+which are flat by construction when nothing is being measured — so a bad
+transient left standing during filter starvation or source silence looked
+perfectly stable after 900 s and overwrote a known-good drift file. Each
+`freqSample` now carries the loop-update count, and `frequencySettled`
+additionally requires **at least two accepted loop updates spanning the
+window**. Readings are recorded only in `StateSynced` — while settling, in
+holdover or unsynchronized the kernel word is a guess being carried, not a
+measurement — and the history is discarded when the **system source** changes
+or a **step** happens, so evidence from different measurement chains is never
+averaged. Flat repeated reads alone can no longer establish stability, and a
+frozen tail longer than the window disqualifies itself because the update
+count stops advancing. The last known-good file is preserved on insufficient
+evidence; the scalar format, atomic replacement and the configurable
+spread/window are unchanged.
+
+**Files.** `internal/engine/engine.go`, `DESIGN.md`,
+`internal/engine/engine_test.go`.
+
+**Verification.** `TestTakeoverFrozenFrequencyMustNotOverwriteDrift` in the
+review's own reproduction now passes: the previously stored 6.125 ppm survives
+instead of being replaced by the frozen 30.539062 ppm.
+`TestEngineDoesNotPersistAMovingFrequency` and
+`TestEngineFrequencySettledGate` still pass — the latter updated to drive the
+gate through synchronized snapshots carrying update counts, so it still covers
+insufficient history, excessive movement and a steady estimate settling again.
+`TestEngineStepsSettlesAndPersistsDrift` proves independently supported stable
+observations still permit the write.

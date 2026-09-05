@@ -170,6 +170,11 @@ type System struct {
 	// still-applicable synchronization may enter serviceable holdover.
 	everSynced bool
 
+	// rootDispAt is when the estimate behind rootDisp was received, from
+	// which that dispersion ages. It is not lastUpdate: the loop can run at
+	// a moment later than the observation it ran on.
+	rootDispAt float64
+
 	// unsyncedReason records why the daemon is UNSYNCED, so the refid it
 	// advertises tells the operator which of the three causes it is.
 	unsyncedReason ntp.RefID
@@ -466,6 +471,12 @@ func (s *System) reselect(now float64) Result {
 	s.refID = sys.SourceRefID
 	s.rootDelay = sys.RootDelay + sys.Delay
 	s.rootDisp = sys.RootDisp + sys.Dispersion + sel.Jitter
+	// Root dispersion ages from the moment the estimate was received, which
+	// is what the filter aged its own dispersion to. Ageing it from the
+	// handover instant instead threw away the elapsed age that the source's
+	// selection distance had already accounted for, so switching to an
+	// older survivor advertised less uncertainty than it had (RA6X-025).
+	s.rootDispAt = sys.Updated
 	s.lastUpdate = now
 	s.haveUpdate = true
 	return res
@@ -556,7 +567,7 @@ func (s *System) Status(now float64) Status {
 	}
 	if s.haveUpdate {
 		st.LastUpdate = s.lastUpdate
-		st.RootDisp = s.rootDisp + Phi*math.Max(0, now-s.lastUpdate) + math.Abs(s.loop.Pending)
+		st.RootDisp = s.rootDisp + Phi*math.Max(0, now-s.rootDispAt) + math.Abs(s.loop.Pending)
 	}
 	switch s.state {
 	case StateUnsynced:
