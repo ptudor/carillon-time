@@ -1,0 +1,32 @@
+package server
+
+import (
+	"net/netip"
+	"testing"
+
+	"carillon/internal/ntp/auth"
+)
+
+// RF5X-008/035: crypto-NAKs are replies too. An unauthenticated sender
+// must not bypass all rate bounds merely by naming a require_key address.
+func TestVerification035CryptoNAKFloodIsBounded(t *testing.T) {
+	h, stats := newTestHandler(t, func(c *Config) {
+		c.RequireKey = map[netip.Prefix]uint32{netip.MustParsePrefix("192.0.2.7/32"): 1}
+		c.RateLimitPPS, c.RateBurst = 1, 8
+	})
+	unknown := auth.Key{ID: 77, Secret: []byte("0123456789abcdef")}
+	req := unknown.Append(request(4))
+	replies := 0
+	for i := 0; i < 100; i++ {
+		if got := h.Handle(req, from("192.0.2.7"), testWall, testMono); len(got) > 0 {
+			replies++
+			if len(got) > len(req) { t.Fatal("amplified reply") }
+		}
+	}
+	if got := h.Handle(testKey.Append(request(4)), from("192.0.2.7"), testWall, testMono); len(got) != 68 {
+		t.Fatal("spoofed traffic starved authenticated peer")
+	}
+	if replies > 9 { // burst plus at most one throttled KoD
+		t.Fatalf("%d replies to 100 bad MACs at one instant with burst=8; counters=%+v", replies, stats.Snapshot().Total)
+	}
+}

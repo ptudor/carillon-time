@@ -1,0 +1,64 @@
+package refclock
+
+import (
+	"testing"
+	"time"
+
+	"carillon/internal/discipline"
+	"carillon/internal/ntp"
+	"carillon/internal/pps"
+)
+
+// RF5X-001/026: resetting a locked window must invalidate the previously
+// advertised estimate before the reach register drains completely.
+func TestVerification001ReprimeInvalidatesSelection(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		name := "four_spikes"
+		if restart { name = "sequence_restart" }
+		t.Run(name, func(t *testing.T) {
+			p, clk := testPPS(t)
+			sys := discipline.New(discipline.Config{Loop: discipline.LoopConfig{
+				StepThreshold: 0.5, StepLimit: 0, Panic: 1000, MaxSlewPPM: 500, Precision: 1e-6,
+			}, HoldoverMax: 3600}, 0, true)
+			sys.AddSource("ntp", discipline.Options{Numbering: true})
+			sys.AddSource("pps0", discipline.Options{PPS: true, Prefer: true})
+			sys.Update(discipline.Measurement{Source: "ntp", Now: 0.1, At: 0.1, Valid: true,
+				Reach: 0xff, Poll: 6, Offset: 0, Delay: 0.002, Jitter: 1e-6, Stratum: 2, Leap: ntp.LeapNone})
+			base := clk.Now()
+			feed := func(seq uint32, second int, offset time.Duration) {
+				clk.Advance(time.Second)
+				m := p.accept(pps.Sample{Sequence: seq, Time: base.Add(time.Duration(second)*time.Second + offset)})
+				sys.Update(m)
+			}
+			for i := 1; i <= 16; i++ { feed(uint32(1000+i), i, 0) }
+			if !p.stable || sys.Status(16).SystemSource != "pps0" { t.Fatal("setup did not select locked PPS") }
+			if restart { feed(5, 17, 0) } else {
+				for i := 17; i <= 20; i++ { feed(uint32(1000+i), i, 10*time.Millisecond) }
+			}
+			if p.stable || len(p.window) != 0 { t.Fatal("setup did not reset window") }
+			if st := sys.Status(clk.Monotonic()); st.SystemSource == "pps0" {
+				t.Fatalf("PPS remains system source at reach=%03o despite cleared window and stable=false", p.reach)
+			}
+		})
+	}
+}
+
+// RF5X-002: Run reads wall time before consume reads Generation at '$'.
+// A step between those reads assigns new-generation validity to old time.
+func TestVerification002NMEAGenerationMatchesArrival(t *testing.T) {
+	n, clk, _ := testNMEA(t)
+	arrival := clk.Now().Add(150 * time.Millisecond)
+	gen := uint64(1)
+	n.cfg.Generation = func() uint64 {
+		if gen == 1 {
+			gen++
+			_ = clk.Step(time.Second)
+			n.Reset()
+		}
+		return gen
+	}
+	got := n.consume([]byte(sentence("GNZDA,120000.00,23,08,2026,00,00")+"\r\n"), arrival, 1)
+	if len(n.offsets) != 0 || n.Info().Received != 0 {
+		t.Fatalf("pre-step arrival entered post-step window: offsets=%v received=%d measurements=%+v", n.offsets, n.Info().Received, got)
+	}
+}

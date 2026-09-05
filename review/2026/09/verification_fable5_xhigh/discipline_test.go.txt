@@ -1,0 +1,92 @@
+package discipline
+
+import (
+	"math"
+	"testing"
+
+	"carillon/internal/ntp"
+)
+
+// RF5X-011: the frequency actually issued at t=1 must be accounted for
+// over the next 1.5 seconds, rather than the newly computed frequency.
+func TestVerification011ChargesTheAppliedWord(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	l.Update(0.010, 6, 0, false, true)
+	l.Tick(1)
+	word, _ := l.Applied()
+	pending := l.Pending
+	l.Tick(2.5)
+	want := pending - word*1e-6*1.5
+	if math.Abs(l.Pending-want) > 1e-12 {
+		t.Fatalf("pending=%.12f want=%.12f (issued %.9f ppm for 1.5 s)", l.Pending, want, word)
+	}
+}
+
+// RF5X-007: losing the numbering source must clear the now-inapplicable
+// wrong-edge diagnostic, while retaining the unqualified classification.
+func TestVerification007ClearsObsoleteDisagreement(t *testing.T) {
+	n := src("ntp", 0, 0.002, Options{Numbering: true})
+	p := src("pps", 0.120, 0, Options{PPS: true, Prefer: true})
+	p.Stratum, p.Jitter = 0, 1e-6
+	Select([]*SourceState{n, p}, 100, 1)
+	if p.Status != StatusFalseticker || p.DisagreesWith != "ntp" {
+		t.Fatalf("setup: %+v", p)
+	}
+	n.Reach = 0
+	Select([]*SourceState{n, p}, 101, 1)
+	if p.Status != StatusUnqualified || p.DisagreesWith != "" || p.Disagreement != 0 {
+		t.Fatalf("status=%v disagrees_with=%q delta=%v without a numbering source", p.Status, p.DisagreesWith, p.Disagreement)
+	}
+}
+
+// RF5X-036: once fallback service is running, a preferred source which
+// never answered is still lost. Startup suppression must not last forever.
+func TestVerification036ReportsNeverReachablePreferAfterFallback(t *testing.T) {
+	n := src("fallback", 0, 0.002, Options{Numbering: true})
+	p := src("preferred", 0, 0.002, Options{Numbering: true, Prefer: true})
+	p.Reach, n.Reach = 0, 0
+	if s := Select([]*SourceState{n, p}, 100, 1); s.PreferLost {
+		t.Fatal("prefer loss should be suppressed before any survivor")
+	}
+	n.Reach = 0xff
+	Select([]*SourceState{n, p}, 101, 1)
+	sel := Select([]*SourceState{n, p}, 1000, 1)
+	if sel.System != n || !sel.PreferLost {
+		t.Fatalf("system=%v prefer_lost=%v after 900 s of fallback service", sel.System.Name, sel.PreferLost)
+	}
+}
+
+// RF5X-012: checks the actual requirement, independently of the fix log's
+// explanation for deferring it.
+func TestVerification012UnfilledFilterDispersion(t *testing.T) {
+	f := NewFilter(1e-6)
+	for i := 1; i <= 4; i++ {
+		out, _ := f.Add(0, 0.001, 0.001, float64(i))
+		if i == 1 && math.Abs(out.Dispersion-7.938) > 0.001 {
+			t.Errorf("one-sample dispersion=%g, want about 7.938 s", out.Dispersion)
+		}
+		if i == 4 && math.Abs(out.Dispersion-0.9385) > 0.001 {
+			t.Errorf("four-sample dispersion=%g, want about 0.9385 s", out.Dispersion)
+		}
+	}
+}
+
+// RF5X-005: preserving synchronization through a leap must not extend the
+// holdover deadline when no subsequent measurement arrives.
+func TestVerification005HoldoverStillExpires(t *testing.T) {
+	cfg := simConfig()
+	cfg.SettleUpdates = 3
+	cfg.HoldoverMax = 10
+	s := New(cfg, 0, true)
+	s.AddSource("ntp", Options{Numbering: true})
+	feed := func(at float64) {
+		s.Update(Measurement{Source: "ntp", Now: at, At: at, Reach: 0xff, Poll: 6,
+			Valid: true, Offset: 0.001, Delay: 0.002, Dispersion: 1e-6, Jitter: 1e-6,
+			Stratum: 2, Leap: ntp.LeapNone})
+	}
+	for i := 1; i <= 4; i++ { feed(float64(i)) }
+	if s.State() != StateSynced { t.Fatal("setup did not synchronize") }
+	s.Resync(5)
+	s.Tick(16)
+	if s.State() != StateUnsynced { t.Fatal("holdover did not expire") }
+}

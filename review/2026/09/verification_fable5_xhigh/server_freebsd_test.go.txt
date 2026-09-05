@@ -1,0 +1,17 @@
+//go:build freebsd
+
+package server
+
+import (
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+func TestVerification003FreeBSDBroadcastDestination(t *testing.T) {
+	oob := marshalControl(unix.IPPROTO_IP, unix.IP_RECVDSTADDR, []byte{192, 168, 1, 255})
+	dst, reply, rejected := destination(oob, "udp4")
+	if !rejected && !martianDestination(dst) {
+		t.Fatalf("directed-broadcast destination=%v accepted, reply source control bytes=%x", dst, reply)
+	}
+}

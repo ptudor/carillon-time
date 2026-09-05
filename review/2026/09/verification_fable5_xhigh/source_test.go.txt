@@ -1,0 +1,28 @@
+package source
+
+import (
+	"context"
+	"net/netip"
+	"testing"
+	"time"
+
+	"carillon/internal/clock"
+	"carillon/internal/ntp"
+)
+
+// RF5X-017: a temporary KoD maximum belongs to the old server, not to
+// the configuration of an unrelated server obtained on re-resolution.
+func TestVerification017AddressChangeDropsKissMaximum(t *testing.T) {
+	n, err := NewNTP(NTPConfig{Name: "ntp", Host: "server.invalid", Port: 123, PollMin: 4, PollMax: 6}, clock.NewFake(time.Unix(1800000000, 0)), nil)
+	if err != nil { t.Fatal(err) }
+	n.addr, n.haveAddr = netip.MustParseAddrPort("192.0.2.1:123"), true
+	n.handleKiss(&kissError{code: "RATE", pkt: ntp.Packet{Poll: 13}})
+	n.lookup = func(context.Context, string, uint16) (netip.AddrPort, error) {
+		return netip.MustParseAddrPort("192.0.2.2:123"), nil
+	}
+	n.consecutiveTimeouts = resolveAfterTimeouts
+	if !n.ensureResolved(context.Background()) { t.Fatal("re-resolution failed") }
+	if n.cfg.PollMax != 6 {
+		t.Fatalf("new server inherited old RATE maximum %d; configured poll_max was 6", n.cfg.PollMax)
+	}
+}
