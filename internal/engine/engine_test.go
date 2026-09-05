@@ -322,3 +322,85 @@ func TestDriftFileRoundTrip(t *testing.T) {
 		t.Fatal("garbage must be rejected")
 	}
 }
+
+// TestEngineLeavesBaseFrequencyInKernel covers RF5X-004. While a slew is in
+// progress the kernel holds the base frequency plus a transient of up to
+// ±MaxSlewPPM. Shutdown writes the base to the drift file, so it must write
+// the same value to the kernel; otherwise the host keeps running fast or slow
+// by the transient until something else sets the frequency.
+func TestEngineLeavesBaseFrequencyInKernel(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	// 0.3 s is under the step threshold, so it is slewed, and at 500 ppm a
+	// slew that size is still saturated when the engine is asked to stop.
+	src := &scripted{name: "a", clk: clk, gap: 20 * time.Millisecond,
+		script: []discipline.Measurement{good(0.3), good(0.3), good(0.3)}}
+	e, err := New(testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}}), clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+
+	if err := e.Wait(ctx, func(s *Status) bool { return s.Pending != 0 && s.Updates >= 2 }); err != nil {
+		t.Fatalf("never started slewing: %v (status %+v)", err, e.Status().Status)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	st := e.Status()
+	if st.Pending == 0 {
+		t.Skip("the slew finished before shutdown; nothing to assert")
+	}
+	last := clk.Frequencies[len(clk.Frequencies)-1]
+	if math.Abs(last-st.Frequency) > 1e-9 {
+		t.Fatalf("kernel left at %.6f ppm with %.6f s of phase still pending; want the base estimate %.6f ppm",
+			last, st.Pending, st.Frequency)
+	}
+	if f, _ := clk.Frequency(); math.Abs(f-st.Frequency) > 1e-9 {
+		t.Fatalf("clock frequency %.6f ppm, want %.6f", f, st.Frequency)
+	}
+}
+
+// TestEngineDoesNotRewriteFrequencyAfterTheKernelRefusedOne is the second
+// half of RF5X-004: when the fatal error was SetFrequency itself, shutdown
+// must not call it again just to produce a second failure.
+func TestEngineDoesNotRewriteFrequencyAfterTheKernelRefusedOne(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	fc := &failingClock{Fake: clk, failFrequencyAfter: 2}
+	src := &scripted{name: "a", clk: clk, gap: 10 * time.Millisecond,
+		script: []discipline.Measurement{good(0.3), good(0.3), good(0.3), good(0.3)}}
+	e, err := New(testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}}), fc, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = 5 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = e.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "refused a frequency change") {
+		t.Fatalf("run error %v, want a refused frequency change", err)
+	}
+	if n := fc.frequencyCalls.Load(); n != 3 {
+		t.Fatalf("SetFrequency called %d times; the failing call must not be retried on exit", n)
+	}
+}
+
+// failingClock refuses SetFrequency after a given number of successful calls.
+type failingClock struct {
+	*clock.Fake
+	failFrequencyAfter int32
+	frequencyCalls     atomic.Int32
+}
+
+func (c *failingClock) SetFrequency(ppm float64) error {
+	if c.frequencyCalls.Add(1) > c.failFrequencyAfter {
+		return errors.New("simulated EPERM")
+	}
+	return c.Fake.SetFrequency(ppm)
+}

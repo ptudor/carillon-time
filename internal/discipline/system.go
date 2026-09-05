@@ -211,6 +211,13 @@ func (s *System) Frequency() float64 { return s.loop.Freq }
 // FreqKnown reports whether the frequency has been measured or loaded.
 func (s *System) FreqKnown() bool { return s.loop.FreqKnown }
 
+// Applied returns the frequency word the actuator was last given and whether
+// one was given at all. See Loop.Applied.
+func (s *System) Applied() (float64, bool) { return s.loop.Applied() }
+
+// Pending returns the residual phase, in seconds, the loop has not slewed yet.
+func (s *System) Pending() float64 { return s.loop.Pending }
+
 func (s *System) all() []*SourceState {
 	out := make([]*SourceState, 0, len(s.order))
 	for _, n := range s.order {

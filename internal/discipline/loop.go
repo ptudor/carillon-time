@@ -274,3 +274,10 @@ func (l *Loop) Tick(now float64) []Action {
 
 // TimeConstant returns the current loop time constant in seconds.
 func (l *Loop) TimeConstant() float64 { return l.tau }
+
+// Applied returns the frequency word most recently issued to the actuator —
+// the base frequency plus whatever phase-slew transient the last Tick added —
+// and whether anything has been issued at all. The caller needs it to know
+// what the kernel is actually running at, which is not Freq while a slew is
+// in progress.
+func (l *Loop) Applied() (float64, bool) { return l.applied, l.haveApply }

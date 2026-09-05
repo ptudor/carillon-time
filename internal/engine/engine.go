@@ -25,6 +25,10 @@ import (
 	"carillon/internal/source"
 )
 
+// errFrequencyRefused marks a fatal error that came from SetFrequency
+// itself, so the shutdown path knows not to make the same call again.
+var errFrequencyRefused = errors.New("kernel refused a frequency change")
+
 // SourceSpec pairs a source with its discipline options.
 type SourceSpec struct {
 	Source  source.Source
@@ -284,8 +288,37 @@ loop:
 	}
 	cancel()
 	wg.Wait()
+	e.restoreBaseFrequency(runErr)
 	e.maybeWriteDrift(e.clk.Monotonic(), true)
 	return runErr
+}
+
+// restoreBaseFrequency puts the base frequency estimate back into the kernel
+// on the way out. While the daemon runs, the word the kernel holds is the
+// base plus the one-second phase-slew transient the last Tick issued — up to
+// ±MaxSlewPPM. The drift file records the base, so leaving the transient
+// behind means the host runs fast or slow by up to 500 ppm (43 s/day) from
+// the moment carillon stops until something else writes the frequency word.
+//
+// The pending phase is abandoned rather than finished: it can take
+// arbitrarily long, and exit never steps.
+func (e *Engine) restoreBaseFrequency(runErr error) {
+	applied, ok := e.sys.Applied()
+	base := e.sys.Frequency()
+	if !ok || applied == base {
+		return
+	}
+	if errors.Is(runErr, errFrequencyRefused) {
+		// The actuator already refused a frequency change; a second attempt
+		// would only produce a second error on the way out.
+		return
+	}
+	if err := e.clk.SetFrequency(base); err != nil {
+		e.log.Warn("cannot restore the base frequency on exit", "ppm", base, "error", err)
+		return
+	}
+	e.log.Info("kernel frequency left at the base estimate",
+		"ppm", base, "abandoned_slew_ppm", applied-base, "abandoned_phase", e.sys.Pending())
 }
 
 func (e *Engine) sourceExited(name string, err error) {
@@ -315,7 +348,7 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 		switch a.Kind {
 		case discipline.ActionSetFrequency:
 			if err := e.clk.SetFrequency(a.Value); err != nil {
-				return fmt.Errorf("engine: kernel refused frequency %.3f ppm: %w", a.Value, err)
+				return fmt.Errorf("engine: %w of %.3f ppm: %w", errFrequencyRefused, a.Value, err)
 			}
 		case discipline.ActionStep:
 			before := e.clk.Now()
