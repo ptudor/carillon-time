@@ -321,3 +321,144 @@ func TestAstra6StratumChangeReprimesTheFilter(t *testing.T) {
 		}
 	}
 }
+
+// TestAstra6RemoteBackoffIsCapped covers RA6X-031. The only cap on a RATE's
+// demanded exponent was discipline.MaxPoll = 17 — 131072 s, about 36.4 hours
+// — and it overrode poll_max, so a correctly matched but unauthenticated
+// kiss could take an association out of service for a day and a half. RFC
+// 8633 §5.4 recommends bounding accepted backoff at no more than 13.
+func TestAstra6RemoteBackoffIsCapped(t *testing.T) {
+	cases := []struct {
+		name              string
+		pollMax, demanded int8
+		want              int8
+	}{
+		{"beyond the cap", 10, 17, maxRemoteBackoffPoll},
+		{"at the cap", 10, 13, 13},
+		{"below the cap", 10, 12, 12},
+		{"within poll_max", 10, 8, 8},
+		{"an operator's own long poll is kept", 17, 17, 17},
+		{"an operator's long poll is not lowered by the cap", 15, 9, 9},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n, err := NewNTP(NTPConfig{
+				Name: "s", Address: "192.0.2.1:123", Host: "192.0.2.1", Port: 123,
+				PollMin: 6, PollMax: c.pollMax,
+			}, clock.ReadOnly(), slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatal(err)
+			}
+			n.handleKiss(&kissError{code: "RATE", pkt: ntp.Packet{Poll: c.demanded}})
+			if n.poll != c.want {
+				t.Fatalf("poll %d after a RATE demanding %d with poll_max %d, want %d",
+					n.poll, c.demanded, c.pollMax, c.want)
+			}
+			if n.cfg.PollMax != c.pollMax {
+				t.Fatalf("the configured poll_max was mutated: %d -> %d", c.pollMax, n.cfg.PollMax)
+			}
+		})
+	}
+}
+
+// TestAstra6RateBackoffIsAssociationScoped covers RA6X-030: a RATE demand
+// belongs to the server that made it, so a replacement endpoint must not
+// inherit the previous one's expanded maximum or its long poll.
+func TestAstra6RateBackoffIsAssociationScoped(t *testing.T) {
+	a := netip.MustParseAddrPort("192.0.2.1:123")
+	b := netip.MustParseAddrPort("192.0.2.2:123")
+	n, err := NewNTP(NTPConfig{
+		Name: "s", Address: "ntp.test", Host: "ntp.test", Port: 123,
+		PollMin: 6, PollMax: 10,
+	}, clock.ReadOnly(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	answers := []netip.AddrPort{a, b}
+	n.lookup = func(context.Context, string, uint16) ([]netip.AddrPort, error) { return answers, nil }
+	if !n.ensureResolved(context.Background()) {
+		t.Fatal("initial resolution failed")
+	}
+	n.handleKiss(&kissError{code: "RATE", pkt: ntp.Packet{Poll: 13}})
+	if n.effPollMax != 13 || n.kodMinPoll != 13 || n.poll != 13 {
+		t.Fatalf("setup: effPollMax=%d kodMinPoll=%d poll=%d", n.effPollMax, n.kodMinPoll, n.poll)
+	}
+
+	// Move to the other answer: everything the previous server demanded goes.
+	n.consecutiveTimeouts = resolveAfterTimeouts
+	n.ensureResolved(context.Background())
+	if n.addr != b {
+		t.Fatalf("resolved %v, want %v", n.addr, b)
+	}
+	if n.effPollMax != 10 || n.kodMinPoll != 0 || n.poll != 6 {
+		t.Fatalf("a replacement server inherited the previous one's poll policy: effPollMax=%d kodMinPoll=%d poll=%d",
+			n.effPollMax, n.kodMinPoll, n.poll)
+	}
+}
+
+// TestAstra6PollJitterRespectsADemandedFloor covers the scheduling half of
+// RA6X-030: the ±5 % jitter must not schedule a send earlier than the
+// interval a server has demanded.
+func TestAstra6PollJitterRespectsADemandedFloor(t *testing.T) {
+	const floor = int8(10) // 1024 s
+	want := time.Duration(ntp.Log2Seconds(floor) * float64(time.Second))
+	for i := 0; i < 10000; i++ {
+		if got := pollInterval(floor, floor); got < want {
+			t.Fatalf("scheduled %v, earlier than the demanded %v", got, want)
+		}
+	}
+	// With no floor the jitter is free to go either way.
+	below := false
+	for i := 0; i < 10000; i++ {
+		if pollInterval(floor, 0) < want {
+			below = true
+			break
+		}
+	}
+	if !below {
+		t.Fatal("the jitter never went below the nominal interval; the test proves nothing")
+	}
+}
+
+// TestAstra6RateEndsAnIburst covers the last part of RA6X-030: a RATE inside
+// an iburst changed the poll but left the remaining two-second burst requests
+// to go out anyway — which is exactly what the server asked us to stop.
+func TestAstra6RateEndsAnIburst(t *testing.T) {
+	var requests atomic.Int32
+	srv := newFakeServer(t, func(req ntp.Packet, _ []byte) []byte {
+		requests.Add(1)
+		// Every reply is a RATE kiss.
+		return reply(req, func(p *ntp.Packet) {
+			p.Stratum = 0
+			p.ReferenceID = ntp.KissRATE
+			p.Poll = 9
+		})
+	})
+	n, err := NewNTP(NTPConfig{
+		Name: "s", Address: srv.addr.String(),
+		Host: srv.addr.Addr().String(), Port: srv.addr.Port(),
+		PollMin: 6, PollMax: 10, IBurst: true, Timeout: time.Second,
+	}, clock.ReadOnly(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var slept atomic.Int32
+	n.sleep = func(ctx context.Context, d time.Duration) bool {
+		if d >= burstSpacing {
+			slept.Add(1)
+		}
+		if slept.Load() > 0 && requests.Load() > 0 {
+			<-ctx.Done() // park after the burst so the count is stable
+			return false
+		}
+		return ctx.Err() == nil
+	}
+	out, stop := run(t, n)
+	defer stop()
+	<-out
+	// The burst must have stopped at the first kiss rather than sending
+	// burstCount requests two seconds apart.
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("%d requests sent after a RATE during iburst, want 1", got)
+	}
+}

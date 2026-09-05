@@ -189,25 +189,58 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 		c.denied.Add(1)
 		return nil
 	}
-	// A source inside a require_key prefix has its MAC checked before the
-	// limiter is consulted. The bucket is keyed by source address, so
-	// anyone able to forge the peer's address could otherwise drain its
-	// tokens with rate_limit_pps packets a second from anywhere on the
-	// path, push its poll to poll_max, and take the trusted upstream out of
-	// the association the shared key exists to protect. The extra CMAC is
-	// bounded to the handful of addresses require_key names, so this is not
-	// a way to make a public listener do crypto on demand — and a hostile
-	// sender can already force one by sending a known key id with a bad MAC.
+	// Authentication is decided before the service bucket is chosen, so the
+	// bucket can be keyed by the identity that was actually *verified*.
+	//
+	// The cost of doing that — one CMAC, and possibly a crypto-NAK — is
+	// itself metered, from a budget of its own. Verification used to happen
+	// after the bucket was picked for optional keys, which meant a correctly
+	// authenticated client shared the unsigned client's bucket and spoofed
+	// traffic could exhaust its allowance (RA6X-028); and for required keys
+	// it happened before the limiter was consulted at all, so a bad-MAC
+	// flood produced one NAK per packet at arrival rate (RA6X-027). The
+	// separate keyspace means neither can spend the tokens a legitimate
+	// authenticated peer needs, and MAC verification still precedes trusting
+	// any key identity.
 	required := h.requiredKey(addr)
 	var replyKey *auth.Key
-	if required != 0 {
+	if required != 0 || mac != nil {
+		// Two different things are bounded here, and only one of them can
+		// be bounded per address without starving the very peer a spoofer
+		// is impersonating.
+		//
+		// *Work*: an address the configuration does not expect to
+		// authenticate gets its CMAC metered, so a public listener cannot
+		// be made to do crypto on demand. A require_key peer is always
+		// verified: its address is named in the configuration, and refusing
+		// to verify it because someone is flooding that address is exactly
+		// the starvation the separate keyspace exists to avoid.
+		//
+		// *Replies*: a crypto-NAK is emitted only while the crypto budget
+		// has a token, and only a failure spends one. That is what makes
+		// the NAK path bounded — it used to reply before the limiter was
+		// consulted at all, one NAK per bad MAC at arrival rate (RA6X-027).
+		if required == 0 {
+			if allowed, _ := h.limiter.allow(h.limiter.cryptoKey(addr), monotonicNow); !allowed {
+				c.rateLimited.Add(1)
+				h.publishClients(c)
+				return nil
+			}
+		}
 		var ok bool
 		replyKey, ok = h.verify(request, macOffset, mac)
 		if !ok {
 			c.badAuth.Add(1)
+			if required != 0 {
+				// Spend a token for the failure, and stay silent once the
+				// budget is out.
+				if allowed, _ := h.limiter.allow(h.limiter.cryptoKey(addr), monotonicNow); !allowed {
+					return nil
+				}
+			}
 			return h.cryptoNAK(&pkt, request, mac, receive)
 		}
-		if replyKey == nil || replyKey.ID != required {
+		if required != 0 && (replyKey == nil || replyKey.ID != required) {
 			// A missing trailer, or a good MAC under a key this prefix is
 			// not allowed to use. Neither is a key the server does not
 			// know, so there is nothing a NAK would tell the client that
@@ -226,16 +259,13 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 			return nil
 		}
 		c.kod.Add(1)
-		return h.reply(&pkt, receive, h.status(), ntp.KissRATE, nil, true)
-	}
-
-	if required == 0 {
-		var ok bool
-		replyKey, ok = h.verify(request, macOffset, mac)
-		if !ok {
-			c.badAuth.Add(1)
-			return h.cryptoNAK(&pkt, request, mac, receive)
-		}
+		// Sign the RATE to a client whose MAC and permitted identity were
+		// verified. An unsigned kiss is rejected by carillon's own
+		// authenticated client before it ever reads the kiss code, so two
+		// instances could not honour their own rate-control protocol
+		// (RA6X-029). Never signed on the strength of a claimed key id:
+		// replyKey is non-nil only after verification.
+		return h.reply(&pkt, receive, h.status(), ntp.KissRATE, replyKey, true)
 	}
 
 	// A request that survived the ACL, the limiter and authentication is

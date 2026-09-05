@@ -34,12 +34,16 @@ func enablePacketInfo(raw syscall.RawConn, network string) error {
 //
 // FreeBSD does not report it: MSG_BCAST and MSG_MCAST are NetBSD/OpenBSD
 // constants and appear in no FreeBSD header (x/sys/unix defines them for
-// netbsd and openbsd only). A datagram sent to the subnet's directed
-// broadcast address is therefore still answered here, and because
-// in_pcbbind_setup accepts a broadcast address as local (ifa_ifwithaddr
-// matches ifa_broadaddr) the IP_SENDSRCADDR on the reply is honoured — see
-// RF5X-003 in FIXES_FABLE5_XHIGH.md. The Linux side of that finding is
-// fixed in destination(); this side needs a different mechanism.
+// netbsd and openbsd only), so this cannot be the mechanism here.
+//
+// Directed broadcasts are caught instead by comparing the destination the
+// kernel reported against this host's own interface broadcast addresses —
+// see localBroadcasts in broadcast.go, which is what the listener consults
+// on every platform (RA6X-026). Without it a datagram sent to the subnet's
+// directed broadcast address was answered, and because in_pcbbind_setup
+// accepts a broadcast address as local (ifa_ifwithaddr matches
+// ifa_broadaddr) the IP_SENDSRCADDR on the reply was honoured, putting a
+// broadcast address on the reply's source.
 func martianReceiveFlags(int) bool { return false }
 
 // destination returns the address the client addressed the request to and the

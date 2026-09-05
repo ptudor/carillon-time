@@ -69,6 +69,11 @@ type udpListener struct {
 	// this socket, owned by the serve goroutine.
 	overflow     uint32
 	haveOverflow bool
+
+	// broadcasts recognises this host's directed broadcast addresses, which
+	// cannot be told from ordinary unicast addresses without the
+	// interfaces' own configuration.
+	broadcasts *localBroadcasts
 }
 
 // Listen opens every configured socket and prepares its receive timestamp and
@@ -139,7 +144,10 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 		return fail("server: listen %s: %w", addr, err)
 	}
 	actual := conn.LocalAddr().(*net.UDPAddr).AddrPort()
-	l := &udpListener{addr: actual, network: network, conn: conn, handler: h, log: log.With("listen", actual)}
+	l := &udpListener{
+		addr: actual, network: network, conn: conn, handler: h,
+		log: log.With("listen", actual), broadcasts: newLocalBroadcasts(),
+	}
 	l.recvBuffer = effective
 	return l, nil
 }
@@ -237,6 +245,7 @@ func (l *udpListener) serve(ctx context.Context) error {
 	buf := make([]byte, ntp.MaxPacketSize+1)
 	oob := make([]byte, serverOOBSize)
 	missingTimestampWarned := false
+	broadcastWarned := false
 	for {
 		n, oobn, flags, from, err := l.conn.ReadMsgUDPAddrPort(buf, oob)
 		if err != nil {
@@ -281,6 +290,19 @@ func (l *udpListener) serve(ctx context.Context) error {
 		if martian || martianDestination(dst) {
 			c.martian.Add(1)
 			continue
+		}
+		// A *directed* broadcast — 192.0.2.255 on a /24 — cannot be
+		// recognised from the address alone; it depends on the interface's
+		// own configuration. Linux reports the delivery in the flags word
+		// above, FreeBSD does not, so both are covered by comparing the
+		// destination against this host's broadcast addresses (RA6X-026).
+		// Exactly one martian outcome is counted for any one datagram.
+		if bcast, known := l.broadcasts.isBroadcast(dst, time.Now()); bcast {
+			c.martian.Add(1)
+			continue
+		} else if !known && !broadcastWarned {
+			l.log.Warn("cannot read the local interface addresses; directed broadcasts cannot be recognised")
+			broadcastWarned = true
 		}
 		response := l.handler.Handle(buf[:n], from, received, time.Now())
 		if response == nil {
