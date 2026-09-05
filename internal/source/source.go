@@ -66,6 +66,11 @@ type Info struct {
 	Kiss       uint64
 	NoKernelTS uint64
 
+	// Stale counts samples discarded because the clock was stepped (or a
+	// leap crossed) between the start of the sample and its use: the
+	// offset was measured against a clock reading that no longer holds.
+	Stale uint64
+
 	// Refclock is non-nil for a local reference clock. The pointed-to value
 	// is immutable and replaced with every Info snapshot.
 	Refclock *RefclockInfo

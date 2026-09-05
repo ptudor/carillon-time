@@ -96,7 +96,17 @@ type SourceState struct {
 	// Status and Distance are outputs of the last Select call.
 	Status   SelectStatus
 	Distance float64
+
+	// sinceStep counts the valid measurements this source has delivered
+	// since the last clock step. A second step must not rest on a single
+	// post-step sample, which is how a measurement computed before the
+	// first step used to step the clock a second time.
+	sinceStep int
 }
+
+// SinceStep reports how many valid measurements the source has delivered
+// since the last clock step invalidated its estimate.
+func (s *SourceState) SinceStep() int { return s.sinceStep }
 
 // apply records a measurement.
 func (s *SourceState) apply(m Measurement) {
@@ -109,6 +119,7 @@ func (s *SourceState) apply(m Measurement) {
 		return
 	}
 	s.Valid = true
+	s.sinceStep++
 	s.At = m.At
 	s.Updated = m.Now
 	s.Offset = m.Offset
@@ -128,6 +139,7 @@ func (s *SourceState) apply(m Measurement) {
 // invalidate discards the estimate (after a step) while keeping reach.
 func (s *SourceState) invalidate() {
 	s.Valid = false
+	s.sinceStep = 0
 }
 
 // RootDistance is the source's synchronization distance at time now

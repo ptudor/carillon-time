@@ -641,3 +641,58 @@ func TestGoodReplyClearsErrorThrottle(t *testing.T) {
 		t.Fatal("the first failure after recovery was not logged")
 	}
 }
+
+// TestGenerationBumpDiscardsReply covers RF5X-002 on the source side: when
+// the clock is stepped while an exchange is in flight, T1 and T4 lie on
+// opposite sides of the step, so both the offset and the delay are wrong by
+// the step amount. The reply must not enter the clock filter, and must not
+// be emitted as a valid measurement.
+func TestGenerationBumpDiscardsReply(t *testing.T) {
+	gen := new(atomic.Uint64)
+	gen.Store(1)
+	srv := newFakeServer(t, func(req ntp.Packet, _ []byte) []byte {
+		// The step happens between the request leaving and the reply
+		// arriving, exactly as it does when another source's measurement
+		// reaches the engine first.
+		gen.Add(1)
+		return reply(req, nil)
+	})
+	n := newPoller(t, srv, NTPConfig{Generation: gen.Load}, 0)
+	out, stop := run(t, n)
+	defer stop()
+
+	m := next(t, out)
+	if m.Valid {
+		t.Fatalf("a reply that spans a step must not be valid: %+v", m)
+	}
+	if m.Reach != 1 {
+		t.Fatalf("reach %08b: the server did answer, so it is reachable", m.Reach)
+	}
+	info := n.Info()
+	if info.Received != 0 {
+		t.Fatalf("received %d, want 0: the reply was not usable", info.Received)
+	}
+	if info.Stale != 1 {
+		t.Fatalf("stale %d, want 1", info.Stale)
+	}
+	if n.filter.Len() != 0 {
+		t.Fatalf("filter holds %d samples; the stale sample must stay out", n.filter.Len())
+	}
+}
+
+// TestGenerationStampedOnMeasurements checks the stamp itself: a measurement
+// carries the generation its sample was taken under, so the engine can tell
+// a pre-step one from a post-step one.
+func TestGenerationStampedOnMeasurements(t *testing.T) {
+	gen := new(atomic.Uint64)
+	gen.Store(7)
+	srv := newFakeServer(t, plain)
+	n := newPoller(t, srv, NTPConfig{Generation: gen.Load}, 0)
+	out, stop := run(t, n)
+	defer stop()
+
+	m := next(t, out)
+	if !m.Valid || m.Generation != 7 {
+		t.Fatalf("measurement %+v, want valid with generation 7", m)
+	}
+}

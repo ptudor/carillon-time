@@ -60,6 +60,13 @@ type NMEAConfig struct {
 	Sentences []string
 	BuildTime time.Time
 	Pulse     *PulseTracker
+
+	// Generation returns the engine's measurement epoch. It is captured
+	// with the arrival timestamp of a sentence's '$' and checked again
+	// before that sentence's offset enters the window, because the offset
+	// is the sentence's own time minus that arrival reading. Nil disables
+	// the check.
+	Generation func() uint64
 }
 
 // NMEA converts checksum-valid RMC/ZDA sentences into a robust GPS time
@@ -81,6 +88,8 @@ type NMEA struct {
 	line        []byte
 	lineWall    time.Time
 	lineMono    float64
+	lineGen     uint64
+	staleSeen   uint64
 	haveLine    bool
 	haveSlot    bool
 	slotAt      float64
@@ -145,6 +154,15 @@ func defaultAndValidateNMEA(cfg *NMEAConfig, clk clock.Clock) error {
 		return fmt.Errorf("refclock %q: nil clock", cfg.Name)
 	}
 	return nil
+}
+
+// generation reads the engine's measurement epoch, or 0 when the source was
+// built without one.
+func (n *NMEA) generation() uint64 {
+	if n.cfg.Generation == nil {
+		return 0
+	}
+	return n.cfg.Generation()
 }
 
 func (n *NMEA) Name() string      { return n.cfg.Name }
@@ -246,6 +264,7 @@ func (n *NMEA) consume(chunk []byte, wall time.Time, mono float64) []discipline.
 		case b == '$':
 			n.line = append(n.line[:0], b)
 			n.lineWall, n.lineMono, n.haveLine = wall, mono, true
+			n.lineGen = n.generation()
 		case !n.haveLine:
 			continue
 		case b == '\n' || b == '\r':
@@ -314,6 +333,16 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 	if !n.lastStamp.IsZero() && !s.Timestamp.After(n.lastStamp) {
 		return discipline.Measurement{}, false
 	}
+	if now := n.generation(); n.lineGen != 0 && now != n.lineGen {
+		// The clock was stepped between the '$' that fixed `arrival` and
+		// this sentence being complete, so the offset below would be wrong
+		// by the step. Drop the sentence and the window built with it.
+		n.staleSeen++
+		n.resetWindow()
+		n.updateInfo(func(i *source.Info, _ *source.RefclockInfo) { i.Stale++ })
+		n.log.Info("discarding a sentence that spans a clock step", "count", n.staleSeen, "generation", now)
+		return discipline.Measurement{}, false
+	}
 	n.lastStamp = s.Timestamp
 
 	offset := s.Timestamp.Sub(arrival).Seconds() + n.cfg.Offset
@@ -336,7 +365,8 @@ func (n *NMEA) acceptLine(line string, arrival time.Time, mono float64) (discipl
 
 	m := discipline.Measurement{
 		Source: n.cfg.Name, Now: mono, Reach: n.reach, Poll: nmeaPoll,
-		Valid: len(n.offsets) >= 4, At: mono, Offset: median, Delay: 0,
+		Generation: n.lineGen,
+		Valid:      len(n.offsets) >= 4, At: mono, Offset: median, Delay: 0,
 		Dispersion: sigma + precision, Jitter: math.Max(sigma, precision),
 		Leap: ntp.LeapNone, Stratum: 0, RefID: ntp.RefIDFromString("GPS"),
 		SourceRefID: ntp.RefIDFromString("GPS"), Precision: n.clk.Precision(), RefTime: s.Timestamp,
@@ -429,7 +459,10 @@ func (n *NMEA) resetWindow() {
 }
 
 func (n *NMEA) emptyMeasurement() discipline.Measurement {
-	return discipline.Measurement{Source: n.cfg.Name, Now: n.clk.Monotonic(), Reach: n.reach, Poll: nmeaPoll}
+	return discipline.Measurement{
+		Source: n.cfg.Name, Now: n.clk.Monotonic(), Reach: n.reach, Poll: nmeaPoll,
+		Generation: n.generation(),
+	}
 }
 
 func (n *NMEA) emit(ctx context.Context, out chan<- discipline.Measurement, m discipline.Measurement) bool {

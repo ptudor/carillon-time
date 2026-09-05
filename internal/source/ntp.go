@@ -85,6 +85,12 @@ type NTPConfig struct {
 	// is not the system clock (a simulated clock in tests): a kernel
 	// timestamp is only meaningful on the clock it was taken from.
 	NoKernelTimestamps bool
+
+	// Generation returns the engine's measurement epoch. The source reads
+	// it before T1 and again before the reply is filtered; a change means
+	// the clock was stepped mid-exchange and the sample is unusable. Nil
+	// disables the check and stamps every measurement 0.
+	Generation func() uint64
 }
 
 // NTP is an NTP client source polling one server.
@@ -120,6 +126,7 @@ type NTP struct {
 	tsWarned            bool
 	badAuthSeen         uint64
 	bogusSeen           uint64
+	staleSeen           uint64
 }
 
 // NewNTP validates cfg and returns a source ready to Run.
@@ -167,6 +174,15 @@ func NewNTP(cfg NTPConfig, clk clock.Clock, log *slog.Logger) (*NTP, error) {
 	return n, nil
 }
 
+// generation reads the engine's measurement epoch, or 0 when the source was
+// built without one.
+func (n *NTP) generation() uint64 {
+	if n.cfg.Generation == nil {
+		return 0
+	}
+	return n.cfg.Generation()
+}
+
 // Name implements Source.
 func (n *NTP) Name() string { return n.cfg.Name }
 
@@ -189,7 +205,7 @@ func (n *NTP) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 				return nil
 			}
 			n.miss("resolve failed")
-			if !n.emit(ctx, out, nil) {
+			if !n.emit(ctx, out, nil, n.generation()) {
 				return nil
 			}
 		case n.cfg.IBurst && n.reach == 0:
@@ -279,6 +295,7 @@ type sample struct {
 // pollOnce performs one exchange, updates state, and emits a measurement.
 // It returns false when ctx is done.
 func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) bool {
+	gen := n.generation()
 	res, err := exchange(ctx, exchangeParams{
 		addr:     n.addr,
 		key:      n.cfg.Key,
@@ -297,7 +314,14 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 	var bogus *bogusError
 	switch {
 	case err == nil:
-		s = n.hit(res)
+		if now := n.generation(); now != gen {
+			// The clock was stepped between T1 and T4: the offset and the
+			// delay are both wrong by the step. Reachability is real, so
+			// record the reply, but keep the sample out of the filter.
+			n.discardStale(now)
+		} else {
+			s = n.hit(res)
+		}
 	case ctx.Err() != nil:
 		return false
 	case errors.Is(err, errTimeout):
@@ -327,7 +351,28 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		n.updateInfo(func(i *Info) { i.LastError = err.Error() })
 		n.miss("error")
 	}
-	return n.emit(ctx, out, s)
+	if s == nil {
+		// Nothing was measured, so the measurement is valid under whatever
+		// generation is current now.
+		gen = n.generation()
+	}
+	return n.emit(ctx, out, s, gen)
+}
+
+// discardStale records a reply whose exchange spanned a clock step or leap
+// reset. It counts as reached — the server answered — but carries no usable
+// offset.
+func (n *NTP) discardStale(now uint64) {
+	n.reach = n.reach<<1 | 1
+	n.consecutiveTimeouts = 0
+	n.consecutiveMisses = 0
+	n.consecutiveErrs = 0
+	n.staleSeen++
+	if n.staleSeen == 1 || n.staleSeen%logEvery == 0 {
+		n.log.Info("discarding a reply that spans a clock step", "count", n.staleSeen, "generation", now)
+	}
+	// Received counts usable replies; this one is not one.
+	n.updateInfo(func(i *Info) { i.Stale++; i.Reach = n.reach; i.Poll = n.poll })
 }
 
 // handleKiss applies a kiss-o'-death reply.
@@ -437,12 +482,13 @@ func (n *NTP) miss(reason string) {
 }
 
 // emit sends the measurement for the poll that just completed.
-func (n *NTP) emit(ctx context.Context, out chan<- discipline.Measurement, s *sample) bool {
+func (n *NTP) emit(ctx context.Context, out chan<- discipline.Measurement, s *sample, gen uint64) bool {
 	m := discipline.Measurement{
-		Source: n.cfg.Name,
-		Now:    n.clk.Monotonic(),
-		Reach:  n.reach,
-		Poll:   n.poll,
+		Source:     n.cfg.Name,
+		Now:        n.clk.Monotonic(),
+		Reach:      n.reach,
+		Poll:       n.poll,
+		Generation: gen,
 	}
 	if s != nil {
 		pkt := s.out.Packet

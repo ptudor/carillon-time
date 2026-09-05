@@ -306,9 +306,14 @@ func (s *System) reselect(now float64) Result {
 	}
 	s.lastUsedAt = sel.System.At
 
-	u := s.loop.Update(sel.Offset, sel.System.Poll, now, s.state == StateSynced)
+	u := s.loop.Update(sel.Offset, sel.System.Poll, now, s.state == StateSynced, s.mayStep(&sel))
 	res.Actions = append(res.Actions, u.Actions...)
 	switch {
+	case u.Deferred:
+		// The offset warrants a step but there is not enough post-step
+		// evidence yet. Leave the loop untouched and wait for the next
+		// sample; lastUsedAt has already advanced, so it will run again.
+		return res
 	case u.PanicRefused:
 		res.Events = append(res.Events, Event{Kind: EventPanicRefused, Value: sel.Offset})
 		s.setState(StateUnsynced, &res)
@@ -351,6 +356,30 @@ func (s *System) reselect(now float64) Result {
 	s.lastUpdate = now
 	s.haveUpdate = true
 	return res
+}
+
+// mayStep decides whether the loop is allowed to step on this update. The
+// first step of a run is always allowed — it is how a host with no RTC gets
+// its clock — but a *further* step must rest on more than one post-step
+// sample. Without that, a measurement that was computed before the first step
+// and only dequeued afterwards steps the clock a second time by the same
+// amount, in the opposite direction. Two survivors that have both reported
+// since the step count as well: survivors agree by construction, having
+// passed the intersection.
+func (s *System) mayStep(sel *Selection) bool {
+	if s.loop.Steps == 0 {
+		return true
+	}
+	if sel.System.sinceStep >= 2 {
+		return true
+	}
+	fresh := 0
+	for _, src := range sel.Survivors {
+		if src.sinceStep >= 1 {
+			fresh++
+		}
+	}
+	return fresh >= 2
 }
 
 // Tick runs the per-second work: phase slewing and the holdover timeout.

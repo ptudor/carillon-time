@@ -27,6 +27,7 @@ type scripted struct {
 	script []discipline.Measurement
 	gap    time.Duration
 	fail   error
+	gen    func() uint64
 	resets atomic.Int32
 	sent   atomic.Int32
 }
@@ -38,6 +39,9 @@ func (s *scripted) Info() source.Info {
 func (s *scripted) Reset() { s.resets.Add(1) }
 func (s *scripted) Run(ctx context.Context, out chan<- discipline.Measurement) error {
 	for _, m := range s.script {
+		if s.gen != nil {
+			m.Generation = s.gen()
+		}
 		s.clk.Advance(64 * time.Second)
 		m.Source = s.name
 		m.Now = s.clk.Monotonic()
@@ -403,4 +407,79 @@ func (c *failingClock) SetFrequency(ppm float64) error {
 		return errors.New("simulated EPERM")
 	}
 	return c.Fake.SetFrequency(ppm)
+}
+
+// TestEngineStepsOnceWithTwoSources reproduces RF5X-002. Both sources report
+// the same +2 s offset. The engine steps on the first, tells every source to
+// reset, and then reads the second source's measurement — which was computed
+// against the pre-step clock and was already sitting in the channel. Without
+// a generation stamp it is applied, becomes the only valid candidate, and
+// steps the clock a second time by the same amount in the wrong direction.
+func TestEngineStepsOnceWithTwoSources(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC))
+	gen := new(atomic.Uint64)
+	script := []discipline.Measurement{good(2.0), good(0.001), good(0.0005), good(0.0002), good(0.0001)}
+	a := &scripted{name: "a", clk: clk, gap: 30 * time.Millisecond, gen: gen.Load, script: script}
+	b := &scripted{name: "b", clk: clk, gap: 30 * time.Millisecond, gen: gen.Load, script: script}
+	cfg := testConfig("",
+		SourceSpec{Source: a, Options: discipline.Options{Numbering: true}},
+		SourceSpec{Source: b, Options: discipline.Options{Numbering: true}})
+	cfg.Generation = gen
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.tick = 10 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	if err := e.Wait(ctx, func(s *Status) bool { return s.Updates >= 6 }); err != nil {
+		t.Fatalf("never reached six updates: %v (status %+v)", err, e.Status().Status)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if len(clk.Steps) != 1 {
+		t.Fatalf("steps applied to the clock: %v (want exactly one)", clk.Steps)
+	}
+	if got := gen.Load(); got != 2 {
+		t.Fatalf("generation %d, want 2 (one step)", got)
+	}
+	// Which of the two guards fired depends on the interleaving: if the
+	// second source had already read the old generation, its measurement is
+	// dropped as stale; if it had not yet sent, System.mayStep refuses a
+	// step that rests on one post-step sample. Either way there is one step.
+}
+
+// TestEngineDropsStaleMeasurement is the narrow version: a measurement whose
+// generation is behind the engine's must not reach the discipline at all.
+func TestEngineDropsStaleMeasurement(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	gen := new(atomic.Uint64)
+	cfg := testConfig("")
+	cfg.Generation = gen
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gen.Load(); got != 1 {
+		t.Fatalf("generation starts at %d, want 1", got)
+	}
+	gen.Store(4)
+	if !e.stale(discipline.Measurement{Source: "a", Generation: 3}) {
+		t.Fatal("a measurement from an older generation must be dropped")
+	}
+	if e.stale(discipline.Measurement{Source: "a", Generation: 4}) {
+		t.Fatal("a current measurement must not be dropped")
+	}
+	if e.stale(discipline.Measurement{Source: "a", Generation: 0}) {
+		t.Fatal("an unstamped measurement must not be dropped")
+	}
+	if e.staleDrops["a"] != 1 {
+		t.Fatalf("stale drops %d, want 1", e.staleDrops["a"])
+	}
 }

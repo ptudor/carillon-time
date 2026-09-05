@@ -77,6 +77,7 @@ type UpdateResult struct {
 	Actions      []Action
 	Stepped      bool
 	Ignored      bool // popcorn spike
+	Deferred     bool // a step was wanted but the caller withheld permission
 	PanicRefused bool
 	Mu           float64 // seconds since the previous update
 }
@@ -154,7 +155,13 @@ func (l *Loop) stepAllowed() bool {
 
 // Update feeds the loop a new system offset measured with the given poll
 // exponent at monotonic time now. synced enables the popcorn spike gate.
-func (l *Loop) Update(offset float64, poll int8, now float64, synced bool) UpdateResult {
+//
+// mayStep is the caller's veto on the step policy: the System withholds it
+// when a step would rest on a single post-step sample (see reselect). A
+// withheld step is reported as Deferred and changes no loop state at all —
+// it consumes neither the step budget nor an update — so the decision is
+// simply retaken when more evidence arrives.
+func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bool) UpdateResult {
 	var u UpdateResult
 	abs := math.Abs(offset)
 
@@ -164,9 +171,17 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced bool) Updat
 			u.PanicRefused = true
 			return u
 		}
+		if !mayStep {
+			u.Deferred = true
+			return u
+		}
 		return l.step(offset, now)
 	}
 	if abs > l.cfg.StepThreshold && l.stepAllowed() {
+		if !mayStep {
+			u.Deferred = true
+			return u
+		}
 		return l.step(offset, now)
 	}
 

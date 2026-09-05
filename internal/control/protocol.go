@@ -242,6 +242,7 @@ type Source struct {
 	Bogus      uint64    `json:"bogus"`
 	BadAuth    uint64    `json:"bad_auth"`
 	Kiss       uint64    `json:"kiss"`
+	Stale      uint64    `json:"stale"`
 	NoKernelTS uint64    `json:"no_kernel_timestamp"`
 	Denied     bool      `json:"denied"`
 }
@@ -305,6 +306,7 @@ func SourcesOf(st *engine.Status) []Source {
 			line.LastError = info.LastError
 			line.Sent, line.Received, line.Timeouts = info.Sent, info.Received, info.Timeouts
 			line.Bogus, line.BadAuth, line.Kiss = info.Bogus, info.BadAuth, info.Kiss
+			line.Stale = info.Stale
 			line.NoKernelTS = info.NoKernelTS
 			line.Denied = info.Denied
 			line.Reach = info.Reach
