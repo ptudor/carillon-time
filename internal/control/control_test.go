@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,5 +249,57 @@ func TestFreshEngineOmitsNeverHappenedTimestamps(t *testing.T) {
 	}
 	if s := string(raw); strings.Contains(s, "0001-01-01") {
 		t.Fatalf("a year-1 timestamp reached the wire: %s", s)
+	}
+}
+
+// TestShutdownUnreadWaitsync covers RF5X-033. A waitsync with no
+// timeout clears the connection's deadline, so a client that connected, asked
+// for one, and then stopped reading used to hold the handler — and through
+// it Serve, and through that the daemon's shutdown — open indefinitely.
+func TestShutdownUnreadWaitsync(t *testing.T) {
+	path := socketPath(t)
+	eng := newEngine(t) // no sources, so it never reaches SYNCED
+	srv, err := Listen(path, eng, nil, "v-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte(`{"command":"waitsync","timeout":0}` + "\n")); err != nil {
+		cancel()
+		<-done
+		t.Fatal(err)
+	}
+	// The accept loop is sequential, so a second request that completes
+	// proves the first connection was already accepted and handed to a
+	// handler that is now blocked in Wait.
+	if resp, err := Call(ctx, path, Request{Command: CmdVersion}); err != nil || resp.Version != "v-test" {
+		cancel()
+		<-done
+		t.Fatalf("second request: %v %+v", err, resp)
+	}
+
+	// The client never reads. Shutdown must still complete.
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("Serve did not return within 6 s with an unread waitsync connection open")
+	}
+	if elapsed := time.Since(start); elapsed > 6*time.Second {
+		t.Fatalf("shutdown took %v", elapsed)
 	}
 }

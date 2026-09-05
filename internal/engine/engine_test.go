@@ -29,8 +29,12 @@ type scripted struct {
 	gap    time.Duration
 	fail   error
 	gen    func() uint64
-	resets atomic.Int32
-	sent   atomic.Int32
+	// failOnce makes fail apply to the first Run only, so a test can watch
+	// the engine restart the source and see it stay up.
+	failOnce bool
+	runs     atomic.Int32
+	resets   atomic.Int32
+	sent     atomic.Int32
 }
 
 func (s *scripted) Name() string { return s.name }
@@ -39,6 +43,7 @@ func (s *scripted) Info() source.Info {
 }
 func (s *scripted) Reset() { s.resets.Add(1) }
 func (s *scripted) Run(ctx context.Context, out chan<- discipline.Measurement) error {
+	run := s.runs.Add(1)
 	for _, m := range s.script {
 		if s.gen != nil {
 			m.Generation = s.gen()
@@ -59,7 +64,7 @@ func (s *scripted) Run(ctx context.Context, out chan<- discipline.Measurement) e
 			return nil
 		}
 	}
-	if s.fail != nil {
+	if s.fail != nil && (!s.failOnce || run == 1) {
 		return s.fail
 	}
 	<-ctx.Done()
@@ -302,25 +307,53 @@ func TestEngineRejectsBadDriftFile(t *testing.T) {
 	}
 }
 
-func TestEngineSourceExitRemovesIt(t *testing.T) {
+// TestEngineSourceExitMarksItUnreachableAndRestarts covers RF5X-032. A source
+// whose goroutine returns used to be deleted outright: it vanished from
+// carillonctl sources, from /api/v1/status and from every per-source metric
+// series — Prometheus sees the series disappear rather than reach drop to
+// zero — and nothing ever brought it back. DESIGN.md §14 promises the
+// opposite: marked unreachable, reopen retried with backoff.
+func TestEngineSourceExitMarksItUnreachableAndRestarts(t *testing.T) {
 	clk := clock.NewFake(time.Now())
 	src := &scripted{name: "dying", clk: clk, gap: 5 * time.Millisecond,
-		script: []discipline.Measurement{good(0.001), good(0.001), good(0.001)}, fail: errors.New("port vanished")}
+		script:   []discipline.Measurement{good(0.001), good(0.001), good(0.001)},
+		fail:     errors.New("port vanished"),
+		failOnce: true}
 	e, err := New(testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}}), clk, quietLog())
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.tick = 10 * time.Millisecond
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- e.Run(ctx) }()
-	if err := e.Wait(ctx, func(s *Status) bool { return len(s.Sources) == 0 }); err != nil {
-		t.Fatalf("source never removed: %v", err)
+
+	unreachable := func(s *Status) bool {
+		if len(s.Sources) != 1 || s.Sources[0].Name != "dying" {
+			return false
+		}
+		info, ok := s.Infos["dying"]
+		return ok && s.Sources[0].Reach == 0 && info.Reach == 0 && info.LastError == "port vanished"
+	}
+	if err := e.Wait(ctx, unreachable); err != nil {
+		t.Fatalf("source never reported unreachable: %v (status %+v)", err, e.Status().Status)
 	}
 	if st := e.Status(); st.State != discipline.StateHoldover {
 		t.Fatalf("losing the only source must enter holdover, got %v", st.State)
 	}
+
+	// The first retry is one second away; the source runs its script again.
+	if err := e.Wait(ctx, func(s *Status) bool { return src.sent.Load() > 3 }); err != nil {
+		t.Fatalf("source was never restarted: %v (sent %d)", err, src.sent.Load())
+	}
+	if err := e.Wait(ctx, func(s *Status) bool {
+		info, ok := s.Infos["dying"]
+		return ok && info.LastError == "" && info.Reach != 0
+	}); err != nil {
+		t.Fatalf("the restarted source never cleared its error: %v", err)
+	}
+
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run: %v", err)

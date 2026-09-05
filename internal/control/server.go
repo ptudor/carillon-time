@@ -21,6 +21,10 @@ import (
 // maxRequest bounds a request line; anything larger is not a request.
 const maxRequest = 4096
 
+// replyWriteTimeout bounds how long a reply may take to reach a client that
+// has stopped reading, so one such client cannot hold shutdown open.
+const replyWriteTimeout = 5 * time.Second
+
 // ErrInUse is returned by Listen when another daemon holds the socket.
 var ErrInUse = errors.New("control: socket is in use by another carillon")
 
@@ -151,6 +155,11 @@ func (s *Server) reply(conn net.Conn, resp Response) {
 		return
 	}
 	b = append(b, '\n')
+	// A write deadline of its own. A waitsync with no timeout clears the
+	// connection's deadline entirely, so a client that asked for one and
+	// then stopped reading would hold this handler — and the daemon's
+	// shutdown wait — open indefinitely once the socket buffer filled.
+	_ = conn.SetWriteDeadline(time.Now().Add(replyWriteTimeout))
 	if _, err := conn.Write(b); err != nil {
 		s.log.Debug("control: writing response", "error", err)
 	}
