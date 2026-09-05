@@ -275,3 +275,46 @@ func TestPPSTimeoutRePrimesWindowWhileUnreachable(t *testing.T) {
 		t.Fatalf("window kept while unreachable: %d samples", len(p.window))
 	}
 }
+
+// TestPPSSequenceRestartIsNotFourBillionGaps covers RF5X-026. The sequence
+// delta is unsigned, so a device-side counter restart — ldattach restarting,
+// /dev/ppsN recreated under the same name, another process issuing
+// PPS_IOC_DESTROY/CREATE on the same tty — read as about 2^32 missed pulses
+// and added that to a monotonic Gaps counter that could never look right
+// again, while overflowing the emit cadence.
+func TestPPSSequenceRestartIsNotFourBillionGaps(t *testing.T) {
+	p, clk := testPPS(t)
+	base := time.Unix(1_800_000_000, 0)
+	for i := 1; i <= 1000; i++ {
+		clk.Advance(time.Second)
+		p.accept(pps.Sample{Sequence: uint32(i), Time: base.Add(time.Duration(i) * time.Second)})
+	}
+	gaps := p.Info().Refclock.Gaps
+	glitches := p.Info().Refclock.Glitches
+
+	// The device comes back with its counter at 5.
+	clk.Advance(time.Second)
+	p.accept(pps.Sample{Sequence: 5, Time: base.Add(1001 * time.Second)})
+	info := p.Info().Refclock
+	if info.Gaps != gaps {
+		t.Fatalf("gaps %d -> %d: a counter restart is not a gap", gaps, info.Gaps)
+	}
+	if info.Glitches != glitches+1 {
+		t.Fatalf("glitches %d -> %d, want one more", glitches, info.Glitches)
+	}
+	if len(p.window) != 0 || p.slots != 0 {
+		t.Fatalf("window kept across a counter restart: %d samples, %d slots", len(p.window), p.slots)
+	}
+
+	// The next pulses form a fresh train and are accepted normally.
+	for i := 6; i <= 12; i++ {
+		clk.Advance(time.Second)
+		p.accept(pps.Sample{Sequence: uint32(i), Time: base.Add(time.Duration(1001+i-5) * time.Second)})
+	}
+	if p.Info().Refclock.Gaps != gaps {
+		t.Fatalf("gaps after the restart: %d, want %d", p.Info().Refclock.Gaps, gaps)
+	}
+	if len(p.window) != 7 {
+		t.Fatalf("window re-primed to %d samples, want 7", len(p.window))
+	}
+}

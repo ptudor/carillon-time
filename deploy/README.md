@@ -272,8 +272,8 @@ from another host:
 
 ```sh
 carillonctl waitsync 30
-carillon query server.example.net
-carillon query -keys /etc/carillon/keys -key 1 server.example.net
+carillon query server.invalid
+carillon query -keys /etc/carillon/keys -key 1 server.invalid
 ```
 
 Use the platform-appropriate keys path on FreeBSD. An upgrade is an atomic

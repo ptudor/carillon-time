@@ -550,9 +550,14 @@ Implemented as in RFC 5905 §11.2, no deviations:
   tolerating `f` falsetickers where `f < n/2`. Candidates outside are
   falsetickers and are logged at WARN the first time they become one.
 - **Cluster:** repeatedly discard the survivor with the largest *selection
-  jitter* (RMS distance to the other survivors) while it exceeds that
-  survivor's own jitter and more than `min_survivors` (default 1; set 3 on a
-  host with many upstreams) remain.
+  jitter* (RMS distance to the other survivors) while it exceeds the smallest
+  filter jitter among the survivors, and while more than **3** remain. Three
+  is RFC 5905's `NMIN` (ntpd's `tos minclock`), a fixed floor, not a knob:
+  clustering never reduces the set below it. `min_survivors` is a different
+  thing — the number of survivors required before a system source is declared
+  at all (default 1; set higher on a host with many upstreams, but never
+  above the number of sources actually configured, or the daemon will never
+  synchronize).
 - **Combine:** weighted mean with weights `1/λ`; `ψ_sys` is the weighted RMS
   of survivor offsets around the mean.
 - **prefer:** if a `prefer` source is among the survivors, `θ_sys` is *that
@@ -564,9 +569,17 @@ Implemented as in RFC 5905 §11.2, no deviations:
   `θ_sys`. This is the ntpd "PPS peer" behaviour and is what makes the home
   host stratum 1 with a `GPS`/`PPS` refid.
 
-The **system source** (the survivor with the smallest `λ`, or the prefer/PPS
-source) supplies stratum (+1), refid, root delay (+δ), root dispersion, leap
-bits, and reference time for the server variables (§7.3).
+The **system source** is the prefer/PPS source when there is one, and
+otherwise the survivor ranked first by stratum then by `λ`. It supplies
+stratum (+1), refid, root delay (+δ), root dispersion, leap bits, and
+reference time for the server variables (§7.3).
+
+Because a qualified PPS source has stratum 0 and a tiny `λ`, it sorts first
+and is therefore the system source **whether or not it is marked `prefer`**;
+`prefer` only additionally makes `θ_sys` its offset alone rather than the
+distance-weighted mean. This matches ntpd's treatment of a refclock and is
+intended: a locked, qualified, agreeing pulse is the best clock on the host.
+A PPS that should be visible but never used is configured `noselect`.
 
 ### 6.4 Loop
 
@@ -1373,7 +1386,12 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   residual phase is abandoned rather than slewed out: it can take arbitrarily
   long, and exit never steps. If the fatal error that ended the run *was* a
   refused frequency change, the restore is skipped rather than repeated.
-- **No `SIGHUP` reload** in v1. Restart.
+- **No `SIGHUP` reload** in v1. Restart. `SIGHUP` is *ignored* rather than
+  left unhandled — Go's default action for an unhandled signal is to
+  terminate the process at once, so an operator sending HUP expecting a
+  reload, or a terminal hangup on an interactively started instance, would
+  get an abrupt exit with no drift-file write and the slew transient left in
+  the kernel. The first HUP logs a line saying so.
 
 GC and scheduling jitter are not on the accuracy path: PPS and RX timestamps
 are taken in the kernel; only TX timestamps and the once-per-second slew

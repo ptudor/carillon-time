@@ -126,6 +126,7 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 	}
 	freq, known, origin := initialFrequency(cfg.DriftFile, clk, log)
 	log.Info("initial frequency", "ppm", freq, "known", known, "from", origin)
+	sweepDriftTemps(cfg.DriftFile, clk.Now(), log)
 
 	gen := cfg.Generation
 	if gen == nil {
@@ -197,6 +198,33 @@ func readDrift(path string) (float64, error) {
 		return 0, fmt.Errorf("%s: %v ppm is outside ±%v", path, v, discipline.MaxFrequency)
 	}
 	return v, nil
+}
+
+// sweepDriftTemps removes leftover drift temporaries. writeDrift is atomic —
+// write, fsync, rename — but a SIGKILL or a power cut between CreateTemp and
+// Rename leaves a .drift-NNNN file behind, and nothing else ever removes one.
+// A year of unclean shutdowns leaves clutter in the state directory that
+// -check cannot explain. Only files older than a minute are removed, so a
+// concurrent write by another instance is left alone.
+func sweepDriftTemps(path string, now time.Time, log *slog.Logger) {
+	if path == "" {
+		return
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".drift-*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		info, err := os.Stat(m)
+		if err != nil || now.Sub(info.ModTime()) < time.Minute {
+			continue
+		}
+		if err := os.Remove(m); err != nil {
+			log.Debug("cannot remove a stale drift temporary", "path", m, "error", err)
+			continue
+		}
+		log.Debug("removed a stale drift temporary", "path", m)
+	}
 }
 
 // writeDrift persists the frequency atomically (write, fsync, rename).

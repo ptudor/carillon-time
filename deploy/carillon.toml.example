@@ -242,7 +242,10 @@ iburst  = true
 
 # --- Discipline -------------------------------------------------------------
 [discipline]
-# Smallest number of sources the cluster algorithm keeps.
+# Survivors required before a system source is declared at all. This is not
+# the cluster algorithm's floor -- that is a fixed 3 (RFC 5905 NMIN) and is
+# not configurable. Never set this above the number of sources configured, or
+# the daemon will never synchronize.
 min_survivors = 1
 # Seconds to coast on the held frequency with no source before reporting
 # unsynchronized.

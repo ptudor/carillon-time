@@ -194,8 +194,8 @@ func printTracking(t *control.Tracking) {
 	if t.PreferLost {
 		fmt.Fprintf(w, "Prefer\tLOST\n")
 	}
-	if !t.RefTime.IsZero() {
-		fmt.Fprintf(w, "Reference time\t%s (%s ago)\n", t.RefTime.UTC().Format(time.RFC3339Nano), t.Now.Sub(t.RefTime).Round(time.Millisecond))
+	if t.RefTime != nil {
+		fmt.Fprintf(w, "Reference time\t%s (%s ago)\n", t.RefTime.UTC().Format(time.RFC3339Nano), t.Now.Sub(*t.RefTime).Round(time.Millisecond))
 	}
 	fmt.Fprintf(w, "System time\t%s\n", t.Now.UTC().Format(time.RFC3339Nano))
 	fmt.Fprintf(w, "Last offset\t%s\n", seconds(t.Offset, true))
@@ -210,7 +210,7 @@ func printTracking(t *control.Tracking) {
 	fmt.Fprintf(w, "Root dispersion\t%s\n", seconds(t.RootDisp, false))
 	fmt.Fprintf(w, "Leap\t%s\n", t.Leap)
 	fmt.Fprintf(w, "Leap source\t%s\n", t.LeapSource)
-	if !t.LeapExpiry.IsZero() {
+	if t.LeapExpiry != nil {
 		fmt.Fprintf(w, "Leap file expires\t%s\n", t.LeapExpiry.UTC().Format(time.RFC3339))
 	}
 	fmt.Fprintf(w, "Updates / steps\t%d / %d\n", t.Updates, t.Steps)

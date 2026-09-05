@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"syscall"
@@ -127,7 +128,11 @@ func readLine(r *bufio.Reader, limit int) ([]byte, error) {
 			return out, nil
 		}
 		if !errors.Is(err, bufio.ErrBufferFull) {
-			if len(out) > 0 && err.Error() == "EOF" {
+			// A complete but unterminated response is still a response.
+			// Comparing the error text worked only for a bare io.EOF; net
+			// wraps read errors in *net.OpError on some paths, which turned
+			// a good reply into "reading response: EOF".
+			if len(out) > 0 && errors.Is(err, io.EOF) {
 				return out, nil
 			}
 			return nil, err

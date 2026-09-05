@@ -320,8 +320,8 @@ From an allowed peer, exercise the applicable unauthenticated and
 authenticated paths:
 
 ```sh
-carillon query server.example.net
-carillon query -keys /path/to/keys -key 1 server.example.net
+carillon query server.invalid
+carillon query -keys /path/to/keys -key 1 server.invalid
 ```
 
 Then verify that exactly one process owns UDP/123, the former time service is

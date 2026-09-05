@@ -66,20 +66,20 @@ type Refclock struct {
 	DisagreesWith string  `json:"disagrees_with,omitempty"`
 	Disagreement  float64 `json:"disagreement_seconds,omitempty"`
 
-	WindowSamples  int       `json:"window_samples"`
-	WindowJitter   float64   `json:"window_jitter"`
-	IntervalJitter float64   `json:"interval_jitter"`
-	LastInterval   float64   `json:"last_interval"`
-	LastPulse      time.Time `json:"last_pulse,omitempty"`
-	LastOffset     float64   `json:"last_offset"`
-	FixKnown       bool      `json:"fix_known"`
-	FixValid       bool      `json:"fix_valid"`
-	FixQuality     int       `json:"fix_quality"`
-	Satellites     int       `json:"satellites"`
-	Sentence       string    `json:"sentence,omitempty"`
-	LastSentence   time.Time `json:"last_sentence,omitempty"`
-	MeasuredLag    float64   `json:"measured_lag_seconds"`
-	LagSamples     int       `json:"lag_samples"`
+	WindowSamples  int        `json:"window_samples"`
+	WindowJitter   float64    `json:"window_jitter"`
+	IntervalJitter float64    `json:"interval_jitter"`
+	LastInterval   float64    `json:"last_interval"`
+	LastPulse      *time.Time `json:"last_pulse,omitempty"`
+	LastOffset     float64    `json:"last_offset"`
+	FixKnown       bool       `json:"fix_known"`
+	FixValid       bool       `json:"fix_valid"`
+	FixQuality     int        `json:"fix_quality"`
+	Satellites     int        `json:"satellites"`
+	Sentence       string     `json:"sentence,omitempty"`
+	LastSentence   *time.Time `json:"last_sentence,omitempty"`
+	MeasuredLag    float64    `json:"measured_lag_seconds"`
+	LagSamples     int        `json:"lag_samples"`
 
 	Samples  uint64 `json:"samples"`
 	Timeouts uint64 `json:"timeouts"`
@@ -189,6 +189,11 @@ func counterStatsOf(c ntpserver.CounterSnapshot) CounterStats {
 	return out
 }
 
+// optionalTime is how every "has not happened yet" timestamp is carried.
+// encoding/json never omits a zero struct, so a plain time.Time with
+// `omitempty` serialises as "0001-01-01T00:00:00Z" — which a client written
+// against the documented "absent" convention parses as a real instant two
+// thousand years ago.
 func optionalTime(t time.Time) *time.Time {
 	if t.IsZero() {
 		return nil
@@ -196,29 +201,37 @@ func optionalTime(t time.Time) *time.Time {
 	return &t
 }
 
+// timeOrZero is the inverse, for consumers that want a value.
+func timeOrZero(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
 // Tracking is the system-level state.
 type Tracking struct {
-	State        string    `json:"state"`
-	Stratum      uint8     `json:"stratum"`
-	RefID        string    `json:"refid"`
-	Leap         string    `json:"leap"`
-	LeapSource   string    `json:"leap_source"`
-	LeapExpiry   time.Time `json:"leapfile_expires,omitempty"`
-	RefTime      time.Time `json:"reftime"`
-	Now          time.Time `json:"now"`
-	Uptime       float64   `json:"uptime_seconds"`
-	Offset       float64   `json:"offset"`
-	Frequency    float64   `json:"frequency_ppm"`
-	FreqKnown    bool      `json:"frequency_known"`
-	Jitter       float64   `json:"jitter"`
-	Pending      float64   `json:"pending_slew"`
-	RootDelay    float64   `json:"root_delay"`
-	RootDisp     float64   `json:"root_dispersion"`
-	SystemSource string    `json:"system_source,omitempty"`
-	PreferLost   bool      `json:"prefer_lost"`
-	Updates      int       `json:"updates"`
-	Steps        int       `json:"steps"`
-	Version      string    `json:"version"`
+	State        string     `json:"state"`
+	Stratum      uint8      `json:"stratum"`
+	RefID        string     `json:"refid"`
+	Leap         string     `json:"leap"`
+	LeapSource   string     `json:"leap_source"`
+	LeapExpiry   *time.Time `json:"leapfile_expires,omitempty"`
+	RefTime      *time.Time `json:"reftime,omitempty"`
+	Now          time.Time  `json:"now"`
+	Uptime       float64    `json:"uptime_seconds"`
+	Offset       float64    `json:"offset"`
+	Frequency    float64    `json:"frequency_ppm"`
+	FreqKnown    bool       `json:"frequency_known"`
+	Jitter       float64    `json:"jitter"`
+	Pending      float64    `json:"pending_slew"`
+	RootDelay    float64    `json:"root_delay"`
+	RootDisp     float64    `json:"root_dispersion"`
+	SystemSource string     `json:"system_source,omitempty"`
+	PreferLost   bool       `json:"prefer_lost"`
+	Updates      int        `json:"updates"`
+	Steps        int        `json:"steps"`
+	Version      string     `json:"version"`
 }
 
 // Source is one source's line: the discipline's view merged with the
@@ -239,19 +252,19 @@ type Source struct {
 	RefID      string  `json:"refid"`
 	Leap       string  `json:"leap"`
 
-	Address    string    `json:"address,omitempty"`
-	Resolved   string    `json:"resolved,omitempty"`
-	LastRx     time.Time `json:"last_rx,omitempty"`
-	LastError  string    `json:"last_error,omitempty"`
-	Sent       uint64    `json:"sent"`
-	Received   uint64    `json:"received"`
-	Timeouts   uint64    `json:"timeouts"`
-	Bogus      uint64    `json:"bogus"`
-	BadAuth    uint64    `json:"bad_auth"`
-	Kiss       uint64    `json:"kiss"`
-	Stale      uint64    `json:"stale"`
-	NoKernelTS uint64    `json:"no_kernel_timestamp"`
-	Denied     bool      `json:"denied"`
+	Address    string     `json:"address,omitempty"`
+	Resolved   string     `json:"resolved,omitempty"`
+	LastRx     *time.Time `json:"last_rx,omitempty"`
+	LastError  string     `json:"last_error,omitempty"`
+	Sent       uint64     `json:"sent"`
+	Received   uint64     `json:"received"`
+	Timeouts   uint64     `json:"timeouts"`
+	Bogus      uint64     `json:"bogus"`
+	BadAuth    uint64     `json:"bad_auth"`
+	Kiss       uint64     `json:"kiss"`
+	Stale      uint64     `json:"stale"`
+	NoKernelTS uint64     `json:"no_kernel_timestamp"`
+	Denied     bool       `json:"denied"`
 }
 
 // TrackingOf converts an engine snapshot.
@@ -262,8 +275,8 @@ func TrackingOf(st *engine.Status) *Tracking {
 		RefID:        st.RefID.String(),
 		Leap:         st.Leap.String(),
 		LeapSource:   st.LeapSource,
-		LeapExpiry:   st.LeapExpiry,
-		RefTime:      st.RefTime,
+		LeapExpiry:   optionalTime(st.LeapExpiry),
+		RefTime:      optionalTime(st.RefTime),
 		Now:          st.Now,
 		Uptime:       st.Uptime.Seconds(),
 		Offset:       st.Offset,
@@ -309,7 +322,7 @@ func SourcesOf(st *engine.Status) []Source {
 			if info.Resolved.IsValid() {
 				line.Resolved = info.Resolved.String()
 			}
-			line.LastRx = info.LastRx
+			line.LastRx = optionalTime(info.LastRx)
 			line.LastError = info.LastError
 			line.Sent, line.Received, line.Timeouts = info.Sent, info.Received, info.Timeouts
 			line.Bogus, line.BadAuth, line.Kiss = info.Bogus, info.BadAuth, info.Kiss
@@ -350,10 +363,10 @@ func RefclocksOf(st *engine.Status) []Refclock {
 			DisagreesWith: s.DisagreesWith, Disagreement: s.Disagreement,
 			WindowSamples: r.WindowSamples, WindowJitter: r.WindowJitter,
 			IntervalJitter: r.IntervalJitter, LastInterval: r.LastInterval,
-			LastPulse: r.LastPulse, LastOffset: r.LastOffset, Samples: r.Samples, Timeouts: r.Timeouts,
+			LastPulse: optionalTime(r.LastPulse), LastOffset: r.LastOffset, Samples: r.Samples, Timeouts: r.Timeouts,
 			Gaps: r.Gaps, Glitches: r.Glitches, Spikes: r.Spikes,
 			FixKnown: r.FixKnown, FixValid: r.FixValid, FixQuality: r.FixQuality, Satellites: r.Satellites,
-			Sentence: r.Sentence, LastSentence: r.LastSentence,
+			Sentence: r.Sentence, LastSentence: optionalTime(r.LastSentence),
 			MeasuredLag: r.MeasuredLag, LagSamples: r.LagSamples,
 		})
 	}

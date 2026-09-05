@@ -363,6 +363,22 @@ func runDaemon(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// SIGHUP is deliberately not a reload (DESIGN.md D11), but Go's default
+	// action for an unhandled signal is to terminate the process at once:
+	// no drift file, no base frequency restored to the kernel, sockets
+	// closed by the OS. An operator sending HUP to ask for a reload, or a
+	// terminal hangup on an interactively started instance, would get that.
+	// Ignore it and say so the first time.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go func() {
+		if _, ok := <-hup; ok {
+			log.Warn("SIGHUP ignored: carillon has no reload; restart it to pick up a changed configuration")
+		}
+		for range hup {
+		}
+	}()
 	statsCtx, stopStats := context.WithCancel(context.Background())
 	defer stopStats()
 	auxErr := make(chan error, 3)

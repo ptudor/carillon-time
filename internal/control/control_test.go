@@ -2,11 +2,13 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,5 +213,40 @@ func TestRefclockConversion(t *testing.T) {
 	}
 	if !rs[1].Qualified || !rs[1].Locked || !rs[1].FixValid || rs[1].Satellites != 9 || rs[1].LagSamples != 8 {
 		t.Fatalf("NMEA refclock: %+v", rs[1])
+	}
+}
+
+// TestFreshEngineOmitsNeverHappenedTimestamps covers RF5X-015.
+// encoding/json never omits a zero struct, so `omitempty` on a time.Time did
+// nothing: a source that had never received a reply serialised
+// "last_rx":"0001-01-01T00:00:00Z", which a client written against the
+// documented "absent" convention parses as a real instant in year 1.
+func TestFreshEngineOmitsNeverHappenedTimestamps(t *testing.T) {
+	eng := newEngine(t)
+	st := eng.Status()
+	payload := struct {
+		Tracking  *Tracking  `json:"tracking"`
+		Sources   []Source   `json:"sources"`
+		Refclocks []Refclock `json:"refclocks"`
+	}{TrackingOf(st), SourcesOf(st), RefclocksOf(st)}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	tracking, ok := decoded["tracking"].(map[string]any)
+	if !ok {
+		t.Fatalf("tracking missing from %s", raw)
+	}
+	for _, key := range []string{"reftime", "leapfile_expires"} {
+		if v, present := tracking[key]; present {
+			t.Errorf("%q present on a fresh engine as %v; it has not happened yet", key, v)
+		}
+	}
+	if s := string(raw); strings.Contains(s, "0001-01-01") {
+		t.Fatalf("a year-1 timestamp reached the wire: %s", s)
 	}
 }

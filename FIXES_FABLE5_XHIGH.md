@@ -466,3 +466,142 @@ is unchanged.
 offset gives ≈35 ms of jitter (0.100/√8), that a step leaves the estimate
 untouched, that the update after it does too, and that ordinary updates still
 move it.
+
+## RF5X-013 — NMEA reader would spin on a zero-byte read — FIXED
+
+**Changed.** `serial.ReadTimeout` reports `n == 0 && err == nil` as an
+`io.EOF` wrapped in a `serial:` error, so `NMEA.Run` takes its reopen path
+instead of looping straight back into `poll(2)`, finding the descriptor
+readable-at-EOF, and spinning at 100 % CPU with nothing in the log.
+
+**Files.** `internal/serial/read_unix.go`,
+`internal/serial/read_unix_test.go` (new).
+
+**Verification.** COMPILES, not run here. `TestReadTimeoutReportsEOF` uses
+`os.Pipe()` with the write end closed and asserts the result is an `io.EOF`
+and not `ErrTimeout`. It is `//go:build linux || freebsd` (the file it tests
+is), so it cannot run on this darwin host; `GOOS=linux go test -c` and
+`GOOS=freebsd go vet` pass. The USB-unplug check remains a target-host step.
+
+## RF5X-014 — SIGHUP terminates the daemon — FIXED
+
+**Changed.** `main` installs a handler that ignores `SIGHUP` and logs once at
+WARN saying carillon has no reload and a restart is what picks up a changed
+configuration. Go's default for an unhandled signal is immediate termination:
+no drift-file write, no base frequency restored (RF5X-004), sockets closed by
+the OS. `SIGTERM`/`SIGINT` handling is unchanged.
+
+**Files.** `cmd/carillon/main.go`, `DESIGN.md` §12.
+
+**Verification.** PASS (build and suite). The signal itself is not exercised
+by a unit test — sending a real signal to the test process would be a hard
+rule 1 hazard — the handler is three lines and `signal.Ignore` semantics are
+the standard library's.
+
+## RF5X-015 — omitempty on time.Time emits year-1 timestamps — FIXED
+
+**Changed.** `Refclock.LastPulse`, `Refclock.LastSentence`,
+`Tracking.LeapExpiry`, `Tracking.RefTime` and `Source.LastRx` are `*time.Time`
+filled through the existing `optionalTime` helper, matching `LastRequest`/
+`LastServed`. `reftime` gained `omitempty` so it disappears rather than
+serialising `null`. Field names are unchanged. The Prometheus collector uses
+`optionalTimestampSeconds` for the two it reads, and `carillonctl` checks for
+nil instead of `IsZero()`.
+
+**Files.** `internal/control/protocol.go`, `internal/monitor/metrics.go`,
+`cmd/carillonctl/main.go`, `internal/control/control_test.go`,
+`internal/monitor/model_test.go`.
+
+**Verification.** PASS. `TestFreshEngineOmitsNeverHappenedTimestamps` marshals
+a fresh engine's tracking/sources/refclocks, decodes into `map[string]any`,
+asserts `reftime` and `leapfile_expires` are absent, and fails on any
+`0001-01-01` anywhere in the payload. `TestSnapshotOf` asserts the same two
+are nil.
+
+## RF5X-016 — Cluster floor is 3, not min_survivors — FIXED (documentation)
+
+**Changed.** `DESIGN.md` §6.3 now says clustering keeps at least **3**
+(RFC 5905 `NMIN`, a fixed floor and not a knob) and that `min_survivors` is
+the number of survivors required before a system source is declared, with the
+warning not to set it above the number of sources configured. The discard rule
+is described as comparing against the smallest filter jitter among the
+survivors, which is what the code and the RFC do. The example config's comment
+was rewritten to match. No code change, as specified.
+
+**Files.** `DESIGN.md` §6.3, `deploy/carillon.toml.example`.
+
+**Verification.** Doc review.
+
+## RF5X-019 — Crash between CreateTemp and Rename leaves .drift-* files — FIXED
+
+**Changed.** `engine.New` calls `sweepDriftTemps`, which globs
+`.drift-*` beside the drift file and removes matches older than a minute,
+logging each at DEBUG. A younger temporary — one another instance may be
+writing right now — is left alone. The atomic write itself is untouched.
+
+**Files.** `internal/engine/engine.go`, `internal/engine/engine_test.go`.
+
+**Verification.** PASS. `TestEngineSweepsStaleDriftTemporaries` plants an
+hour-old temporary and a fresh one and asserts only the stale one goes, and
+that the drift file itself survives.
+
+## RF5X-026 — A backwards PPS sequence counter produces a 4-billion-slot gap — FIXED
+
+**Changed.** `accept` treats an unsigned sequence delta above
+`maxSequenceGap` (3600) as a device-side counter restart rather than an hour
+of missed pulses: `sequenceRestart` forgets the previous sample, clears the
+pending misses and the window, logs once at WARN, and the pulse is counted one
+`Glitches`. Normal gap accounting below the threshold is unchanged.
+
+**Files.** `internal/refclock/pps.go`, `internal/refclock/pps_test.go`.
+
+**Verification.** PASS. `TestPPSSequenceRestartIsNotFourBillionGaps` runs the
+counter to 1000, feeds sequence 5, and asserts `Gaps` is unchanged, `Glitches`
+went up by one, the window was dropped, and the following pulses re-prime it
+normally.
+
+## RF5X-027 — systemd unit grants write access to all of /run — FIXED
+
+**Changed.** `ReadWritePaths=/var/lib/carillon` only. `RuntimeDirectory=`
+already makes `/run/carillon` writable under `ProtectSystem=strict`, and
+nothing writes outside that and `/var/lib/carillon`.
+`RuntimeDirectoryMode` is unchanged.
+
+**Files.** `deploy/systemd/carillon.service`.
+
+**Verification.** Config review; `systemctl restart carillon && carillonctl version`
+on `gummi` remains a target-host step.
+
+## RF5X-028 — Routable placeholder hostname in the docs — FIXED
+
+**Changed.** `server.example.net` → `server.invalid` in `deploy/README.md` and
+`deploy/ACCEPTANCE.md`, including the authenticated `-keys` form.
+
+**Files.** `deploy/README.md`, `deploy/ACCEPTANCE.md`.
+
+**Verification.** PASS. `grep -rn 'example\.(net|com|org)'` over the tree
+matches only the review document itself.
+
+## RF5X-030 — readLine compares err.Error() == "EOF" — FIXED
+
+**Changed.** `errors.Is(err, io.EOF)`, with `io` imported. A complete but
+unterminated response wrapped in a `*net.OpError` used to be reported as
+"reading response: EOF".
+
+**Files.** `internal/control/client.go`.
+
+**Verification.** PASS. Existing control tests.
+
+## RF5X-031 — A non-prefer PPS becomes the system source — FIXED (documentation)
+
+**Changed.** The review's first option: `DESIGN.md` §6.3 now states that a
+qualified, locked, agreeing PPS source has stratum 0 and a tiny λ, so it sorts
+first and is the system source whether or not it is marked `prefer`; `prefer`
+additionally makes θ_sys its offset alone rather than the distance-weighted
+mean. It says this matches ntpd's treatment of a refclock, is intended, and
+that a pulse which should be visible but never used is configured `noselect`.
+No behaviour change, as the specification allows.
+
+**Files.** `DESIGN.md` §6.3.
+
+**Verification.** Doc review.
