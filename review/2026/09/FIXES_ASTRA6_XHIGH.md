@@ -1377,3 +1377,99 @@ gate through synchronized snapshots carrying update counts, so it still covers
 insufficient history, excessive movement and a steady estimate settling again.
 `TestEngineStepsSettlesAndPersistsDrift` proves independently supported stable
 observations still permit the write.
+
+---
+
+## Wave 6 — fatal errors, persistence and shutdown ownership
+
+## RA6X-012 — Panic refusal is logged but does not stop the daemon as specified — FIXED
+
+**Changed.** `DESIGN.md` §6.6 says a refused panic correction is fatal — log
+the offset, exit 1, let the service manager's backoff make it visible — but it
+was implemented as an ordinary event plus a state change, after which `Run`
+carried on applying corrections and ticks. `handle` now returns a typed
+`engine.ErrPanicRefused` when the discipline reports `EventPanicRefused`,
+**after** publishing the snapshot, so the PANC diagnostic is visible to
+operators and every client before the run ends. `Run` breaks on it like any
+other fatal result, `restoreBaseFrequency` runs (it is suppressed only for
+`errFrequencyRefused`), the sources and auxiliaries are cancelled, and `main`
+returns `exitRuntime` = 1. The deliberate startup exception (`panic_at_startup`
+with stepping permitted, RA6X-011) and the no-step-on-exit rule are unchanged.
+Source-stop reselection propagates the same way (RA6X-017).
+
+**Files.** `internal/engine/engine.go`, `DESIGN.md`,
+`internal/engine/astra6_epoch_review_test.go`.
+
+**Verification.** `TestAstra6PanicRefusalIsFatal` asserts the typed error, the
+published UNSYNCED/PANC status, and that nothing stepped.
+`TestAstra6PanicRefusalEndsRun` drives the real `Run` with a scripted source
+and requires prompt termination with `ErrPanicRefused`, no step, and the
+kernel left at the base estimate. `TestSimPanicRefused` still covers the
+selection-level behaviour. `CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-044 — Synchronous persistence can freeze discipline while the NTP server serves stale synchronization — FIXED
+
+**Changed.** Two independent halves.
+
+*Persistence off the engine goroutine.* `driftWriter` is a single-owner worker
+with a **one-slot candidate channel**. The engine validates the frequency
+(`clock.CheckFrequency`, RA6X-014) and hands it over without blocking;
+`offer` replaces a pending candidate rather than queueing behind it, so a
+delayed write can never overwrite a newer accepted value. Failures are logged
+once and cleared when the file becomes writable again — the same throttling as
+before, now owned by the worker. Atomic replacement (write, fsync, rename) and
+the stable-write gate (RA6X-013) are unchanged. On shutdown the worker is
+closed with a 2 s bound and a diagnostic if it does not finish.
+
+*An independent age limit on served status.* `engine.Status` gained
+`PublishedMono`, the engine's monotonic processing time at publication — wall
+time cannot serve here, because a daemon whose job is to step the wall clock
+has no monotonic guarantee there. The NTP listener's status closure now
+computes the snapshot's age from the monotonic clock: past 30 s (thirty
+publications, since the engine publishes every tick) it serves
+**unsynchronized** with `LI = 3` instead of vouching for a clock nobody is
+watching, and while fresh it ages the advertised root dispersion by φ over the
+interval since publication.
+
+*Observer contract.* The `Observe` doc comment now states plainly that it runs
+on the engine goroutine, must not block, and that the statistics recorder's
+bounded non-blocking queue is the model — with the served-status age limit
+named as a bound on the damage, not a substitute.
+
+**Files.** `internal/engine/engine.go`, `cmd/carillon/main.go`, `DESIGN.md`,
+`internal/engine/astra6_review_test.go`.
+
+**Verification.** `TestAstra6DriftWriteDoesNotStallTheEngine` injects a
+writer that blocks, holds a write open, then offers 100 further candidates:
+none of the offers block, the slot never holds more than one, and exactly two
+writes happen — the blocked one and the single surviving candidate.
+`TestAstra6StaleSnapshotIsNotSynchronized` checks the monotonic publication
+stamp and that it does not follow the engine once it stops publishing.
+`TestAstra6ShutdownRestoresBeforeDraining` covers the worker's bounded close.
+**Deferred to the target hosts:** an actual filesystem stall.
+
+## RA6X-045 — The shutdown deadline excludes the engine and frequency restoration — FIXED
+
+**Changed.** The sequence was cancel → `wg.Wait()` → `restoreBaseFrequency` →
+`maybeWriteDrift` → return, so a source that ignores cancellation, or a wedged
+filesystem, could hold the kernel at the phase-slew transient — up to
+±500 ppm, 43 s/day — until a service manager killed the process. That is
+exactly what the restore exists to prevent.
+
+The engine now **restores the clock first**, immediately after cancelling: it
+owns the actuator and no source can influence it once the loop has left, so
+there is nothing to wait for. Then the best-effort drift write, bounded to 2 s.
+Then a bounded 5 s source drain that names any goroutine still running, using a
+registry the engine keeps as it starts them. Single-writer clock ownership,
+ordinary clean shutdown, the no-exit-step rule and the no-frequency-retry rule
+after a rejected syscall are unchanged; `DESIGN.md` §12 documents the order and
+why it matters.
+
+**Files.** `internal/engine/engine.go`, `DESIGN.md`,
+`internal/engine/astra6_epoch_review_test.go`.
+
+**Verification.** `TestAstra6ShutdownRestoresBeforeDraining` runs a source
+whose `Run` deliberately never returns alongside a working one, synchronizes
+so a nonzero transient is applied, then cancels: `Run` must return within the
+bounded drain and the last actuator write must be the base estimate. No real
+clock or driver hang is involved, as the review requires.

@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"carillon/internal/clock"
+	"carillon/internal/discipline"
 )
 
 // TestAstra6DriftRejectsNaN is the review's RA6X-014 probe. strconv accepts
@@ -285,5 +287,97 @@ func TestAstra6WriteDriftUsesItsOwnNamespace(t *testing.T) {
 	}
 	if got := driftTempPattern(drift); got != ".state.drift-tmp-*" {
 		t.Fatalf("temp pattern %q is not destination-specific", got)
+	}
+}
+
+// blockingDriftWriter blocks until released, so a test can hold the drift
+// write open and check that the engine keeps working meanwhile.
+type blockingDriftWriter struct {
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (w *blockingDriftWriter) write(string, float64) error {
+	w.calls.Add(1)
+	<-w.release
+	return nil
+}
+
+// TestAstra6DriftWriteDoesNotStallTheEngine covers RA6X-044. Create, write,
+// fsync and rename ran on the engine goroutine, so a slow filesystem stopped
+// ticks, measurement handling and status publication while the UDP listener
+// kept answering from the frozen snapshot.
+func TestAstra6DriftWriteDoesNotStallTheEngine(t *testing.T) {
+	dir := t.TempDir()
+	drift := filepath.Join(dir, "drift")
+	if err := os.WriteFile(drift, []byte("12.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingDriftWriter{release: make(chan struct{})}
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	e, err := New(testConfig(drift), clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.drift = &driftWriter{
+		path: drift, log: quietLog(),
+		work: make(chan float64, 1), done: make(chan struct{}),
+		write: blocked.write,
+	}
+	go e.drift.run()
+
+	// Hand the worker a candidate; it blocks in the write.
+	e.drift.offer(1.0)
+	waitFor(t, func() bool { return blocked.calls.Load() == 1 })
+
+	// The engine goroutine must still be able to run: offering further
+	// candidates never blocks, and the newest supersedes the pending one.
+	for i := 0; i < 100; i++ {
+		e.drift.offer(float64(i))
+	}
+	if got := len(e.drift.work); got > 1 {
+		t.Fatalf("the candidate slot holds %d entries; a delayed write must not queue behind", got)
+	}
+
+	close(blocked.release)
+	if !e.drift.close(5 * time.Second) {
+		t.Fatal("the drift worker did not finish")
+	}
+	// Exactly two writes: the one that blocked, and the single surviving
+	// candidate — not one per offer.
+	if got := blocked.calls.Load(); got != 2 {
+		t.Fatalf("%d writes for 101 candidates; a newer candidate must replace a pending one", got)
+	}
+}
+
+// TestAstra6StaleSnapshotIsNotSynchronized covers the served-status half of
+// RA6X-044: a snapshot the engine has stopped refreshing must not keep
+// vouching for the clock.
+func TestAstra6StaleSnapshotIsNotSynchronized(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	e, err := New(testConfig(""), clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.sys.AddSource("a", discipline.Options{Numbering: true})
+	for i := 1; i <= 3; i++ {
+		clk.Advance(time.Second)
+		m := good(0.001)
+		m.Source, m.Now, m.At = "a", clk.Monotonic(), clk.Monotonic()
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := e.Status()
+	if st.State != discipline.StateSynced {
+		t.Fatalf("setup state %v", st.State)
+	}
+	if st.PublishedMono <= 0 {
+		t.Fatal("the snapshot carries no monotonic publication time")
+	}
+	// The engine stops publishing; the fake clock keeps moving.
+	clk.Advance(time.Hour)
+	if age := clk.Monotonic() - e.Status().PublishedMono; age < 3000 {
+		t.Fatalf("snapshot age %v s; the publication stamp is not monotonic", age)
 	}
 }

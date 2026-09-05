@@ -915,9 +915,11 @@ the second line of defence behind the generation counter (§5.1) against a
 measurement computed before a step being applied after it.
 
 Semantics match chrony's `makestep 0.5 3` plus ntpd's panic gate. A refused
-panic correction is fatal: the daemon logs the offset and exits 1 rather than
-serve or slew nonsense; the init script's restart backoff makes this visible
-rather than harmful. Every step is logged at WARN with before/after times and
+panic correction is fatal: the daemon publishes the refusal first — UNSYNCED
+with the `PANC` reference id, which is what an operator and every client see —
+then ends the run, restores the base frequency, and exits 1 rather than
+serving or slewing nonsense. The init script's restart backoff makes this
+visible rather than harmful. Every step is logged at WARN with before/after times and
 the source that justified it, and increments `carillon_steps_total`.
 
 Backward steps are as allowed as forward ones under this policy (after the
@@ -1519,6 +1521,20 @@ good-against-bad traffic chart.
   drift file costs one convergence the loop performs anyway. Observed on
   2026-09-05: a host went 6.13 → 32.28 ppm in four minutes after a restart of
   its upstream (`deploy/ACCEPTANCE.md`).
+  **Persistence is off the engine goroutine.** The drift file is written by a
+  single-owner worker with a one-slot candidate channel: the engine validates
+  a frequency and hands it over without blocking, and a newer candidate
+  replaces a pending one rather than queueing behind it, so a delayed write
+  can never overwrite a newer accepted value. Create, write, fsync and rename
+  used to run inline, where a slow filesystem stopped ticks, measurement
+  handling and status publication — while the UDP listener kept answering
+  from the frozen snapshot with `Synced = true` and an unchanging root
+  dispersion. That last hazard is now bounded independently: the listener
+  checks the snapshot's **monotonic publication age** and, past 30 s, serves
+  unsynchronized rather than vouching for a clock nobody is watching. An
+  `Observe` hook runs on the engine goroutine and must not block for the same
+  reason; the statistics recorder's bounded non-blocking queue is the model.
+
 - **Statistics** (optional, `[stats] dir`): `loop.tsv` (per update: time, θ,
   freq, ψ, poll, state), `pps.tsv` (per accepted pulse: time, θ),
   `sources.tsv`, and `server.tsv` (one row per address family per minute
@@ -1648,8 +1664,18 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   non-blocking queue, owns its buffered daily files, flushes each minute, and
   drains queued snapshots on shutdown. It never calls into the engine.
 - **Shutdown:** `SIGTERM`/`SIGINT` cancel the root context; the engine
-  rewrites the kernel frequency word with the *base* frequency estimate,
-  writes the drift file, closes sockets; `main` waits with a 5 s deadline.
+  **restores the kernel frequency word first**, before waiting on anything
+  else, then writes the drift file, then drains its sources; `main` waits for
+  the auxiliaries with a 5 s deadline.
+
+  The order matters. Waiting for the source goroutines first meant a stuck
+  driver — or a wedged filesystem in the drift write — could hold the kernel
+  at the phase-slew transient until a service manager gave up and killed the
+  process, which is exactly the outcome the restore exists to prevent. The
+  engine owns the actuator and no source can influence it once the loop has
+  left, so restoring immediately is safe. Every wait after that is bounded:
+  2 s for the final best-effort drift write, 5 s for the source drain, each
+  logging what is still running and exiting anyway.
   The frequency estimate itself is kept — it is the best one anybody has —
   but the word the kernel is holding at that instant is the base plus the
   one-second phase-slew transient of the last tick, up to ±`max_slew_ppm`.
@@ -1663,9 +1689,9 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   The 5 s deadline is on the *auxiliary* goroutines — statistics, the control
   socket, the NTP listener, the monitor — and is real: main waits on a done
   channel with a timer and exits anyway, logging which components are still
-  running. The engine has already written the drift file and restored the
-  base frequency by the time it returns, so the deadline costs nothing but a
-  late exit. Without it, a client that asked for `waitsync` with no timeout
+  running. The engine has already restored the base frequency and made its
+  best effort at the drift file by the time it returns, so the deadline costs
+  nothing but a late exit. Without it, a client that asked for `waitsync` with no timeout
   and then stopped reading held the control handler open for ever —
   `waitsync 0` clears that connection's deadline — and `service carillon
   stop` hung until the init system's own `TimeoutStopSec` killed the
