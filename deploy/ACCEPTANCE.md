@@ -418,6 +418,56 @@ reports it — not merely for its state to read `synced`. On this LAN that is
 about ten minutes after the upstream restarts, or one `holdover_max`-free
 poll interval after its offset settles, whichever is longer.
 
+### Observation, not a finding: `mu` runs to 1–2× tau, and the integrator feels it
+
+`gummi` did the same thing on its own account — −15.42 ppm from its drift file
+to +1.72 ppm — while its offset came down from 10.2 ms to 445 µs. Both hosts
+recovered (`twocom` turned around at 13:25 and was back to +29.27 ppm by
+13:30; `gummi`'s offset closed to 445 µs by the same time), so the loops are
+stable. But the size of the excursion is worth writing down, because the
+intervals explain it:
+
+| host | between loop updates (`mu`) | poll | tau = 4·2^poll | ratio |
+|---|---|---|---|---|
+| `gummi` | 448 s | 6 | 256 s | 1.75 |
+| `gummi` | 255 s | 6 | 256 s | 1.0 |
+| `twocom` | 128 s | 4 | 64 s | 2.0 |
+| `twocom` | 257 s | 5 | 128 s | 2.0 |
+
+The frequency integrator is `freq += theta · min(mu, 2048) / (4·tau²)`, a
+discrete approximation of a continuous integrator that is only well behaved
+for `mu` well under `tau`. At `mu = 2·tau` the step is `theta/(2·tau)` —
+half the standing phase error converted to frequency in a single update. That
+is exactly what the 13:19:45 row on `twocom` is: 2.5 ms of offset became
+17 ppm of frequency in one step.
+
+`mu` is the time since the last *loop update*, and a loop update happens only
+when the clock filter yields a new lowest-delay sample — which is uncorrelated
+with the poll interval that sets `tau`. So `mu` is not bounded by `tau` in any
+way, and on a quiet LAN it routinely runs to several times it. `min(mu, 2048)`
+clamps at the Allan intercept, which is about the frequency estimate's
+validity, not about the integrator's stability margin.
+
+**This is not new and was not changed here** — the integration formula is
+untouched by the 2026-09-05 work, and RF5X-006 noticed the same filter gate
+but only addressed what it did to the SETTLING state machine, not what it does
+to the integrator. It is not one of the review's 36 findings. What changed is
+that a host now *serves* through the transient, with an honest root dispersion
+(~28 ms on `twocom` at the widest) rather than sitting unsynced for fifteen
+minutes. Whether an honest 28 ms bound beats LI=3 for a quarter of an hour is
+a judgement call, but clients now see the former.
+
+Worth a look in a future review: bounding `mu` by `tau` in the frequency
+integration, or deriving `tau` from the observed update interval rather than
+from the poll.
+
+Practical note meanwhile: the drift file is written hourly and at shutdown, so
+**do not restart a host during this transient** — it would persist a frequency
+that is tens of ppm from the host's true value and start the next run from
+there. All three drift files still held their pre-restart values at 13:30
+(`gummi` −15.418, `twocom` +6.127, `navlisten2026` +9.403); the first hourly
+write lands around 14:16 UTC, by which time both excursions had converged.
+
 Rollback: `.prev` on all three is the version each was running before —
 `1410eae` on `gummi`, `2700bc7` on `twocom` and `navlisten2026`.
 
