@@ -67,3 +67,39 @@ without the fix it reports the review's evidence verbatim — *kernel left at
 0.000000 ppm*. `TestEngineDoesNotRewriteFrequencyAfterTheKernelRefusedOne`
 asserts the refused call is not repeated on the way out. `go vet ./...` and
 `go test -race ./...` pass.
+
+## RF5X-012 — Filter dispersion ignores unfilled stages — SKIPPED
+
+**Reason: the fix specification conflicts with the code's actual behaviour.**
+
+The spec says to count absent stages at `MaxDispersion` (RFC 5905 §10) while
+explicitly leaving "the staleness rule" unchanged. Those two cannot both hold
+here. `SourceState.apply` only refreshes `Dispersion` when the measurement is
+`Valid`, and a source's measurement is `Valid` only when its filter reported
+`updated` — i.e. when the new sample beat every older one on delay. So a
+source's *reported* dispersion freezes at the stage count the filter had the
+last time it picked a new best sample, and under the RFC rule that frozen
+value is seconds, not milliseconds.
+
+Implemented as specified and probed in the simulation:
+
+- `TestSystemRemoveSource`: the single source's first replies happen to have
+  the lowest delays, so the filter never reports another update. Its
+  dispersion is pinned at the three-sample value `1.938` and its root distance
+  at `1.95` — permanently above `MaxDistance` (1.5). The source is `invalid`
+  for the whole 600 s run and the daemon never leaves `unsynced`. On a real
+  host that is a server that never synchronises because its first reply was
+  unusually fast.
+- `TestSimFalseticker`: sources cross the `MaxDistance` threshold at different
+  times for the same reason, so there is a window in which only one is a
+  candidate. With the review's change, at t=512 that one is the falseticker
+  (`bias = 3.0`): it becomes the sole survivor and system source and steps the
+  clock by 3 s — `steps=2` where the test requires 0. Today the intersection
+  excludes it because all three sources are candidates from their first
+  sample.
+
+Making the RFC dispersion correct would require also changing what the spec
+says not to change — reporting the filter output on every poll and gating only
+the loop update on `updated`, as ntpd does — which is a larger design change
+than this finding authorises and overlaps RF5X-006. Left unfixed; the finding
+is real but needs a fix specification that addresses the staleness rule too.

@@ -61,6 +61,15 @@ type Measurement struct {
 	// Poll is the source's current poll exponent (log2 seconds).
 	Poll int8
 
+	// Generation is the measurement epoch the source read when it began
+	// this sample. The engine bumps its own counter whenever it does
+	// something that invalidates work in flight — a clock step, a leap
+	// transition — so a measurement arriving with an older generation was
+	// computed against a clock reading that no longer holds and must be
+	// dropped rather than applied. Zero means the source does not stamp
+	// generations and is never treated as stale.
+	Generation uint64
+
 	// Valid is false when a poll produced no usable sample; then only
 	// Source, Now, Reach and Poll are meaningful.
 	Valid bool
