@@ -1232,6 +1232,21 @@ Unix socket, newline-delimited JSON request/response, `0660`. Commands:
 
 `carillonctl` prints these as aligned tables; `-json` passes the raw reply through.
 
+**Ownership of the socket path.** The daemon takes an exclusive advisory lock
+(`flock(2)`) on a sibling lock file, `<control>.lock`, and holds it for its
+whole run. That lock, not the presence of the socket inode, is what makes the
+daemon single-instance on the control path; a second start reports the path as
+in use and exits. Only while holding the lock does the daemon consider
+removing the socket, and only when the path *is* a socket (`lstat(2)`, so a
+symlink is never followed) and connecting to it is refused — which is the one
+outcome that proves nothing is listening. A regular file, a directory, a
+symlink, a fifo, a permission error or a connect timeout all fail startup with
+the path untouched: the earlier "remove anything that does not answer"
+behaviour could delete an operator's file after a mistyped path, or unlink a
+live daemon's socket after a slow probe and let a second listener bind the
+same name. The lock file is left in place between runs; deleting it would
+reopen the race it closes.
+
 ### 10.3 HTTP monitoring
 
 The optional `[monitor]` listener is a read-only network observability surface.
@@ -1372,7 +1387,16 @@ good-against-bad traffic chart.
   any of it out; a dated tree keeps each directory small and makes retention
   a per-day `rm -rf`. `[stats] keep_days` (default 0 = keep everything)
   removes day directories older than that at rotation, and prunes the month
-  and year directories it empties. Buffered, flushed each minute and on exit. Snapshot delivery to the writer is bounded and
+  and year directories it empties. Retention runs from a *trusted horizon* —
+  the latest wall time seen while the discipline reported SYNCED, which never
+  moves backwards — and not from the date of the row being written. Rows are
+  still labelled with their own observation time, and unsynchronized
+  observations are still recorded; but a host whose RTC reads 2099 at boot,
+  or a misdated PPS row, must not be able to delete the archive, and nothing
+  is removed until the clock has been synchronized at least once. The horizon
+  can lag the current day, so retention sometimes keeps a little more than
+  `keep_days`; that is the safe direction.
+  Buffered, flushed each minute and on exit. Snapshot delivery to the writer is bounded and
   non-blocking: a stalled disk drops and counts statistics snapshots rather
   than delaying the engine. Output errors are rate-limited WARNs and retried;
   they never stop clock discipline. This is what gets plotted when tuning.

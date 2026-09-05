@@ -357,3 +357,131 @@ base. `TestAstra6RestoreEdgeCases` covers zero updates (exactly one frequency
 write, the startup value) and an initial write failure (`SetFrequency` called
 once, no retry on the way out). `CGO_ENABLED=1 go test -race -count=2 ./...`
 passes.
+
+---
+
+## Wave 2 — stop destructive filesystem mistakes
+
+## RA6X-015 — Startup temporary cleanup can delete the configured drift file — FIXED
+
+**Changed.** The sweep globbed `.drift-*` beside the drift file, `os.Stat`ed
+each match and removed anything older than a minute. The drift filename is
+operator-configurable, so a host calibrated into `.drift-calibrated` had its
+calibration deleted at every start, and two instances sharing a state
+directory could delete each other's temporaries.
+
+`writeDrift` now creates its temporary from a destination-specific pattern —
+`driftTempPattern(path)` = `.<basename>-tmp-*` — so an instance's temporaries
+are namespaced to the file it writes, and no destination can match its own
+sweep glob (`.<base>-tmp-<digits>` is always longer than `<base>`).
+`sweepDriftTemps` requires a candidate to clear four tests before removal:
+
+1. the name is one `os.CreateTemp` generates from *this* destination's
+   pattern — the exact prefix plus decimal digits and nothing else;
+2. `os.Lstat` reports a regular file, so a symlink is never followed and a
+   directory is never touched;
+3. it is not the configured destination, by `os.SameFile` (device and inode),
+   even if the name somehow matched;
+4. it is older than a minute, so a concurrent write is left alone.
+
+Temporaries in the pre-existing `.drift-<digits>` shape are still swept, but
+only when the destination's basename is exactly `drift`, which is the only
+case in which they provably belonged to it — otherwise already-deployed hosts
+would accumulate the clutter the sweep exists to remove. Atomic
+write/fsync/rename, valid configured filenames and the last known-good
+contents are unchanged.
+
+**Files.** `internal/engine/engine.go`,
+`internal/engine/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6SweepPreservesConfiguredDrift`
+passes — `.drift-calibrated`, aged an hour, survives `New` with its contents
+intact. `TestAstra6SweepScope` plants the whole list from the review: matching
+and non-matching names, a plausible operator filename, another instance's
+temporary, a suffixed name, a non-hidden name, an unrelated dotfile, a
+directory named like a temporary, a symlink named like a temporary (with its
+target), a fresh temporary, and the destination itself — only the two genuinely
+abandoned temporaries disappear. `TestAstra6SweepIsInstanceScoped` and
+`TestAstra6WriteDriftUsesItsOwnNamespace` cover the namespacing, and the
+existing `TestEngineSweepsStaleDriftTemporaries` still passes.
+`CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-032 — Control socket startup can delete ordinary files or unlink a live daemon — FIXED
+
+**Changed.** `Listen` `os.Stat`ed the path without checking its type and
+removed anything that failed to accept a connection within 500 ms. A mistyped
+control path therefore destroyed a regular file, and a permission error,
+exhausted backlog or slow probe unlinked a *live* socket — after which a second
+listener could bind the same name and the host had two clock owners.
+
+Ownership of the path is now taken with an exclusive advisory `flock(2)` on a
+sibling lock file (`<control>.lock`), held for the daemon's whole run; that
+lock, not the presence of the socket inode, is the single-instance check. A
+second start reports `ErrInUse` and exits. Only while holding the lock does
+`clearAbandonedSocket` consider removing anything, and it removes only a path
+that is a socket by `os.Lstat` (so a symlink is refused rather than followed)
+*and* whose probe failed in a way that proves nothing is listening.
+`socketAbandoned` accepts exactly `ECONNREFUSED` and "it vanished between the
+lstat and the dial"; a timeout, `EACCES`, `EPERM` or a reset all fail startup
+with the path untouched, because each of those also happens to live sockets.
+Non-socket paths fail with a message naming what is actually there. `Server`
+gained a `Close` that releases the socket and the lock, `Serve` releases the
+lock on both of its exits, and `main` defers `ctl.Close()` so the lock is
+dropped on paths that never reach `Serve`. Mode `0660`, the socket path,
+`ErrInUse` discoverability and recovery from a genuinely abandoned socket are
+preserved; the behaviour is documented in `DESIGN.md` §10.2.
+
+The existing `TestListenRemovesStaleSocket` planted a *regular file*, encoding
+the very assumption the finding is about; it now creates a real unix socket and
+closes the listener with `SetUnlinkOnClose(false)`, which is exactly what a
+SIGKILLed daemon leaves behind.
+
+**Files.** `internal/control/server.go`, `cmd/carillon/main.go`, `DESIGN.md`,
+`internal/control/control_test.go`,
+`internal/control/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6ListenPreservesRegularFile`
+passes: `Listen` fails and the file keeps its contents.
+`TestAstra6ListenRefusesNonSockets` covers a directory, a symlink to a live
+socket (neither link nor target touched) and a fifo;
+`TestAstra6ListenRefusesLiveSocket` confirms a busy listener is reported as in
+use and keeps answering afterwards; `TestAstra6ConcurrentStartersElectOneOwner`
+runs eight simultaneous `Listen` calls and requires exactly one winner with the
+rest returning `ErrInUse`; `TestAstra6ListenRecoversAbandonedSocket` keeps the
+recovery path working, mode `0660` included; and
+`TestAstra6SocketAbandonedClassification` pins which dial failures may be read
+as "no listener". `CGO_ENABLED=1 go test -race ./...` passes.
+
+## RA6X-046 — Statistics retention trusts an unsynchronized wall clock — FIXED
+
+**Changed.** Opening any new dated file called `prune(at)` with that row's own
+wall date, so a future RTC at boot deleted every retained day on the first
+minute tick or the shutdown server row — and a misdated PPS row could do the
+same independently.
+
+The recorder now separates the label from the horizon. Rows are still written
+under the date of the observation they describe, unsynchronized observations
+included; but destructive retention runs only from `Recorder.horizon`, the
+latest wall time seen in a snapshot the discipline reported as `StateSynced`.
+`StateSynced` is reached only after settling, which excludes both boot and the
+interval around a large startup step, and the horizon never moves backwards, so
+an excursion cannot pull retention back either. Until the clock has been
+synchronized once, `pruneTrusted` removes nothing at all. Because the horizon
+can lag the current day, retention keeps at least `keep_days` and sometimes a
+little more — the safe direction. TSV paths and columns, `keep_days = 0`, the
+UTC-day semantics and the recording of unsynchronized observations are
+unchanged; `DESIGN.md` §11 documents the horizon.
+
+**Files.** `internal/stats/writer.go`, `DESIGN.md`,
+`internal/stats/astra6_review_test.go` (new).
+
+**Verification.** The named probe `TestAstra6UntrustedWallTimeDoesNotPrune`
+passes: a 2026 file survives a recorder whose `Now` reads 2099 with
+`keep_days = 7`. `TestAstra6RetentionHorizon` covers the rest of the review's
+list — a future RTC and a past RTC before synchronization (nothing pruned, rows
+still written under their own dates), a corrected RTC (pruning resumes and
+removes only genuinely expired days), a backward excursion (horizon does not
+retreat), a misdated PPS row (recorded, not destructive) and `keep_days = 0`.
+The existing `TestRecorderPrunesExpiredDays` and
+`TestRecorderKeepsEverythingByDefault` still pass.
+`CGO_ENABLED=1 go test -race ./...` passes and `make dist` still builds.

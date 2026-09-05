@@ -156,10 +156,24 @@ func TestWaitSyncFollowsRestart(t *testing.T) {
 	}
 }
 
+// TestListenRemovesStaleSocket uses a real abandoned unix socket, the only
+// thing Listen is entitled to remove. It used to plant a regular file, which
+// encoded the assumption RA6X-032 is about: that anything at the control path
+// which does not answer is disposable.
 func TestListenRemovesStaleSocket(t *testing.T) {
 	path := socketPath(t)
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
+	ln, err := net.Listen("unix", path)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Close the listener without unlinking, exactly as a SIGKILLed daemon
+	// leaves it: the inode stays, and connecting to it is refused.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode().Type() != fs.ModeSocket {
+		t.Fatalf("setup: %v %v", info, err)
 	}
 	srv, err := Listen(path, newEngine(t), nil, "v", nil)
 	if err != nil {
