@@ -2,7 +2,60 @@
 
 Review date: 2026-09-05. Baseline: `8060697` on `main`. Analysis only; production source, tests, dependencies, and deployment configuration are unchanged.
 
-This is an incremental review checkpoint. The final revision will include the complete coverage record, verification results, severity table, and dependency-aware fix order. Findings refer to the baseline's line numbers. Earlier findings are included when their underlying defects remain in the current tree; references identify prior reproductions rather than treating earlier fix claims as proof.
+The review covers every file tracked at the baseline: **136 files, 27,109 lines**, including **104 Go files (38 test files)**, all build/deployment material, the design, and all earlier review evidence. The only repository change is this report. Findings use baseline line numbers or function names. Previously reported defects are included when still present; earlier “fixed” claims were checked against code and reproductions rather than accepted as proof.
+
+There are **59 findings: 25 High, 27 Medium, 7 Low, and no Critical**. Six are explicitly marked **Needs investigation** because receiver behavior, interoperability, durability, or an intended operational policy must be established before prescribing the final behavior. Other findings distinguish direct reproductions from static traces and prior target-host evidence. Severity reflects plausible correctness, availability, or data-integrity impact, not a claim that every deployment reaches the path.
+
+### Coverage and method
+
+Every baseline file was read, including build-tagged implementations and test/reproduction assets. Data flows traced included network/serial/kernel timestamps → source windows → selection → loop actions → clock syscalls; source cancellation/restart and step generations; status publication → wire/control/HTTP/metrics/TSV; and config → constructor → deployment privileges/files/devices. No source, test, dependency, deployment file, hardware state, service, or host clock was modified.
+
+| Area | Files | Lines | Review coverage |
+|---|---:|---:|---|
+| Root files | 6 | 2,011 | .gitignore, CLAUDE.md, DESIGN.md, Makefile, go.mod, go.sum |
+| cmd/carillon | 2 | 853 | Startup, dependency construction, signals, service lifecycle, query mode, tests |
+| cmd/carillonctl | 2 | 335 | Argument/error/output behavior and tests |
+| internal/buildinfo | 1 | 38 | Build identity and clock-era lower bound |
+| internal/clock | 13 | 1,062 | Fake/read-only/platform clocks, frequency/status/step ABI, precision, all tests |
+| internal/config | 5 | 1,796 | TOML/defaults, semantic/file/device/platform checks, tests |
+| internal/control | 4 | 989 | Socket lifecycle, framing, cancellation, DTOs, tests |
+| internal/discipline | 9 | 3,150 | Filter, selection/cluster/combination, loop/state machine, simulations/tests |
+| internal/engine | 2 | 1,494 | Ownership, queues, epochs, actions, drift, publication, tests |
+| internal/leap | 2 | 272 | Parsing, authority, expiry/boundary behavior, tests |
+| internal/monitor | 6 | 956 | HTTP/ACLs, health/status model, metrics, lifecycle, tests |
+| internal/ntp, including auth | 6 | 1,211 | Packet/time encoding, CMAC/key loading, parser/auth/fuzz tests |
+| internal/pps | 10 | 606 | Linux/FreeBSD devices and ABI, lifecycle, build tags, tests |
+| internal/refclock | 7 | 2,049 | PPS qualification/recovery, NMEA parsing/windows/validity, simulations/tests |
+| internal/serial | 6 | 397 | Platform termios/line discipline, read/poll/error handling, tests |
+| internal/server | 18 | 2,282 | Decode/ACL/auth/limiting/replies, ancillary data, listeners, counters, tests |
+| internal/sockts | 5 | 209 | Linux/FreeBSD timestamp enable/parse, fallback, tests |
+| internal/source | 4 | 1,746 | DNS, authenticated exchanges, filtering, polls/KoD, source contract, tests |
+| internal/stats | 2 | 651 | Queues, row semantics, retention, rotation/error handling, tests |
+| deploy | 8 | 1,482 | Example config, service definitions, Apache, OpenWrt, acceptance/runbooks |
+| Existing review material | 18 | 3,520 | Four Markdown reports and fourteen reproduction/verification assets |
+| **Total baseline** | **136** | **27,109** | **All tracked files; this report excluded** |
+
+Ignored generated executables were not treated as source files. No vendored dependency source is present. Dependencies were checked through manifests and govulncheck; this is not an exhaustive manual review of third-party implementations.
+
+### Verification performed
+
+The development host is darwin/arm64 with Go 1.27.0; go.mod declares Go 1.25.0. Commands used dedicated temporary caches/build directories. Socket-dependent probes initially hit sandbox bind restrictions and were rerun with the necessary execution permission; those environmental failures are not counted as code findings.
+
+| Check | Result and limits |
+|---|---|
+| Baseline `CGO_ENABLED=1 go test -race ./...` and `go vet ./...` | Pass. Nineteen packages considered, seventeen with native tests; buildinfo and serial have no tests for this host's active files. Cached successes were retained where applicable. No detected Go data race; logical ordering defects still reproduce. |
+| `make test GO=/opt/local/bin/go` on this host | Pass after permitting temporary local sockets. Deployment-platform cgo/race incompatibility is separately reproduced in RA6X-055. |
+| Pure-Go builds of both commands | Pass for linux/amd64, linux/arm64, freebsd/amd64, freebsd/arm64; eight temporary binaries. Cross-building does not verify runtime syscall ABI or devices. |
+| Existing `verification_fable5_xhigh/run_probes.py -race` | Fourteen top-level tests fail and four pass. Failures map to RA6X-005/006/007/008/016/017/024/027/030/036/050/051. Passing blocked-write, wrapped-EOF, existing holdover-expiry, and alternate-prefer probes were retained as positive evidence. |
+| Existing takeover runner, `baseline` and `distance` | Both reproduce delayed-feedback and drift-persistence failures. Distance ranking improves several cases but still fails a symmetric RTT-growth case; it is not a complete fix. |
+| Existing `probe_rfc_dispersion.py` | Diagnostic overlay fails the falseticker test with two steps and the source-removal test; unknown-frequency convergence passes. This supports designing priming/admission together rather than applying the old local change. |
+| Existing `probe_signals.py` | Pass with clock.Fake: two SIGHUPs preserve control service and log one warning; SIGTERM exits 0 within six seconds. No real clock or privileged NTP listener used. |
+| New embedded Astra6 fixtures | Eighteen top-level counterexamples validated through the embedded overlay runner; the subsequently added queued-time regression was also run and fails as described in RA6X-059. Nineteen total top-level tests are embedded, including six Infinity subcases. Expected failures demonstrate baseline behavior; no production patches applied. |
+| Safe `go list -test -tags hwtest` with cgo | Package loading rejects the Linux PPS and FreeBSD PPS/timex C-import test files, as in RA6X-054. No hardware test executed. |
+| govulncheck v1.6.0, rebuilt with Go 1.27 | Linux/amd64 and FreeBSD/amd64 source scans both report “No vulnerabilities found” against the fetched Go vulnerability database. The installed Go-1.26-built scanner initially could not parse Go 1.27 and was rebuilt only in /private/tmp. A clean database scan does not rule out the project-specific protocol/lifecycle findings here. |
+| Report integrity | Sequential IDs, required fields, all probe fixtures, coverage arithmetic, severity totals, and fix-order coverage checked; git diff limited to this report. |
+
+Hardware PPS/GPS behavior, native Linux/FreeBSD serial execution, FreeBSD broadcast packet captures, filesystem crash durability, and the module's exact minimum Go version were not executed in this session. When a finding cites prior target-host results, that provenance is explicit. Static checks and cross-builds do not replace those remaining verifications.
 
 ## RA6X-001 — Delayed filter observations destabilize the discipline loop
 
@@ -108,7 +161,7 @@ This is an incremental review checkpoint. The final revision will include the co
 
 **Location:** `internal/discipline/loop.go:258–267,292–338`.
 
-**Problem:** Tick claims to account for the transient that actually ran during elapsed time, but computes `actual` from the new Pending and new base. It then debits that new correction before issuing it. Even successive ordinary ticks disagree with the applied-word integral; intervening loop updates, changed bases, and delayed ticks make the discrepancy larger. Initial ticks also charge a nominal second before the first transient has run.
+**Problem:** Tick claims to account for the transient that actually ran during elapsed time, but computes `actual` from the new Pending and new base. It then debits that new correction before issuing it. Even successive ordinary ticks disagree with the applied-word integral; intervening loop updates, changed bases, and delayed ticks make the discrepancy larger. Initial ticks also charge a nominal second before the first transient has run. Intervals beyond maxTickInterval are reduced to one second even if the old word actually remained applied throughout the stall.
 
 **Evidence:** `total := clampFreq(l.Freq + adj*1e6)` and `actual := (total-l.Freq)*1e-6` precede `Pending -= actual*dt`; the previous `l.applied` is not used. `TestVerification011ChargesTheAppliedWord` expects 0.009902343750 s remaining after 39.0625 ppm ran for 1.5 s, but receives 0.009902572632 s. The ordinary test derives expected debit from the same new Pending expression and misses the defect. Prior ID: RF5X-011.
 
@@ -184,7 +237,7 @@ This is an incremental review checkpoint. The final revision will include the co
 
 **Fix specification:** Require independent fresh accepted discipline evidence spanning the stability interval, bounded sample ages, and a trustworthy synchronized state. Flat repeated reads alone must never establish stability. Reset/partition evidence on source/epoch changes and rejected corrections. Preserve the last known-good file on insufficient evidence, existing scalar drift format, atomic replacement, and configurable spread/window. Coordinate with RA6X-001/002/003/008 before choosing thresholds.
 
-**Verification:** Make the takeover drift probe pass; cover zero feedback, stale-but-reachable sources, holdover, source changes, and an upstream still slewing. Also prove genuinely stable observations eventually permit hourly and shutdown writes.
+**Verification:** Make the takeover drift probe pass; cover zero feedback, stale-but-reachable sources, holdover, source changes, and an upstream still slewing. Also prove independently supported stable observations eventually permit hourly and shutdown writes.
 
 ## RA6X-014 — NaN in the drift file reaches the clock-control state
 
@@ -492,7 +545,7 @@ This is an incremental review checkpoint. The final revision will include the co
 
 **Fix specification:** Validate finiteness and meaningful representable ranges at config, CLI, and public constructor boundaries. Reject overflow and unintended zero-after-rounding rather than defaulting after conversion. Keep explicit zero meanings such as CLI waitsync 0 and stats keep_days 0. Preserve existing valid settings, TOML names, defaults, and documented frequency clamps; cover all float fields systematically.
 
-**Verification:** Table-test NaN, ±Inf, maximum representable seconds, just-overflowing finite values, sub-nanosecond values, and normal boundary settings through both Parse and constructors. Ensure invalid configs fail before sockets/devices/clock mutations and limiter state never becomes nonfinite.
+**Verification:** `TestAstra6ConfigurationRejectsInfinity` confirms all six listed infinite settings pass a valid baseline config. Make it pass, then table-test NaN, ±Inf, maximum representable seconds, just-overflowing finite values, sub-nanosecond values, and normal boundary settings through both Parse and constructors. Ensure invalid configs fail before sockets/devices/clock mutations and limiter state never becomes nonfinite.
 
 ## RA6X-036 — Presence-sensitive refclock validation silently ignores explicit settings
 
@@ -816,6 +869,20 @@ This is an incremental review checkpoint. The final revision will include the co
 
 **Verification:** Use filesystem fault/crash testing in a disposable environment and injected syscall failures around write, sync, chmod, rename, and directory sync. Require either the old complete value or the newly committed complete value according to the documented guarantee, with no falsely reported durable success.
 
+## RA6X-059 — Queued measurement timestamps rewind the engine's processing time
+
+**Severity:** Medium
+
+**Location:** `internal/engine/engine.go:361–366`, `publishStatus`; `internal/discipline/system.go`, Update/reselect; source Measurement.Now producers.
+
+**Problem:** Engine uses the producer's enqueue-time Now as the current time for selection, loop processing, and publication. Buffered or cross-source measurements can arrive after a newer tick/measurement, making global time move backward. Candidate age is understated, loop intervals become inconsistent, and uptime/root-uncertainty snapshots regress even while the actual monotonic clock advances. Epoch checks do not reject this ordinary queue delay.
+
+**Evidence:** The receive branch executes `e.handle(e.sys.Update(m), m.Now)`; System.Update calls reselect(m.Now). `TestAstra6QueuedMeasurementDoesNotRewindEngineTime` publishes at monotonic 100, then processes a queued Now=1 observation through the same calls and sees Uptime fall from 1m40s to 1s. Measurement.At already exists for observation time but processing time is not independently established at dequeue.
+
+**Fix specification:** Establish a nondecreasing engine processing clock at consumption, retaining the actual observation/acquisition timestamps separately. Evaluate freshness and deadlines at processing time and reject or compensate delayed feedback according to RA6X-001/025; merely rewriting At would conceal staleness. Define ordering for lifecycle events, ticks, and multiple producers, preserving correct generation boundaries and public time units. Do not let old events make a source younger or restart a past timeout.
+
+**Verification:** Make the named probe pass. Deliver interleaved sources and queued samples around ticks, holdover expiry, source stop/restart, and clock steps; require monotonic uptime/deadlines, honest observation ages, and no duplicated or backward-time feedback integration.
+
 ## Reproducible Astra6 probes
 
 These review fixtures were run only in a temporary copy with fake clocks and temporary files/sockets. They are embedded here to keep the repository change limited to this report. The assertions express desired behavior and **fail on the reviewed baseline**. The receiver-validity assertion for RA6X-021 demonstrates the admitted contradictory state; finalize the receiver policy before making that assertion normative. These are focused counterexamples, not complete future regression suites.
@@ -1054,6 +1121,30 @@ func TestAstra6StepRejectsUnrepresentableDuration(t *testing.T) {
 		t.Fatalf("unrepresentable positive step reached actuator: err=%v steps=%v", err, clk.Steps)
 	}
 }
+
+func TestAstra6QueuedMeasurementDoesNotRewindEngineTime(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 5, 0, 0, 0, 0, time.UTC))
+	e, err := New(testConfig(""), clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.sys.AddSource("a", discipline.Options{Numbering: true})
+	clk.Advance(100 * time.Second)
+	if err := e.handle(e.sys.Tick(clk.Monotonic()), clk.Monotonic()); err != nil {
+		t.Fatal(err)
+	}
+	before := e.Status().Uptime
+	m := good(0.001)
+	m.Source = "a"
+	m.Now = 1
+	m.At = 1
+	if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+		t.Fatal(err)
+	}
+	if e.Status().Uptime < before {
+		t.Fatalf("processing a queued measurement rewound uptime: %v -> %v", before, e.Status().Uptime)
+	}
+}
 ```
 
 ### Probe file: `internal/engine/astra6_review_test.go`
@@ -1271,3 +1362,94 @@ func TestAstra6UntrustedWallTimeDoesNotPrune(t *testing.T) {
 	}
 }
 ```
+
+## Summary by severity
+
+| Severity | Findings | Needs investigation |
+|---|---:|---:|
+| Critical | 0 | 0 |
+| High | 25 | 1 |
+| Medium | 27 | 4 |
+| Low | 7 | 1 |
+| **Total** | **59** | **6** |
+
+The following index includes every finding, grouped by severity. “Investigation” identifies the six findings whose final behavior needs the specified external evidence or policy decision.
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| RA6X-001 | High | Delayed filter observations destabilize the discipline loop | Actionable; see evidence/verification |
+| RA6X-002 | High | The filter can withhold useful corrections for many polls | Actionable; see evidence/verification |
+| RA6X-003 | High | Time-based source expiry never runs on engine ticks | Actionable; see evidence/verification |
+| RA6X-004 | High | Device reconnect loops retain reachable, selectable estimates | Actionable; see evidence/verification |
+| RA6X-005 | High | Re-priming PPS does not invalidate the selector's old lock | Actionable; see evidence/verification |
+| RA6X-006 | High | Generation stamping does not bracket clock-step execution | Actionable; see evidence/verification |
+| RA6X-007 | High | Leap transitions are detected after queued corrections execute | Actionable; see evidence/verification |
+| RA6X-008 | High | Phase debit uses the next frequency word for the previous interval | Actionable; see evidence/verification |
+| RA6X-009 | High | Losing a source during settling promotes untrusted time to holdover | Actionable; see evidence/verification |
+| RA6X-010 | High | Failed polls count as successful settling evidence | Actionable; see evidence/verification |
+| RA6X-011 | High | Panic-at-startup bypasses the never-step setting | Actionable; see evidence/verification |
+| RA6X-013 | High | A frozen transient frequency is accepted as stable drift | Actionable; see evidence/verification |
+| RA6X-014 | High | NaN in the drift file reaches the clock-control state | Actionable; see evidence/verification |
+| RA6X-015 | High | Startup temporary cleanup can delete the configured drift file | Actionable; see evidence/verification |
+| RA6X-017 | High | Source-stop events can be overtaken by queued measurements and swallow fatal errors | Actionable; see evidence/verification |
+| RA6X-018 | High | Canceling an NMEA reconnect panics the daemon | Actionable; see evidence/verification |
+| RA6X-019 | High | NMEA reacquisition reuses a stale pre-outage median | Actionable; see evidence/verification |
+| RA6X-020 | High | One future GPS date can suppress all subsequent correct time | Actionable; see evidence/verification |
+| RA6X-021 | High | ZDA can discipline time while the receiver reports an invalid fix | Investigation |
+| RA6X-022 | High | Leap warnings are coupled to loop updates and lack a fileless boundary reset | Actionable; see evidence/verification |
+| RA6X-032 | High | Control socket startup can delete ordinary files or unlink a live daemon | Actionable; see evidence/verification |
+| RA6X-041 | High | Clock actions are converted to durations without range checks | Actionable; see evidence/verification |
+| RA6X-044 | High | Synchronous persistence can freeze discipline while the NTP server serves stale synchronization | Actionable; see evidence/verification |
+| RA6X-045 | High | The shutdown deadline excludes the engine and frequency restoration | Actionable; see evidence/verification |
+| RA6X-046 | High | Statistics retention trusts an unsynchronized wall clock | Actionable; see evidence/verification |
+| RA6X-012 | Medium | Panic refusal is logged but does not stop the daemon as specified | Actionable; see evidence/verification |
+| RA6X-016 | Medium | Shutdown before the first tick leaves the wrong base frequency applied | Actionable; see evidence/verification |
+| RA6X-023 | Medium | An expired authoritative leapfile can suppress valid upstream warnings | Investigation |
+| RA6X-024 | Medium | Filter startup uncertainty omits all unfilled stages | Actionable; see evidence/verification |
+| RA6X-025 | Medium | Filtered offsets are paired with metadata from a different packet | Actionable; see evidence/verification |
+| RA6X-026 | Medium | FreeBSD answers directed broadcasts as unicast requests | Actionable; see evidence/verification |
+| RA6X-027 | Medium | Required-key authentication failures bypass all response limiting | Actionable; see evidence/verification |
+| RA6X-028 | Medium | Optional authenticated clients share the unsigned client's bucket | Actionable; see evidence/verification |
+| RA6X-029 | Medium | Authenticated clients cannot authenticate this server's RATE replies | Actionable; see evidence/verification |
+| RA6X-030 | Medium | RATE backoff is not consistently applied or cleared | Actionable; see evidence/verification |
+| RA6X-031 | Medium | An untrusted RATE can suppress polling for over a day | Actionable; see evidence/verification |
+| RA6X-033 | Medium | Control calls ignore cancellation after connecting | Actionable; see evidence/verification |
+| RA6X-034 | Medium | Abandoned waitsync requests accumulate and can deadlock listener failure | Actionable; see evidence/verification |
+| RA6X-035 | Medium | Positive infinity and unrepresentable durations pass configuration validation | Actionable; see evidence/verification |
+| RA6X-037 | Medium | DNS address choice can pin an association to an unusable endpoint | Actionable; see evidence/verification |
+| RA6X-038 | Medium | Selection has no local timing-loop rejection | Actionable; see evidence/verification |
+| RA6X-039 | Medium | Device identity checks use path spelling instead of the underlying device | Actionable; see evidence/verification |
+| RA6X-040 | Medium | Negative root-delay interoperability needs an explicit representation policy | Investigation |
+| RA6X-042 | Medium | NMEA leap-second parsing normalizes or rejects the same instant inconsistently | Actionable; see evidence/verification |
+| RA6X-047 | Medium | Statistics omit source loss and state transitions without loop updates | Investigation |
+| RA6X-048 | Medium | Per-pulse statistics can silently coalesce accepted PPS events | Actionable; see evidence/verification |
+| RA6X-049 | Medium | JSON output failures are reported as successful empty responses | Actionable; see evidence/verification |
+| RA6X-050 | Medium | A preferred source that never answers is never reported lost | Actionable; see evidence/verification |
+| RA6X-054 | Medium | ABI verification tests cannot be built because they import C in test files | Actionable; see evidence/verification |
+| RA6X-055 | Medium | The documented race-test Make target fails on deployment platforms | Actionable; see evidence/verification |
+| RA6X-057 | Medium | Source-count validation does not express an achievable or independent quorum | Investigation |
+| RA6X-059 | Medium | Queued measurement timestamps rewind the engine's processing time | Actionable; see evidence/verification |
+| RA6X-036 | Low | Presence-sensitive refclock validation silently ignores explicit settings | Actionable; see evidence/verification |
+| RA6X-043 | Low | Receive-buffer fallback can skip the promised minimum | Actionable; see evidence/verification |
+| RA6X-051 | Low | PPS disagreement diagnostics outlive the comparison that produced them | Actionable; see evidence/verification |
+| RA6X-052 | Low | Monitoring server lifecycle does not fully own its listener and shutdown | Actionable; see evidence/verification |
+| RA6X-053 | Low | Monitoring freshness and last-activity ordering break across wall-clock steps | Actionable; see evidence/verification |
+| RA6X-056 | Low | The serial EOF regression asserts the wrong kernel event path | Actionable; see evidence/verification |
+| RA6X-058 | Low | Drift replacement lacks an explicit power-loss durability contract | Investigation |
+
+## Suggested fix order and dependencies
+
+Treat these as integration waves, with independent containment fixes proceeding alongside the larger discipline design. The primary acceptance gate is actual fake-clock error plus consistent wire/kernel/state behavior, not just a passing unit suite. Preserve the reviewed baseline/reproductions so failures cannot disappear through weakened assertions. No public API, wire format, configuration key, or TSV schema should change incidentally; each finding specifies its compatibility constraints.
+
+| Order | Work | Findings, in suggested local order | Dependencies and acceptance gate |
+|---:|---|---|---|
+| 0 | Enable native verification alongside the fixes | RA6X-054, RA6X-055, RA6X-056 | Repair target race and ABI/serial checks before treating cross-build success as runtime validation. These changes can proceed alongside the immediate safeguards. |
+| 1 | Guard inputs and the clock actuator | RA6X-014, RA6X-035, RA6X-041, RA6X-011, RA6X-018, RA6X-016 | Reject nonfinite/unrepresentable input before action generation/conversion; preserve never-step policy and make reconnect cancellation safe. Verify initial-frequency restoration with the fake actuator. |
+| 2 | Stop destructive filesystem mistakes | RA6X-015, RA6X-032, RA6X-046 | Independent urgent fixes: constrain drift cleanup, protect the control path, and establish a trusted retention horizon. Do not defer these data-loss paths until algorithm work finishes. |
+| 3 | Establish event time, epochs, and source invalidation | RA6X-059, RA6X-006, RA6X-007, RA6X-017, RA6X-004, RA6X-005, RA6X-019, RA6X-020, RA6X-021, RA6X-022, RA6X-042 | Define processing versus observation time and a step/leap protocol first. Carry source lifecycle/invalidation through it. Resolve receiver validity, chronology, and both leap authorities before accepting reacquired or boundary samples. |
+| 4 | Make eligibility and synchronized state truthful | RA6X-003, RA6X-009, RA6X-010, RA6X-023, RA6X-038, RA6X-057, RA6X-050, RA6X-051, RA6X-037, RA6X-039 | Build expiry/settling on the new event contract. Decide expired leap authority and quorum semantics; fix loss diagnostics and endpoint/device recovery. Preserve successful fallback and legitimate refclock numbering. |
+| 5 | Complete the coupled discipline redesign | RA6X-001, RA6X-002, RA6X-008, RA6X-024, RA6X-025, RA6X-013 | Start this design immediately; integrate after the time/epoch and eligibility contracts are established. Observation age, feedback cadence, applied-word accounting, priming uncertainty, and metadata must be validated together. Only then certify drift stability/persistence. |
+| 6 | Finish fatal-error, persistence, and shutdown ownership | RA6X-012, RA6X-044, RA6X-045 | Fatal refusal relies on result/error propagation in RA6X-017. Isolate durable writes and expire stale served snapshots; restore the actuator before bounded draining. Stress stalls with fake sources/filesystems. |
+| 7 | Close protocol and authenticated limiting gaps | RA6X-026, RA6X-027, RA6X-028, RA6X-029, RA6X-031, RA6X-030, RA6X-040 | Design separate unauthenticated/authenticated budgets before optional-key buckets and signed RATE. Define a remote-backoff cap, then fix scheduling/reset semantics. Verify FreeBSD broadcasts and the signed-root-delay interoperability policy on appropriate peers/hosts. |
+| 8 | Finish control and monitor lifecycle/freshness | RA6X-033, RA6X-034, RA6X-052, RA6X-053 | Bind request lifetimes to cancellation and bounded server ownership. Keep processing/event age monotonic, using RA6X-059 and the stale-service policy in RA6X-044; preserve stable public schemas. |
+| 9 | Complete diagnostics, durability, and remaining validation | RA6X-047, RA6X-048, RA6X-049, RA6X-058, RA6X-043, RA6X-036 | Record event/snapshot semantics explicitly, carry pulse records without hidden loss, and propagate serialization failures after input guards. Finalize durable replacement after RA6X-015/044; close fallback and TOML-presence gaps. Re-run consumers and deployment checks. |
