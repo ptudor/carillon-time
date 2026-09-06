@@ -94,9 +94,19 @@ func run(args []string) int {
 		return 2
 	}
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(resp)
+		// Serialize before writing anything, and report a failure rather
+		// than exiting successfully with no output or half of it
+		// (RA6X-049). A non-finite number in the daemon's status is the
+		// realistic cause, and it is exactly what an operator needs told.
+		body, err := json.MarshalIndent(resp, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "carillonctl: cannot render the response as JSON: %v\n", err)
+			return 2
+		}
+		if _, err := os.Stdout.Write(append(body, '\n')); err != nil {
+			fmt.Fprintf(os.Stderr, "carillonctl: writing output: %v\n", err)
+			return 2
+		}
 		if resp.Synced != nil && !*resp.Synced {
 			return 1
 		}

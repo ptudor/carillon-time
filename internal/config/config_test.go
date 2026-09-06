@@ -387,27 +387,6 @@ func TestValidateRules(t *testing.T) {
 		{"duplicate source name", func(c *Config) {
 			c.Refclocks = []Refclock{{Name: "a", Type: "pps", Device: "/dev/null", Edge: "assert", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
 		}, "duplicate name"},
-		// RF5X-021(a): GPS-only keys on a bare PPS refclock were accepted
-		// and silently ignored, which the strict-configuration promise says
-		// they must not be.
-		{"pps with baud", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", Baud: 9600, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "baud applies only to type gps"},
-		{"pps with nmea_offset", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", NMEAOffset: 0.15, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "nmea_offset applies only to type gps"},
-		{"pps with pps path", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PPS: "/dev/pps0", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "pps applies only to type gps"},
-		{"pps with pps_edge", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PPSEdge: "clear", LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "pps_edge applies only to type gps"},
-		{"pps with pps_offset", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", PPSOffset: 1e-3, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "pps_offset applies only to type gps"},
-		{"pps with sentences", func(c *Config) {
-			c.Refclocks = []Refclock{{Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert", Sentences: []string{"RMC"}, LockJitter: 1e-6, PollMin: 4, PollMax: 7}}
-		}, "sentences applies only to type gps"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -623,4 +602,93 @@ func TestGPSWithSeparatePPSDeviceValidates(t *testing.T) {
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("a separate PPS tty must validate: %v", err)
 	}
+}
+
+// TestRefclockKeysAreRejectedByPresence covers RF5X-021(a) and RA6X-036.
+// GPS-only keys on a bare PPS refclock — and the reverse — are accepted and
+// silently ignored unless validation tests whether the operator *wrote* the
+// key, because an explicit zero is indistinguishable from absence by value.
+// The rule therefore only applies to parsed configuration; a Config built in
+// Go cannot observe presence and its zero values are legitimate defaults.
+func TestRefclockKeysAreRejectedByPresence(t *testing.T) {
+	const preamble = "[[server]]\naddress = \"192.0.2.1\"\n\n[serve]\nlisten = [\"127.0.0.1:123\"]\nallow = [\"127.0.0.0/8\"]\n\n"
+	check := func(t *testing.T, block, want string) {
+		t.Helper()
+		cfg, err := Parse([]byte(preamble + block))
+		if err == nil {
+			err = Validate(cfg)
+		}
+		if err == nil {
+			t.Fatalf("silently accepted:\n%s", block)
+		}
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err.Error(), want)
+		}
+	}
+
+	pps := "[[refclock]]\ntype = \"pps\"\ndevice = \"/dev/pps0\"\n"
+	for _, c := range []struct{ key, value, want string }{
+		{"baud", "9600", "baud applies only to type gps"},
+		{"baud", "0", "baud applies only to type gps"},
+		{"pps", `"dcd"`, "pps applies only to type gps"},
+		{"pps", `""`, "pps applies only to type gps"},
+		{"pps_edge", `"clear"`, "pps_edge applies only to type gps"},
+		{"pps_edge", `""`, "pps_edge applies only to type gps"},
+		{"pps_offset", "0.001", "pps_offset applies only to type gps"},
+		{"pps_offset", "0.0", "pps_offset applies only to type gps"},
+		{"nmea_offset", "0.15", "nmea_offset applies only to type gps"},
+		{"nmea_offset", "0.0", "nmea_offset applies only to type gps"},
+		{"sentences", `["RMC"]`, "sentences applies only to type gps"},
+		{"sentences", "[]", "sentences applies only to type gps"},
+	} {
+		t.Run("pps/"+c.key+"="+c.value, func(t *testing.T) {
+			check(t, pps+c.key+" = "+c.value+"\n", c.want)
+		})
+	}
+
+	gps := "[[refclock]]\ntype = \"gps\"\ndevice = \"/dev/ttyS0\"\n"
+	for _, c := range []struct{ key, value, want string }{
+		{"edge", `"assert"`, "edge applies only to type pps"},
+		{"edge", `""`, "edge applies only to type pps"},
+		{"offset", "0.001", "offset applies only to type pps"},
+		{"offset", "0.0", "offset applies only to type pps"},
+	} {
+		t.Run("gps/"+c.key+"="+c.value, func(t *testing.T) {
+			check(t, gps+c.key+" = "+c.value+"\n", c.want)
+		})
+	}
+
+	t.Run("pps keys with pps = none", func(t *testing.T) {
+		check(t, gps+"pps = \"none\"\npps_offset = 0.0\n",
+			"pps_offset applies only when pps is enabled")
+	})
+
+	t.Run("valid blocks still parse", func(t *testing.T) {
+		for _, block := range []string{
+			pps,
+			pps + "edge = \"clear\"\noffset = 0.000001\n",
+			gps,
+			gps + "pps = \"none\"\nnmea_offset = 0.15\n",
+			gps + "pps = \"dcd\"\npps_edge = \"assert\"\npps_offset = 0.0\nnmea_offset = 0.15\nbaud = 9600\nsentences = [\"RMC\"]\n",
+		} {
+			cfg, err := Parse([]byte(preamble + block))
+			if err != nil {
+				t.Fatalf("parse:\n%s\n%v", block, err)
+			}
+			if err := Validate(cfg); err != nil {
+				t.Fatalf("validate:\n%s\n%v", block, err)
+			}
+		}
+	})
+
+	t.Run("a Config built in Go is unaffected", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Refclocks = []Refclock{{
+			Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert",
+			LockJitter: 1e-6, PollMin: 4, PollMax: 7,
+		}}
+		if err := Validate(cfg); err != nil {
+			t.Fatalf("a programmatic PPS refclock with zero-valued GPS fields was refused: %v", err)
+		}
+	})
 }

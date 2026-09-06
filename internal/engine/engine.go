@@ -449,6 +449,29 @@ func writeDrift(path string, ppm float64) error {
 		cleanup()
 		return err
 	}
+	// Sync the containing directory so the new directory entry itself is
+	// durable, not only the file's contents. Rename is atomic to a reader at
+	// any instant, but on the supported filesystems that says nothing about
+	// what survives power loss: without this, writeDrift could return
+	// success and a crash could still leave the old entry, or on some
+	// configurations neither (RA6X-058). The guarantee carillon states is
+	// that a successful write is durable, and this is what makes it true.
+	//
+	// A directory that cannot be opened or synced is reported: silently
+	// returning success would be exactly the false promise the finding is
+	// about. The replacement has already happened at this point, so the file
+	// on disk is the new one either way.
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("drift: opening %s to make the replacement durable: %w", dir, err)
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("drift: syncing %s to make the replacement durable: %w", dir, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("drift: closing %s: %w", dir, err)
+	}
 	return nil
 }
 

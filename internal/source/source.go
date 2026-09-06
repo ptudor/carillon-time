@@ -45,6 +45,26 @@ const FirstEpoch uint64 = 2
 // for it separately.
 func StableEpoch(g uint64) bool { return g != 0 && g%2 == 0 }
 
+// Pulse is one accepted reference-clock edge, as an immutable record.
+//
+// It exists because a per-pulse diagnostic cannot be reconstructed from
+// status snapshots: Info holds only the *latest* pulse, so when several
+// arrive between two publications every snapshot sees the newest one and the
+// earlier ones vanish with no drop counted (RA6X-048). The record travels its
+// own bounded path instead, so either a pulse is written or its loss is
+// counted.
+type Pulse struct {
+	// Source is the configured refclock name.
+	Source string
+
+	// At is the kernel timestamp of the edge, and Offset the offset it
+	// implies including the configured calibration. Sequence is the
+	// device's own counter, which wraps.
+	At       time.Time
+	Offset   float64
+	Sequence uint32
+}
+
 // Source is a producer of clock measurements.
 type Source interface {
 	// Name returns the configured name of the source.

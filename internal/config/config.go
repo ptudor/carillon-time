@@ -143,7 +143,20 @@ type Refclock struct {
 	PPSOffset  float64  `toml:"pps_offset"`
 	NMEAOffset float64  `toml:"nmea_offset"`
 	Sentences  []string `toml:"sentences"`
+
+	// present names the keys the operator actually wrote for this refclock.
+	// Validation of type-specific keys tests presence rather than value: an
+	// explicit `baud = 0` on a bare PPS block is indistinguishable from
+	// absence by value, so a misplaced key was silently ignored and the
+	// diagnostics were value-dependent (RA6X-036). It is empty for a Config
+	// built in Go, where presence cannot be observed and the zero value is
+	// a legitimate default.
+	present map[string]bool
 }
+
+// supplied reports whether the operator wrote this key in the TOML for this
+// refclock.
+func (r *Refclock) supplied(key string) bool { return r.present[key] }
 
 // HasPPS reports whether this refclock produces a PPS logical source.
 func (r *Refclock) HasPPS() bool { return r.Type == "pps" || (r.Type == "gps" && r.PPS != "none") }
@@ -424,6 +437,24 @@ func Parse(data []byte) (*Config, error) {
 			s.PollMax = DefaultPollMax
 		}
 	}
+	// Record which refclock keys were actually written, before defaults are
+	// filled in below and make presence unobservable.
+	var raw struct {
+		Refclocks []map[string]any `toml:"refclock"`
+	}
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return nil, renderTOMLError(err)
+	}
+	for i := range cfg.Refclocks {
+		if i >= len(raw.Refclocks) {
+			break
+		}
+		present := make(map[string]bool, len(raw.Refclocks[i]))
+		for k := range raw.Refclocks[i] {
+			present[k] = true
+		}
+		cfg.Refclocks[i].present = present
+	}
 	for i := range cfg.Refclocks {
 		r := &cfg.Refclocks[i]
 		if r.Name == "" {
@@ -650,19 +681,13 @@ func Validate(cfg *Config) error {
 			// silently ignored is the same mistake with a friendlier face.
 			// None of these are defaulted for type = "pps", so a non-zero
 			// value here can only have been written by the operator.
-			for _, k := range []struct {
-				name string
-				set  bool
-			}{
-				{"baud", r.Baud != 0},
-				{"pps", r.PPS != ""},
-				{"pps_edge", r.PPSEdge != ""},
-				{"pps_offset", r.PPSOffset != 0},
-				{"nmea_offset", r.NMEAOffset != 0},
-				{"sentences", len(r.Sentences) != 0},
-			} {
-				if k.set {
-					fail("%s: %s applies only to type gps and would be ignored here", label, k.name)
+			for _, k := range []string{"baud", "pps", "pps_edge", "pps_offset", "nmea_offset", "sentences"} {
+				// Presence, not value: `baud = 0` is a misplaced key just
+				// as much as `baud = 9600` is, and refusing only the
+				// non-zero one made the diagnostic depend on what the
+				// operator happened to write (RA6X-036).
+				if r.supplied(k) {
+					fail("%s: %s applies only to type gps and would be ignored here", label, k)
 				}
 			}
 			if r.Edge != "assert" && r.Edge != "clear" {
@@ -737,8 +762,22 @@ func Validate(cfg *Config) error {
 }
 
 func validateGPSRefclock(r *Refclock, label string, fail func(string, ...any)) {
-	if r.Edge != "" || r.Offset != 0 {
-		fail("%s: edge and offset apply only to type pps; use pps_edge and pps_offset", label)
+	for _, k := range []string{"edge", "offset"} {
+		if r.supplied(k) {
+			fail("%s: %s applies only to type pps; use pps_%s", label, k, k)
+		}
+	}
+	// pps = "none" is intentionally supported — an NMEA-only GPS — and the
+	// PPS-specific keys are then inapplicable in exactly the same way the
+	// GPS keys are on a bare PPS block. Rejecting them keeps the rule one
+	// rule rather than two, and an operator who meant to enable PPS is told
+	// so instead of silently getting NMEA only.
+	if r.PPS == "none" {
+		for _, k := range []string{"pps_edge", "pps_offset"} {
+			if r.supplied(k) {
+				fail("%s: %s applies only when pps is enabled; set pps to dcd, cts, or a device path", label, k)
+			}
+		}
 	}
 	switch r.Baud {
 	case 4800, 9600, 19200, 38400, 57600, 115200:

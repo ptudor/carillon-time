@@ -184,6 +184,20 @@ func runDaemon(args []string) int {
 			Options: discipline.Options{Prefer: s.Prefer, NoSelect: s.NoSelect, Numbering: true},
 		})
 	}
+	// The statistics recorder is created below, after the listener counters
+	// it needs; refclocks constructed here hand it every accepted pulse
+	// through this closure. Sources do not run until eng.Run, which happens
+	// after the assignment, so the read below is ordered after the write.
+	var statsRecorder *stats.Recorder
+	acceptedPulse := func(tracker *refclock.PulseTracker) func(source.Pulse) {
+		return func(p source.Pulse) {
+			if tracker != nil {
+				tracker.Observe(p.At)
+			}
+			statsRecorder.Pulse(p)
+		}
+	}
+
 	for i := range cfg.Refclocks {
 		r := &cfg.Refclocks[i]
 		if r.Type == "pps" {
@@ -196,6 +210,7 @@ func runDaemon(args []string) int {
 				Name: r.Name, Device: r.Device, Edge: edge, Offset: r.Offset,
 				LockJitter: r.LockJitter, PollMin: int8(r.PollMin), PollMax: int8(r.PollMax),
 				MaxSlewPPM: cfg.Discipline.MaxSlewPPM, Generation: generation.Load,
+				OnPulse: acceptedPulse(nil),
 			}, clk, log)
 			if err != nil {
 				log.Error("refclock", "name", r.Name, "error", err)
@@ -243,7 +258,7 @@ func runDaemon(args []string) int {
 		pulseSource, err := refclock.NewPPS(refclock.PPSConfig{
 			Name: r.Name + "/pps", Type: "gps-pps", Device: ppsDevice,
 			Edge: edge, Offset: r.PPSOffset, LockJitter: r.LockJitter,
-			PollMin: int8(r.PollMin), PollMax: int8(r.PollMax), OnPulse: pulse.Observe,
+			PollMin: int8(r.PollMin), PollMax: int8(r.PollMax), OnPulse: acceptedPulse(pulse),
 			MaxSlewPPM: cfg.Discipline.MaxSlewPPM, Generation: generation.Load,
 		}, clk, log)
 		if err != nil {
@@ -262,7 +277,6 @@ func runDaemon(args []string) int {
 	// so a bind failure cannot leave the recorder pointing at nothing.
 	serverStats := &ntpserver.Stats{}
 
-	var statsRecorder *stats.Recorder
 	var observe func(*engine.Status)
 	if cfg.Stats.Enabled() {
 		scfg := stats.Config{Dir: cfg.Stats.Dir, KeepDays: cfg.Stats.KeepDays, Now: clk.Now, Log: log}

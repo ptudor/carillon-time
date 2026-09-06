@@ -357,8 +357,17 @@ func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Respo
 func (s *Server) reply(conn net.Conn, resp Response) {
 	b, err := json.Marshal(resp)
 	if err != nil {
+		// Closing without saying anything leaves the client to guess. Send
+		// a structured error instead — the same shape every other failure
+		// takes — so `carillonctl` reports it and exits nonzero rather than
+		// printing nothing successfully (RA6X-049). Non-finite numbers in
+		// the status are the realistic cause; the detail goes to the log,
+		// not to the client.
 		s.log.Error("control: encoding response", "error", err)
-		return
+		b, err = json.Marshal(Response{Error: "control: internal encoding failure"})
+		if err != nil {
+			return
+		}
 	}
 	b = append(b, '\n')
 	// A write deadline of its own. A waitsync with no timeout clears the
