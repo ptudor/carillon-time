@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.0.0 — 2026-09-06
+## Unreleased
 
-- First public release of Carillon: a pure-Go NTP time daemon for Linux and
+- Prepare the public distribution of Carillon: a pure-Go NTP time daemon for Linux and
   FreeBSD, with GPS, serial PPS, and inspectable clock discipline.
 - Publish static Linux and FreeBSD binaries for amd64 and arm64, unsigned Linux
   RPMs and DEBs, SHA-256 manifests, and GitHub build attestations.
