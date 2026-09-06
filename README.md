@@ -211,3 +211,9 @@ are permitted with the copyright and license notice preserved. Dependencies
 retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
 
 *A carillon is a set of tuned bells. This one keeps the time between the strikes.*
+
+## Keep exploring
+
+**[Sigillum →](https://github.com/ptudor/sigillum-dnssec#readme)** pairs an automatic
+DNSSEC zone signer with a browser-based validator for inspecting DNS chains of trust.
+From the same maintainer, for people who operate their own infrastructure.
