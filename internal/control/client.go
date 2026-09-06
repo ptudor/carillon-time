@@ -25,34 +25,56 @@ const (
 // Call sends one request to the daemon at path and returns its response.
 // A Response with a non-empty Error is returned as an error.
 func Call(ctx context.Context, path string, req Request) (*Response, error) {
+	// A nonzero waitsync timeout becomes a context deadline of its own, with
+	// the server's extra reply allowance on top. Sending the timeout in the
+	// request and trusting the server to honour it meant an unresponsive one
+	// could exceed it by ten seconds (RA6X-033).
+	if req.Command == CmdWaitSync && req.Timeout > 0 {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, waitDuration(req.Timeout)+replyWriteTimeout+connectRetry)
+			defer cancel()
+		}
+	}
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("control: connecting to %s: %w", path, err)
 	}
 	defer conn.Close()
+	// DialContext honours cancellation only while dialing. Once connected, a
+	// cancellable context with no deadline did not interrupt a blocked read,
+	// so an indefinite waitsync hung after its caller had given up
+	// (RA6X-033). Closing the connection is what unblocks the read; the
+	// callback is stopped on every exit.
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
-	} else if req.Command != CmdWaitSync || req.Timeout > 0 {
-		wait := 10 * time.Second
-		if req.Timeout > 0 {
-			// Bounded conversion: an out-of-range timeout would otherwise
-			// wrap to a deadline in the past (RA6X-035).
-			wait = waitDuration(req.Timeout) + 10*time.Second
+	} else if req.Command != CmdWaitSync {
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+	// Otherwise: waitsync with timeout 0 is intentionally indefinite, and
+	// stays so for as long as ctx is live.
+	fail := func(what string, err error) error {
+		// Report cancellation and deadline as themselves, so errors.Is
+		// still identifies them behind the closed connection.
+		if ce := ctx.Err(); ce != nil {
+			return fmt.Errorf("control: %s: %w", what, ce)
 		}
-		_ = conn.SetDeadline(time.Now().Add(wait))
+		return fmt.Errorf("control: %s: %w", what, err)
 	}
 	b, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := conn.Write(append(b, '\n')); err != nil {
-		return nil, fmt.Errorf("control: sending request: %w", err)
+		return nil, fail("sending request", err)
 	}
 	r := bufio.NewReaderSize(conn, 64*1024)
 	line, err := readLine(r, maxResponse)
 	if err != nil {
-		return nil, fmt.Errorf("control: reading response: %w", err)
+		return nil, fail("reading response", err)
 	}
 	var resp Response
 	if err := json.Unmarshal(line, &resp); err != nil {

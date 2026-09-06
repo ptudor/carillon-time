@@ -380,6 +380,7 @@ func runDaemon(args []string) int {
 			Status:        eng.Status,
 			Stats:         serverStats,
 			Now:           clk.Now,
+			Monotonic:     clk.Monotonic,
 			Log:           log,
 		})
 		if err != nil {

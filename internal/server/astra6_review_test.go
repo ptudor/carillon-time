@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -287,5 +288,58 @@ func TestAstra6LimiterKeyspacesAreDistinct(t *testing.T) {
 		if allowed, _ := l.allow(k, now); allowed {
 			t.Fatalf("keyspace %d has more than its own burst", i)
 		}
+	}
+}
+
+// TestAstra6LastEventSurvivesAClockStep covers the listener half of
+// RA6X-053. "Latest" meant "the largest UnixNano seen", so after a backward
+// step every subsequent request carried a smaller timestamp and was refused —
+// last_request stayed pinned to a pre-step future value for ever.
+func TestAstra6LastEventSurvivesAClockStep(t *testing.T) {
+	var e eventTime
+	future := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	corrected := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+
+	e.store(future)
+	if got := e.load(); !got.Equal(future) {
+		t.Fatalf("first event %v, want %v", got, future)
+	}
+	// The clock is stepped back to the truth; the next request is newer as
+	// an *event* even though its wall time is smaller.
+	e.store(corrected)
+	if got := e.load(); !got.Equal(corrected) {
+		t.Fatalf("after a backward step the last event is %v, want %v", got, corrected)
+	}
+	// Ordinary forward progress still works.
+	later := corrected.Add(time.Second)
+	e.store(later)
+	if got := e.load(); !got.Equal(later) {
+		t.Fatalf("last event %v, want %v", got, later)
+	}
+}
+
+// TestAstra6ConcurrentEventsKeepOne checks concurrent listeners contending on
+// the same counter leave exactly one of the stored values behind, and never a
+// zero.
+func TestAstra6ConcurrentEventsKeepOne(t *testing.T) {
+	var e eventTime
+	base := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				e.store(base.Add(time.Duration(i*1000+j) * time.Millisecond))
+			}
+		}(i)
+	}
+	wg.Wait()
+	got := e.load()
+	if got.IsZero() {
+		t.Fatal("concurrent stores left no event at all")
+	}
+	if got.Before(base) || got.After(base.Add(10*time.Second)) {
+		t.Fatalf("last event %v is not one of the stored values", got)
 	}
 }
