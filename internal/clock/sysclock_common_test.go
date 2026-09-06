@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func TestFreqWord(t *testing.T) {

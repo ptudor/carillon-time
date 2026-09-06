@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // modeCount is the number of three-bit NTP association modes.

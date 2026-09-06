@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
-	"carillon/internal/engine"
-	"carillon/internal/source"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/engine"
+	"github.com/ptudor/carillon-time/internal/source"
 )
 
 func socketPath(t *testing.T) string {

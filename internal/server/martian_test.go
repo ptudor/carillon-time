@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // openACL is the configuration of a public NTP pool server: every source

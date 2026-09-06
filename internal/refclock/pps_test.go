@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/ntp"
-	"carillon/internal/pps"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/pps"
 )
 
 func testPPS(t *testing.T) (*PPS, *clock.Fake) {

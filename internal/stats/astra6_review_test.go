@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/discipline"
-	"carillon/internal/engine"
-	ntpserver "carillon/internal/server"
-	"carillon/internal/source"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/engine"
+	ntpserver "github.com/ptudor/carillon-time/internal/server"
+	"github.com/ptudor/carillon-time/internal/source"
 )
 
 // plantDay creates a dated statistics directory with one row in it and

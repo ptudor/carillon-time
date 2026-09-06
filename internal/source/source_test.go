@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
-	"carillon/internal/ntp"
-	"carillon/internal/ntp/auth"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp/auth"
 )
 
 // fakeServer is an in-process NTP server on loopback whose replies are

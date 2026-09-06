@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"carillon/internal/engine"
-	ntpserver "carillon/internal/server"
+	"github.com/ptudor/carillon-time/internal/engine"
+	ntpserver "github.com/ptudor/carillon-time/internal/server"
 )
 
 // Config configures the monitoring HTTP service.

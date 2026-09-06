@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func src(name string, offset, distance float64, o Options) *SourceState {

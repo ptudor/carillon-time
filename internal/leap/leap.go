@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 const ntpUnixEpoch = uint64(2_208_988_800)

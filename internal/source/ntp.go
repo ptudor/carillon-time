@@ -13,11 +13,11 @@ import (
 	"syscall"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
-	"carillon/internal/ntp"
-	"carillon/internal/ntp/auth"
-	"carillon/internal/sockts"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp/auth"
+	"github.com/ptudor/carillon-time/internal/sockts"
 )
 
 const (

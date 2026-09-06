@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
 )
 
 // TestAstra6DriftRejectsNaN is the review's RA6X-014 probe. strconv accepts

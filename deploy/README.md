@@ -1,5 +1,9 @@
 # carillon deployment quickstart
 
+For GitHub release RPMs and DEBs, follow [Linux package setup](../docs/linux-packages.md).
+Packages install under `/usr/bin` with a network-only systemd unit. The manual
+recipes below use `/usr/local` and include example hardware access.
+
 These recipes replace the host's existing NTP daemon. `carillon` refuses to
 start while another process owns UDP/123, and two clock-discipline daemons
 must never run together. Prepare the binary and configuration first so the

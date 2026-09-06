@@ -3,3 +3,8 @@
 *.test
 *.out
 *.prof
+
+# Release outputs and local configuration
+.DS_Store
+.env
+.env.local

@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
-	"carillon/internal/leap"
-	"carillon/internal/ntp"
-	"carillon/internal/source"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/leap"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/source"
 )
 
 // steppingClock runs a callback from inside Step, so a test can observe what

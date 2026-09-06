@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/ntp"
-	"carillon/internal/ntp/auth"
-	"carillon/internal/server"
-	"carillon/internal/source"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp/auth"
+	"github.com/ptudor/carillon-time/internal/server"
+	"github.com/ptudor/carillon-time/internal/source"
 )
 
 func TestClientServerEndToEnd(t *testing.T) {

@@ -1,0 +1,99 @@
+# Build with GoReleaser OSS v2.18.1. No signing keys or paid features required.
+version: 2
+project_name: carillon-time
+env:
+  - CGO_ENABLED=0
+builds:
+  - id: carillon
+    binary: carillon
+    main: ./cmd/carillon
+    goos: [linux, freebsd]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    ldflags:
+      - -s -w -X github.com/ptudor/carillon-time/internal/buildinfo.Version={{ .Version }} -X github.com/ptudor/carillon-time/internal/buildinfo.BuildTime={{ .CommitDate }}
+  - id: carillonctl
+    binary: carillonctl
+    main: ./cmd/carillonctl
+    goos: [linux, freebsd]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    ldflags:
+      - -s -w -X github.com/ptudor/carillon-time/internal/buildinfo.Version={{ .Version }} -X github.com/ptudor/carillon-time/internal/buildinfo.BuildTime={{ .CommitDate }}
+archives:
+  - formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - README.md
+      - CHANGELOG.md
+      - LICENSE
+      - THIRD_PARTY_NOTICES.md
+      - SECURITY.md
+      - docs/*
+      - DESIGN.md
+      - deploy/carillon.toml.example
+      - deploy/README.md
+      - deploy/systemd/*
+      - deploy/freebsd/*
+nfpms:
+  - id: carillon
+    package_name: carillon
+    ids: [carillon, carillonctl]
+    file_name_template: '{{ .ConventionalFileName }}'
+    homepage: https://github.com/ptudor/carillon-time
+    maintainer: Patrick Tudor <ptudor@ptudor.net>
+    description: NTP time daemon with GPS, serial PPS, and a local status client.
+    license: MIT
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    section: net
+    priority: optional
+    mtime: '{{ .CommitDate }}'
+    overrides:
+      deb:
+        dependencies: [ca-certificates, systemd, passwd]
+      rpm:
+        dependencies: [ca-certificates, systemd, shadow-utils]
+    contents:
+      - src: packaging/carillon.toml
+        dst: /etc/carillon/carillon.toml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+      - src: packaging/carillon.service
+        dst: /usr/lib/systemd/system/carillon.service
+      - src: packaging/carillon.tmpfiles
+        dst: /usr/lib/tmpfiles.d/carillon.conf
+      - src: README.md
+        dst: /usr/share/doc/carillon/README.md
+      - src: docs/linux-packages.md
+        dst: /usr/share/doc/carillon/linux-packages.md
+      - src: LICENSE
+        dst: /usr/share/doc/carillon/copyright
+      - src: THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/carillon/THIRD_PARTY_NOTICES.md
+    scripts:
+      preinstall: packaging/carillon-preinstall.sh
+      postinstall: packaging/carillon-postinstall.sh
+      preremove: packaging/carillon-preremove.sh
+      postremove: packaging/postremove.sh
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+changelog:
+  sort: asc
+  filters:
+    exclude: ['^chore:', '^ci:', '^docs:']
+release:
+  github:
+    owner: ptudor
+    name: carillon-time
+  draft: true
+  prerelease: auto
+  header: |
+    Static Go binaries for the platforms named in each archive.
+    Linux RPM and DEB packages are unsigned and install without starting services.
+    See the README and docs/linux-packages.md before enabling a daemon.
+    Check SHA-256 hashes in checksums.txt and verify the GitHub build attestation.

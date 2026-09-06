@@ -10,7 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // KeySize is the AES-128 key length in bytes.

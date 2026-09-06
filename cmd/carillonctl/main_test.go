@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/control"
+	"github.com/ptudor/carillon-time/internal/control"
 )
 
 func TestHistogramSkipsEmptyBuckets(t *testing.T) {

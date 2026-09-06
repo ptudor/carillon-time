@@ -1033,7 +1033,7 @@ func TestAstra6CallHonorsCancellation(t *testing.T) {
 package discipline
 
 import (
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 	"testing"
 )
 
@@ -1104,8 +1104,8 @@ func TestAstra6LeapUpdatesWithoutSystemFeedback(t *testing.T) {
 package engine
 
 import (
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
 	"testing"
 	"time"
 )
@@ -1175,7 +1175,7 @@ func TestAstra6DriftRejectsNaN(t *testing.T) {
 package monitor
 
 import (
-	"carillon/internal/engine"
+	"github.com/ptudor/carillon-time/internal/engine"
 	"math"
 	"net"
 	"net/http/httptest"
@@ -1214,7 +1214,7 @@ func TestAstra6CloseBeforeServeReleasesListener(t *testing.T) {
 package refclock
 
 import (
-	"carillon/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/discipline"
 	"context"
 	"errors"
 	"testing"
@@ -1297,7 +1297,7 @@ func TestAstra6ZDAHonorsKnownInvalidTime(t *testing.T) {
 package server
 
 import (
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 	"net/netip"
 	"testing"
 	"time"
@@ -1336,7 +1336,7 @@ func TestAstra6OptionalAuthHasIndependentBucket(t *testing.T) {
 package stats
 
 import (
-	ntpserver "carillon/internal/server"
+	ntpserver "github.com/ptudor/carillon-time/internal/server"
 	"os"
 	"path/filepath"
 	"testing"

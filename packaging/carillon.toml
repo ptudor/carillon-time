@@ -1,0 +1,26 @@
+# Installed as /etc/carillon/carillon.toml. Network client only by default.
+# Choose your upstreams before enabling the service. Only one clock daemon
+# should control a host. The package does not start or enable Carillon.
+[daemon]
+drift_file = "/var/lib/carillon/drift"
+control = "/run/carillon/carillon.sock"
+log_level = "info"
+
+[[server]]
+name = "pool-a"
+address = "0.pool.ntp.org"
+iburst = true
+
+[[server]]
+name = "pool-b"
+address = "1.pool.ntp.org"
+iburst = true
+
+[[server]]
+name = "pool-c"
+address = "2.pool.ntp.org"
+iburst = true
+
+# Add [serve] with explicit allow CIDRs to serve clients.
+# See deploy/carillon.toml.example for GPS/PPS, authenticated peers,
+# monitoring, step policy, statistics, and leapfile configuration.

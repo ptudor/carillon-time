@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func TestTakeoverFilterBounds(t *testing.T) {
