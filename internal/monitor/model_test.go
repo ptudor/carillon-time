@@ -20,12 +20,17 @@ func testEngineStatus(now time.Time, state discipline.State) *engine.Status {
 			Offset:       0.0001,
 			Jitter:       0.00002,
 		},
-		Now:     now,
-		Uptime:  time.Hour,
-		Version: "test-version",
-		Infos:   map[string]source.Info{},
+		Now:           now,
+		PublishedMono: testPublishedMono,
+		Uptime:        time.Hour,
+		Version:       "test-version",
+		Infos:         map[string]source.Info{},
 	}
 }
+
+// testPublishedMono is the monotonic instant the fixture snapshots claim to
+// have been published at; ages in these tests are measured against it.
+const testPublishedMono = 3600.0
 
 func TestSnapshotOf(t *testing.T) {
 	now := time.Date(2026, 8, 23, 20, 0, 0, 0, time.UTC)
@@ -34,7 +39,8 @@ func TestSnapshotOf(t *testing.T) {
 		Total: ntpserver.CounterSnapshot{Served: 12},
 		IPv4:  ntpserver.CounterSnapshot{Served: 12},
 	}, true,
-		Metadata{ID: "twocom", Name: "Twocom", Roles: []string{"colo", "ntp-pool"}}, now.Add(time.Second))
+		Metadata{ID: "twocom", Name: "Twocom", Roles: []string{"colo", "ntp-pool"}},
+		now.Add(time.Second), testPublishedMono+1, now.Add(-time.Hour))
 	if s.Schema != schemaV1 || s.Health.Status != "healthy" || s.Health.SnapshotAgeSeconds != 1 {
 		t.Fatalf("snapshot health: %+v", s)
 	}
@@ -71,7 +77,7 @@ func TestHealthStates(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			st := testEngineStatus(now, tt.state)
 			st.PreferLost = tt.preferLost
-			h := healthOf(st, now.Add(tt.age))
+			h := healthOf(st, now.Add(tt.age), testPublishedMono+tt.age.Seconds())
 			if h.Status != tt.want {
 				t.Fatalf("status %q want %q: %+v", h.Status, tt.want, h)
 			}
@@ -86,11 +92,11 @@ func TestHealthReportsLeapfileFreshness(t *testing.T) {
 	now := time.Date(2026, 8, 23, 20, 0, 0, 0, time.UTC)
 	st := testEngineStatus(now, discipline.StateSynced)
 	st.LeapExpiry = now.Add(20 * 24 * time.Hour)
-	if h := healthOf(st, now.Add(time.Second)); h.Status != "degraded" || !slices.Contains(h.Reasons, "leapfile_expiring") {
+	if h := healthOf(st, now.Add(time.Second), testPublishedMono+1); h.Status != "degraded" || !slices.Contains(h.Reasons, "leapfile_expiring") {
 		t.Fatalf("expiring: %+v", h)
 	}
 	st.LeapExpiry = now.Add(-time.Second)
-	if h := healthOf(st, now.Add(time.Second)); h.Status != "unhealthy" || !slices.Contains(h.Reasons, "leapfile_expired") {
+	if h := healthOf(st, now.Add(time.Second), testPublishedMono+1); h.Status != "unhealthy" || !slices.Contains(h.Reasons, "leapfile_expired") {
 		t.Fatalf("expired: %+v", h)
 	}
 }

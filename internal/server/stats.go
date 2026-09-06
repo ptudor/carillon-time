@@ -53,8 +53,8 @@ type counters struct {
 	modes    [modeCount]atomic.Uint64    // nonClient broken out by mode
 	versions [versionCount]atomic.Uint64 // accepted requests by client version
 
-	lastRequest atomic.Int64
-	lastServed  atomic.Int64
+	lastRequest eventTime
+	lastServed  eventTime
 }
 
 // family returns the counters for addr's address family. A nil Stats yields a
@@ -139,8 +139,8 @@ func (c *counters) snapshot() CounterSnapshot {
 		NoKernelTS:  c.missingKernelTS.Load(),
 		KernelDrops: c.kernelDrops.Load(),
 		Clients:     c.clients.Load(),
-		LastRequest: atomicTime(c.lastRequest.Load()),
-		LastServed:  atomicTime(c.lastServed.Load()),
+		LastRequest: c.lastRequest.load(),
+		LastServed:  c.lastServed.load(),
 	}
 	for i := range out.Modes {
 		out.Modes[i] = c.modes[i].Load()
@@ -193,11 +193,33 @@ func atomicTime(ns int64) time.Time {
 	return time.Unix(0, ns).UTC()
 }
 
-func storeLatest(dst *atomic.Int64, t time.Time) {
-	ns := t.UnixNano()
-	for old := dst.Load(); ns > old; old = dst.Load() {
-		if dst.CompareAndSwap(old, ns) {
+// eventTime records the wall time of the most recent event, ordered by a
+// sequence number rather than by the wall value itself.
+//
+// "Latest" used to mean "the largest UnixNano seen", which is wrong on a
+// daemon whose job is to step the wall clock: after a backward step every
+// subsequent request carried a smaller timestamp and was refused, so
+// last_request and last_served stayed pinned to a pre-step future value for
+// ever (RA6X-053). Ordering by arrival and storing whatever wall time that
+// event carried is both monotone in *events* and honest about what the clock
+// said. Concurrent listeners contend on the sequence, so the newest event
+// wins regardless of which way the clock has moved.
+type eventTime struct {
+	seq atomic.Uint64
+	ns  atomic.Int64
+}
+
+func (e *eventTime) store(t time.Time) {
+	next := e.seq.Add(1)
+	for {
+		if cur := e.seq.Load(); cur != next {
+			return // a later event has already claimed the slot
+		}
+		old := e.ns.Load()
+		if e.ns.CompareAndSwap(old, t.UnixNano()) {
 			return
 		}
 	}
 }
+
+func (e *eventTime) load() time.Time { return atomicTime(e.ns.Load()) }

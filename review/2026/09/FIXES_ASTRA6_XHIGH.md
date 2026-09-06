@@ -1695,3 +1695,133 @@ negative values rather than letting them cancel uncertainty.
 **Present behaviour, unchanged.** A raw `RootDelay` of `0xffff0000` decodes as
 +65535 s and is then rejected by the root-distance check, so such a peer is
 unusable rather than misinterpreted. Root dispersion is unaffected.
+
+---
+
+## Wave 8 — control and monitor lifecycle and freshness
+
+## RA6X-033 — Control calls ignore cancellation after connecting — FIXED
+
+**Changed.** `DialContext` handles cancellation only while dialing; once
+connected, a cancellable context with no deadline did not interrupt a blocked
+response read, so an indefinite `waitsync` hung after its caller had given up
+and only closing the connection released it. `Call` now installs a
+`context.AfterFunc` that closes the connection on cancellation and stops it on
+every exit, and reports the error as `ctx.Err()` when the context is what
+ended the call, so `errors.Is(err, context.Canceled)` and
+`context.DeadlineExceeded` still identify it behind the closed connection.
+
+A nonzero `WaitSync` timeout also becomes a **client-side context deadline** —
+the requested wait plus the server's reply allowance — instead of being sent
+in the request and trusted; an unresponsive server could previously exceed it
+by ten seconds. `timeout = 0` keeps its documented meaning of waiting
+indefinitely for as long as the context is live, and the startup retry for a
+missing or refused socket is unchanged.
+
+**Files.** `internal/control/client.go`,
+`internal/control/astra6_review_test.go`.
+
+**Verification.** The named probe `TestAstra6CallHonorsCancellation` passes:
+`Call` returns within 2 s of cancellation with a `context.Canceled`.
+`TestAstra6CallCancellationPoints` covers cancellation before dial and a
+server that accepts and then never answers, requiring the client's own
+deadline to bound the call rather than the server's promise.
+
+## RA6X-034 — Abandoned waitsync requests accumulate and can deadlock listener failure — FIXED
+
+**Changed.** Three things:
+
+1. **Handlers get a child context.** `Serve` derives `hctx` from its own
+   context and cancels it on every exit before `wg.Wait()`. The fatal Accept
+   branch previously waited for handlers whose context would not be cancelled
+   until the *caller* learned Serve had failed — a deadlock on the error path.
+2. **A waiting request is bound to its connection.** `watchClose` reads one
+   byte on the connection in parallel with the wait; the protocol is one
+   request and one response, so any read result means the client is finished.
+   A zero-timeout `waitsync` cleared its deadlines and waited only on the
+   daemon's context, so nothing noticed a client that had gone away —
+   accumulation that ordinary disconnects cause, with no hostile intent.
+3. **Concurrent clients are bounded.** `maxConcurrentClients` = 128 is a
+   documented admission policy, well beyond any legitimate use (`carillonctl`
+   makes one connection and closes it), with a refusal logged.
+
+Legitimate long `waitsync` requests, the one-request/one-response protocol and
+the bounded reply write are unchanged.
+
+**Files.** `internal/control/server.go`,
+`internal/control/astra6_review_test.go`.
+
+**Verification.** `TestAstra6WaitSyncDisconnectDoesNotLeak` connects, sends
+`waitsync 0` and disconnects twenty times while the daemon is unsynchronized,
+requiring the waiter count to return to zero.
+`TestAstra6FatalAcceptDoesNotDeadlock` parks a live waiter and then closes the
+listener under `Serve`, requiring Serve to report the failure promptly instead
+of blocking on a handler it had not cancelled.
+
+## RA6X-052 — Monitoring server lifecycle does not fully own its listener and shutdown — FIXED
+
+**Changed.** `http.Server.Close` only closes listeners it has been given, and
+`Serve` is what gives it this one — so `Close` before `Serve` left the port
+bound and a startup that unwound after binding the monitor could not be
+retried. `Close` now closes the bound listener directly as well, ignores an
+already-closed listener, and is safe to call repeatedly and after `Serve`.
+
+`Serve` no longer returns while shutdown is still running: the cancellation
+`AfterFunc` signals a channel on completion, and if `stop()` reports the
+callback was already running, `Serve` joins it before returning. If the
+graceful deadline passes with connections still open, they are now
+force-closed rather than the timeout merely being logged. `Serve` also closes
+the listener on its own way out, so a caller can rely on the advertised
+lifecycle being finished. Handlers, ACLs, status codes and normal graceful
+request completion are unchanged.
+
+**Files.** `internal/monitor/server.go`,
+`internal/monitor/astra6_review_test.go`.
+
+**Verification.** The named probe
+`TestAstra6CloseBeforeServeReleasesListener` passes — the address rebinds
+immediately, and a repeated `Close` is safe. `TestAstra6MonitorLifecycle`
+covers cancellation before `Serve` and requires that `Serve` reporting
+finished implies the port is free.
+
+## RA6X-053 — Monitoring freshness and last-activity ordering break across wall-clock steps — FIXED
+
+**Changed.** Three consequences of using wall time to measure elapsed time in
+a daemon whose job is to step the wall clock.
+
+1. **Snapshot freshness.** `healthOf` subtracted two wall timestamps and
+   clamped a negative age to zero, so a backward step made an old snapshot
+   look fresh. It now takes the monotonic instant and compares it against
+   `Status.PublishedMono` (added in RA6X-044); `monitor.Config` gained a
+   `Monotonic` hook, wired to the same clock the engine stamps with.
+2. **Process identity.** `started_at` was recomputed as wall-now minus uptime
+   and therefore moved whenever the clock stepped, despite describing one
+   process instance. It is captured once in `Listen`. The field's doc comment
+   states what it means on a host whose clock was wrong at boot: it reports
+   the wrong time the daemon saw, and `uptime_seconds` — monotonic — is the
+   reliable measure.
+3. **Last activity.** `storeLatest` kept the largest `UnixNano` seen, so after
+   a backward step every later request carried a smaller timestamp and was
+   refused, pinning `last_request`/`last_served` to a pre-step future value
+   for ever. `eventTime` orders by an **event sequence number** and stores
+   whatever wall time that event carried, so the newest event wins whichever
+   way the clock moved, and concurrent listeners contend on the sequence
+   rather than on the wall value.
+
+JSON and Prometheus field names and units are unchanged.
+
+**Files.** `internal/monitor/model.go`, `internal/monitor/server.go`,
+`internal/server/stats.go`, `internal/server/responder.go`,
+`cmd/carillon/main.go`, `internal/monitor/model_test.go`,
+`internal/monitor/metrics_test.go`,
+`internal/monitor/astra6_review_test.go`,
+`internal/server/astra6_review_test.go`.
+
+**Verification.** `TestAstra6FreshnessIsMonotonic` steps the clock an hour
+backwards and an hour forwards between publication and serving and requires
+the reported age to follow elapsed time in both directions, with the stale
+verdict following it. `TestAstra6InstanceIdentityIsStable` steps the clock a
+day and requires `started_at` and `uptime_seconds` not to move.
+`TestAstra6LastEventSurvivesAClockStep` requires a corrected time to replace a
+pre-step future one, and `TestAstra6ConcurrentEventsKeepOne` runs eight
+goroutines against one counter.

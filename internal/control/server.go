@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -56,6 +57,12 @@ var ErrInUse = errors.New("control: socket is in use by another carillon")
 // abandoned one. A local unix socket with a listener accepts immediately.
 const socketProbeTimeout = 500 * time.Millisecond
 
+// maxConcurrentClients bounds the control connections handled at once. The
+// socket is mode 0660, so this is not an anti-abuse measure; it is a bound on
+// an accumulation that ordinary disconnects can cause. Well beyond any
+// legitimate use: carillonctl makes one connection and closes it.
+const maxConcurrentClients = 128
+
 // Server answers control requests for one engine.
 type Server struct {
 	path    string
@@ -66,6 +73,10 @@ type Server struct {
 	version string
 	log     *slog.Logger
 	wg      sync.WaitGroup
+
+	// waiters counts the connections currently being handled, for the
+	// admission bound.
+	waiters atomic.Int32
 }
 
 // Listen creates the unix socket at path (mode 0660).
@@ -214,33 +225,79 @@ func (s *Server) Path() string { return s.path }
 // Serve accepts connections until ctx is done, then closes the listener,
 // waits for in-flight requests, and removes the socket file.
 func (s *Server) Serve(ctx context.Context) error {
+	// Handlers run under a child context cancelled on every exit from Serve.
+	// Waiting for them on the parent's context meant a fatal Accept failure
+	// deadlocked: Serve blocked in wg.Wait() while a zero-timeout waitsync
+	// handler blocked on a context that would not be cancelled until the
+	// caller learned Serve had failed (RA6X-034).
+	hctx, stopHandlers := context.WithCancel(ctx)
+	defer stopHandlers()
+
 	go func() {
 		<-ctx.Done()
 		_ = s.ln.Close()
 	}()
+	finish := func(err error) error {
+		stopHandlers()
+		s.wg.Wait()
+		_ = os.Remove(s.path)
+		s.releaseLock()
+		return err
+	}
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				s.wg.Wait()
-				_ = os.Remove(s.path)
-				s.releaseLock()
-				return nil
+				return finish(nil)
 			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				continue
 			}
-			s.wg.Wait()
-			_ = os.Remove(s.path)
-			s.releaseLock()
-			return fmt.Errorf("control: accept: %w", err)
+			return finish(fmt.Errorf("control: accept: %w", err))
+		}
+		if n := s.waiters.Load(); n >= maxConcurrentClients {
+			// A bounded admission policy: local socket-authorized users can
+			// otherwise accumulate indefinitely while unsynchronized, and a
+			// disconnect leak needs no hostile intent to happen.
+			s.log.Warn("refusing a control connection: too many in flight", "clients", n, "limit", maxConcurrentClients)
+			_ = conn.Close()
+			continue
 		}
 		s.wg.Add(1)
+		s.waiters.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.handle(ctx, conn)
+			defer s.waiters.Add(-1)
+			s.handle(hctx, conn)
 		}()
+	}
+}
+
+// watchClose returns a context cancelled when ctx is done or the client
+// disconnects, and a function that stops the watcher.
+//
+// A zero-timeout waitsync clears the connection's deadlines and waits only on
+// the daemon's context, so nothing noticed a client that had gone away: local
+// clients accumulated for as long as the daemon stayed unsynchronized, which
+// needs no hostile behaviour at all (RA6X-034). The watcher reads one byte;
+// the protocol is one request and one response, so any read result other than
+// "still waiting" means the client is finished with this connection.
+func (s *Server) watchClose(ctx context.Context, conn net.Conn) (context.Context, func()) {
+	wctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var b [1]byte
+		_, _ = conn.Read(b[:])
+		cancel()
+	}()
+	return wctx, func() {
+		cancel()
+		// Unblock the watcher's read; handle closes the connection anyway,
+		// but the watcher must not outlive the request.
+		_ = conn.SetReadDeadline(time.Now())
+		<-done
 	}
 }
 
@@ -274,13 +331,16 @@ func (s *Server) dispatch(ctx context.Context, conn net.Conn, req Request) Respo
 	case CmdServerStats:
 		return Response{ServerStats: ServerStatsOf(s.stats.Snapshot())}
 	case CmdWaitSync:
-		wctx := ctx
+		// A waiting request is bound to its connection: a client that goes
+		// away must not leave a goroutine parked on the daemon's context.
+		wctx, stopOnClose := s.watchClose(ctx, conn)
+		defer stopOnClose()
 		var cancel context.CancelFunc
 		if req.Timeout > 0 {
 			// A request is JSON off a local socket, not necessarily from
 			// carillonctl: an out-of-range or non-finite timeout must not
 			// overflow the conversion into a negative deadline (RA6X-035).
-			wctx, cancel = context.WithTimeout(ctx, waitDuration(req.Timeout))
+			wctx, cancel = context.WithTimeout(wctx, waitDuration(req.Timeout))
 			defer cancel()
 			_ = conn.SetDeadline(time.Now().Add(waitDuration(req.Timeout) + replyWriteTimeout))
 		} else {

@@ -254,3 +254,174 @@ func TestAstra6SocketAbandonedClassification(t *testing.T) {
 		})
 	}
 }
+
+// TestAstra6CallHonorsCancellation is the review's RA6X-033 probe.
+// DialContext handles cancellation only while dialing; once connected, a
+// cancellable context with no deadline did not interrupt a blocked read, so
+// an indefinite waitsync hung after its caller had given up.
+func TestAstra6CallHonorsCancellation(t *testing.T) {
+	p := socketPath(t)
+	ln, err := net.Listen("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, e := Call(ctx, p, Request{Command: CmdWaitSync}); done <- e }()
+	c, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	b := make([]byte, 256)
+	c.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err = c.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Call returned %v, want a context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		c.Close()
+		<-done
+		t.Fatal("Call still blocked 2 s after context cancellation")
+	}
+}
+
+// TestAstra6CallCancellationPoints covers the rest of RA6X-033's list.
+func TestAstra6CallCancellationPoints(t *testing.T) {
+	t.Run("before dial", func(t *testing.T) {
+		p := socketPath(t)
+		ln, err := net.Listen("unix", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := Call(ctx, p, Request{Command: CmdVersion}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Call returned %v, want a context.Canceled", err)
+		}
+	})
+
+	t.Run("a server that never answers is bounded by the waitsync timeout", func(t *testing.T) {
+		p := socketPath(t)
+		ln, err := net.Listen("unix", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		go func() {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Read the request and then say nothing, ever.
+			b := make([]byte, 256)
+			_, _ = c.Read(b)
+			<-time.After(time.Minute)
+			c.Close()
+		}()
+		start := time.Now()
+		_, err = Call(context.Background(), p, Request{Command: CmdWaitSync, Timeout: 0.2})
+		if err == nil {
+			t.Fatal("a server that never answers must not succeed")
+		}
+		// The client's own deadline bounds it: the request timeout plus the
+		// reply allowance, not ten seconds on top of it.
+		if elapsed := time.Since(start); elapsed > 8*time.Second {
+			t.Fatalf("Call took %v for a 0.2 s waitsync", elapsed)
+		}
+	})
+}
+
+// TestAstra6WaitSyncDisconnectDoesNotLeak covers RA6X-034. A zero-timeout
+// waitsync cleared its deadlines and waited only on the daemon's context, so
+// nothing noticed a client that had gone away and local clients accumulated
+// for as long as the daemon stayed unsynchronized.
+func TestAstra6WaitSyncDisconnectDoesNotLeak(t *testing.T) {
+	p := socketPath(t)
+	srv, err := Listen(p, newEngine(t), nil, "v", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ctx) }()
+
+	for i := 0; i < 20; i++ {
+		conn, err := net.Dial("unix", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte(`{"command":"waitsync","timeout":0}` + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		// Give the handler a moment to park in Engine.Wait, then vanish.
+		time.Sleep(5 * time.Millisecond)
+		conn.Close()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.waiters.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d waiters still parked after their clients disconnected", srv.waiters.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAstra6FatalAcceptDoesNotDeadlock covers the other half of RA6X-034: the
+// fatal Accept branch waited for handlers whose context was not cancelled
+// until the caller learned Serve had failed.
+func TestAstra6FatalAcceptDoesNotDeadlock(t *testing.T) {
+	p := socketPath(t)
+	srv, err := Listen(p, newEngine(t), nil, "v", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(ctx) }()
+
+	// A live waiter, parked indefinitely.
+	conn, err := net.Dial("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte(`{"command":"waitsync","timeout":0}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.waiters.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the waiter never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Close the listener under Serve: Accept fails for a reason that is not
+	// cancellation, which is the fatal branch.
+	_ = srv.ln.Close()
+	select {
+	case err := <-served:
+		if err == nil {
+			t.Fatal("a fatal Accept failure must be reported")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve deadlocked waiting for a handler it had not cancelled")
+	}
+	conn.Close()
+}

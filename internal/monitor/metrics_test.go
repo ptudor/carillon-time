@@ -69,7 +69,7 @@ func TestServerMetricsAreLabelledByFamily(t *testing.T) {
 		IPv6: ntpserver.CounterSnapshot{Served: 546, Clients: 32},
 	}
 	body := gatherMetrics(t, func() Snapshot {
-		return SnapshotOf(testEngineStatus(now, discipline.StateSynced), stats, true, Metadata{}, now)
+		return SnapshotOf(testEngineStatus(now, discipline.StateSynced), stats, true, Metadata{}, now, testPublishedMono, now.Add(-time.Hour))
 	})
 
 	for _, want := range []string{

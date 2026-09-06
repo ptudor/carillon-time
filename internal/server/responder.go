@@ -274,7 +274,7 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 	// spoofed flood look like accepted traffic and advanced last_request
 	// while nothing was being served.
 	c.versions[pkt.Version].Add(1)
-	storeLatest(&c.lastRequest, receive)
+	c.lastRequest.store(receive)
 
 	st := h.status()
 	refID := st.ReferenceID
@@ -284,7 +284,7 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 	response := h.reply(&pkt, receive, st, refID, replyKey, !st.Synced)
 	if response != nil {
 		c.served.Add(1)
-		storeLatest(&c.lastServed, receive)
+		c.lastServed.store(receive)
 		if !st.Synced {
 			c.unsynced.Add(1)
 		}
