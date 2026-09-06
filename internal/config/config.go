@@ -21,8 +21,8 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"golang.org/x/sys/unix"
 
-	"carillon/internal/clock"
-	ntpserver "carillon/internal/server"
+	"github.com/ptudor/carillon-time/internal/clock"
+	ntpserver "github.com/ptudor/carillon-time/internal/server"
 )
 
 // Poll exponent bounds (log2 seconds) accepted for upstream servers.

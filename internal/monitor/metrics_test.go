@@ -8,9 +8,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"carillon/internal/control"
-	"carillon/internal/discipline"
-	ntpserver "carillon/internal/server"
+	"github.com/ptudor/carillon-time/internal/control"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	ntpserver "github.com/ptudor/carillon-time/internal/server"
 )
 
 // TestServerResultsPartitionReceivedTraffic pins the property a traffic chart

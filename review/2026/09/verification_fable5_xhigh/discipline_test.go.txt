@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // RF5X-011: the frequency actually issued at t=1 must be accounted for

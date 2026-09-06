@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // TestAstra6NeverStepIncludesPanicStartup is the review's RA6X-011 probe.

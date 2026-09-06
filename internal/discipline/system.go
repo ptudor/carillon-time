@@ -3,7 +3,7 @@ package discipline
 import (
 	"math"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // State is the synchronization state of the daemon.

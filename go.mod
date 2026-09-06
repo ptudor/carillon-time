@@ -1,4 +1,4 @@
-module carillon
+module github.com/ptudor/carillon-time
 
 go 1.25.0
 

@@ -5,7 +5,7 @@ import (
 	"sort"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 const (

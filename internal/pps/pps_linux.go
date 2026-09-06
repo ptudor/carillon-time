@@ -13,7 +13,7 @@ import (
 	"time"
 	"unsafe"
 
-	"carillon/internal/serial"
+	"github.com/ptudor/carillon-time/internal/serial"
 	"golang.org/x/sys/unix"
 )
 

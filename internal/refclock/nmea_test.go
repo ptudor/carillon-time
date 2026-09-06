@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func testNMEA(t *testing.T) (*NMEA, *clock.Fake, *PulseTracker) {

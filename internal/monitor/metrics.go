@@ -7,7 +7,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"carillon/internal/control"
+	"github.com/ptudor/carillon-time/internal/control"
 )
 
 type collector struct {

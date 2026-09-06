@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
 )
 
 func newBoundsEngine(t *testing.T) (*clock.Fake, *Engine) {

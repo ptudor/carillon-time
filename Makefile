@@ -7,7 +7,7 @@
 GO          ?= go
 BIN         := bin
 DIST        := dist
-PKG         := carillon
+PKG         := github.com/ptudor/carillon-time
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILDTIME   ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS     := -X $(PKG)/internal/buildinfo.Version=$(VERSION) -X $(PKG)/internal/buildinfo.BuildTime=$(BUILDTIME)
@@ -71,3 +71,16 @@ dist: freebsd linux
 
 clean:
 	rm -rf $(BIN) $(DIST)
+
+# GitHub uses the same GoReleaser configuration as local snapshot builds.
+GORELEASER ?= goreleaser
+.PHONY: release-check snapshot
+release-check:
+	$(GORELEASER) check
+
+snapshot:
+	$(GORELEASER) release --snapshot --clean
+
+.PHONY: check-examples
+check-examples: build
+	python3 scripts/check-configs.py ./bin/carillon

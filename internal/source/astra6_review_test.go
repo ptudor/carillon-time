@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // TestAstra6RotatesPastAnUnusableAnswer covers RA6X-037. Only the first DNS

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func ntpStamp(t time.Time) uint64 { return uint64(t.Unix()) + ntpUnixEpoch }

@@ -4,7 +4,7 @@ import (
 	"slices"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 const (

@@ -12,8 +12,8 @@ import (
 	"slices"
 	"time"
 
-	"carillon/internal/ntp"
-	"carillon/internal/ntp/auth"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp/auth"
 )
 
 const defaultMinPoll = 6

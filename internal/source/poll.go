@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // adaptPoll implements the RFC 5905 poll-interval rule: when the offset is

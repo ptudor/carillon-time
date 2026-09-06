@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // simClock models a local clock with an intrinsic frequency error (drift)

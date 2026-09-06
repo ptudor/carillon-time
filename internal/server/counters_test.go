@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // modeRequest builds a well-formed packet carrying an arbitrary mode.

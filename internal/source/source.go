@@ -12,8 +12,8 @@ import (
 	"net/netip"
 	"time"
 
-	"carillon/internal/discipline"
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // Clock epochs.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/discipline"
-	"carillon/internal/pps"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/pps"
 )
 
 // TestAstra6NMEAFarFutureSentenceIsRejected covers the refclock half of

@@ -23,8 +23,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"carillon/internal/config"
-	"carillon/internal/control"
+	"github.com/ptudor/carillon-time/internal/config"
+	"github.com/ptudor/carillon-time/internal/control"
 )
 
 func main() {

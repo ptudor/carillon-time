@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func TestUDPListenerRoundTrip(t *testing.T) {

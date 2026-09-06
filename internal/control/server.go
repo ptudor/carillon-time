@@ -18,9 +18,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"carillon/internal/discipline"
-	"carillon/internal/engine"
-	ntpserver "carillon/internal/server"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/engine"
+	ntpserver "github.com/ptudor/carillon-time/internal/server"
 )
 
 // maxRequest bounds a request line; anything larger is not a request.

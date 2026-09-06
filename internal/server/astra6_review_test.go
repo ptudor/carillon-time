@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/ntp"
-	"carillon/internal/ntp/auth"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp/auth"
 )
 
 // TestAstra6HandlerRejectsUnboundedLimits covers RA6X-035 at the public

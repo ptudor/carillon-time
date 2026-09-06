@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 func unhex(t *testing.T, s string) []byte {

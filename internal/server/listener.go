@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"carillon/internal/ntp"
-	"carillon/internal/sockts"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/sockts"
 )
 
 const serverOOBSize = 256

@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/config"
-	"carillon/internal/leap"
+	"github.com/ptudor/carillon-time/internal/config"
+	"github.com/ptudor/carillon-time/internal/leap"
 )
 
 func TestConfigurationWarnings(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"errors"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // ErrUnsupportedPlatform is returned by New on operating systems without a

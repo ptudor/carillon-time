@@ -11,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"carillon/internal/clock"
-	"carillon/internal/discipline"
-	"carillon/internal/ntp"
-	"carillon/internal/pps"
-	"carillon/internal/source"
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/pps"
+	"github.com/ptudor/carillon-time/internal/source"
 )
 
 const (

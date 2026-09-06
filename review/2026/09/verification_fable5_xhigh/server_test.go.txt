@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"carillon/internal/ntp/auth"
+	"github.com/ptudor/carillon-time/internal/ntp/auth"
 )
 
 // RF5X-008/035: crypto-NAKs are replies too. An unauthenticated sender

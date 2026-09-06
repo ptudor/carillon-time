@@ -6,7 +6,7 @@ import (
 	"math"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // Kernel clock status bits. The values are identical in Linux <linux/timex.h>

@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"carillon/internal/discipline"
-	"carillon/internal/engine"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/engine"
 )
 
 func startTestServer(t *testing.T, allow []netip.Prefix, state discipline.State, mutate ...func(*engine.Status)) (*Server, string) {

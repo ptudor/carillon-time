@@ -4,7 +4,7 @@ import (
 	"errors"
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // ErrReadOnly is returned by the mutating methods of a read-only clock.

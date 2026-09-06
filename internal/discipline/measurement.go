@@ -9,7 +9,7 @@ package discipline
 import (
 	"time"
 
-	"carillon/internal/ntp"
+	"github.com/ptudor/carillon-time/internal/ntp"
 )
 
 // Physical constants of RFC 5905 §7.2 and the ntpd implementation.
