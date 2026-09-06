@@ -1,7 +1,6 @@
 ![Carillon — A precise second. An understandable clock.](docs/banner.svg)
 
 [![CI](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml/badge.svg)](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ptudor/carillon-time?include_prereleases)](https://github.com/ptudor/carillon-time/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](.go-version)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -72,10 +71,11 @@ timestamping, and OpenWrt deployment are outside the current release scope.
 
 ## Install
 
-Download an archive or package from [GitHub Releases](https://github.com/ptudor/carillon-time/releases/latest)
-for **v1.0.0**, then [verify the file](docs/releases.md#verify-a-download).
-Successful [CI runs](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml)
-also retain downloadable development builds.
+Download development binaries and packages from the artifacts of a successful
+[CI run](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml).
+Choose the `carillon-time-snapshot` artifact and the file matching your platform.
+See [build and verification instructions](docs/releases.md) for source builds,
+checksums, and the distinction between development artifacts and tagged releases.
 
 | Asset | Contents |
 | --- | --- |
@@ -96,8 +96,9 @@ sudo dnf --setopt=localpkg_gpgcheck=0 install ./carillon-*.x86_64.rpm
 Packages **do not start or enable the daemon** and do not stop your current time
 service. Configuration starts as an NTP client, with downstream serving and device
 access disabled. Follow [Linux setup](docs/linux-packages.md) to configure and activate
-it. Packages are unsigned; release checksums and GitHub build attestations are
-provided. There is no hosted APT/YUM repository yet.
+it. Packages are unsigned. Development artifacts include checksums; build
+attestations belong to the tagged-release workflow. There is no hosted APT/YUM
+repository.
 
 For a manual installation or FreeBSD rc.d setup, use the
 [deployment guide](deploy/README.md). Packaged binaries live in `/usr/bin`; manual
