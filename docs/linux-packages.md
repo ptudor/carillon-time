@@ -4,6 +4,10 @@ The `carillon` RPM and DEB contain both `carillon` and `carillonctl`. They targe
 systemd-based Linux on amd64 and arm64. CI exercises Debian 13 and Fedora 43 on
 amd64; other distribution versions need their own acceptance run.
 
+The project MIT license and dependency notices are combined in each package's
+`/usr/share/doc/<package>/copyright`, which Debian slim retains when filtering
+other documentation.
+
 ## Package layout and policy
 
 | Path | Purpose |

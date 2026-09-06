@@ -70,10 +70,9 @@ nfpms:
         dst: /usr/share/doc/carillon/README.md
       - src: docs/linux-packages.md
         dst: /usr/share/doc/carillon/linux-packages.md
-      - src: LICENSE
-        dst: /usr/share/doc/carillon/copyright
+      # Debian slim retains copyright while excluding other documentation.
       - src: THIRD_PARTY_NOTICES.md
-        dst: /usr/share/doc/carillon/THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/carillon/copyright
     scripts:
       preinstall: packaging/carillon-preinstall.sh
       postinstall: packaging/carillon-postinstall.sh
