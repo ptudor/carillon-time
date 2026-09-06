@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -19,9 +20,22 @@ import (
 	"carillon/internal/engine"
 	"carillon/internal/ntp"
 	ntpserver "carillon/internal/server"
+	"carillon/internal/source"
 )
 
-const queueSize = 256
+const (
+	queueSize = 256
+
+	// eventMinInterval is the shortest gap between two rows for one subject
+	// in events.tsv, so a flapping source cannot fill the disk.
+	eventMinInterval = time.Second
+
+	// pulseQueueSize buffers accepted reference-clock edges. A PPS delivers
+	// one a second and the writer drains between them, so this is a large
+	// margin; a full queue counts what it drops rather than blocking the
+	// refclock goroutine.
+	pulseQueueSize = 4096
+)
 
 // Config configures a Recorder.
 type Config struct {
@@ -61,11 +75,17 @@ type Recorder struct {
 
 	keepDays int
 
-	dropped atomic.Uint64
-	files   map[string]*dailyFile
+	dropped       atomic.Uint64
+	pulses        chan source.Pulse
+	pulsesDropped atomic.Uint64
+	files         map[string]*dailyFile
 
 	lastUpdates int
-	lastPulse   map[string]time.Time
+
+	// lastEvents is the previous snapshot's event-relevant state, and
+	// lastEventAt throttles a flapping subject. See writeEvents.
+	lastEvents  eventState
+	lastEventAt map[string]time.Time
 	lastErrLog  time.Time
 
 	// horizon is the retention clock: the latest wall time seen while the
@@ -87,8 +107,10 @@ func New(cfg Config) *Recorder {
 	}
 	return &Recorder{
 		dir: cfg.Dir, log: cfg.Log, server: cfg.Server, now: cfg.Now, keepDays: cfg.KeepDays,
-		ch:    make(chan *engine.Status, queueSize),
-		files: make(map[string]*dailyFile), lastPulse: make(map[string]time.Time),
+		ch:          make(chan *engine.Status, queueSize),
+		pulses:      make(chan source.Pulse, pulseQueueSize),
+		files:       make(map[string]*dailyFile),
+		lastEventAt: make(map[string]time.Time),
 	}
 }
 
@@ -114,6 +136,8 @@ func (r *Recorder) Run(ctx context.Context) {
 		select {
 		case st := <-r.ch:
 			r.processAndReport(st)
+		case p := <-r.pulses:
+			r.recordPulseAndReport(p)
 		case <-flush.C:
 			r.recordServerAndReport()
 			r.flushAndReport()
@@ -123,6 +147,8 @@ func (r *Recorder) Run(ctx context.Context) {
 				select {
 				case st := <-r.ch:
 					r.processAndReport(st)
+				case p := <-r.pulses:
+					r.recordPulseAndReport(p)
 				default:
 					r.recordServerAndReport()
 					r.flushAndReport()
@@ -147,6 +173,9 @@ func (r *Recorder) process(st *engine.Status) error {
 		return nil
 	}
 	r.noteHorizon(st)
+	if err := r.writeEvents(st); err != nil {
+		return err
+	}
 	if st.Updates > 0 && st.Updates != r.lastUpdates {
 		if err := r.writeLoop(st); err != nil {
 			return err
@@ -156,21 +185,150 @@ func (r *Recorder) process(st *engine.Status) error {
 		}
 		r.lastUpdates = st.Updates
 	}
-	for name, info := range st.Infos {
-		ref := info.Refclock
-		if ref == nil || ref.LastPulse.IsZero() || ref.LastPulse.Equal(r.lastPulse[name]) {
+	return nil
+}
+
+// Pulse queues one accepted reference-clock edge. It is called from the
+// refclock's own goroutine and never blocks: a full queue drops the pulse and
+// counts it, so a gap in pps.tsv is always accounted for.
+//
+// Pulse rows used to be derived from each source's latest Info at snapshot
+// time, which silently coalesced every pulse that arrived between two
+// publications (RA6X-048). Carrying the record itself means one row per
+// accepted pulse, or an explicit count of what was lost.
+func (r *Recorder) Pulse(p source.Pulse) {
+	if r == nil || p.At.IsZero() {
+		return
+	}
+	select {
+	case r.pulses <- p:
+	default:
+		r.pulsesDropped.Add(1)
+	}
+}
+
+func (r *Recorder) recordPulse(p source.Pulse) error {
+	line := strings.Join([]string{
+		p.At.UTC().Format(time.RFC3339Nano), escape(p.Source), number(p.Offset),
+		strconv.FormatUint(uint64(p.Sequence), 10),
+	}, "\t") + "\n"
+	return r.write("pps", p.At, "time\tsource\toffset_seconds\tsequence\n", line)
+}
+
+func (r *Recorder) recordPulseAndReport(p source.Pulse) {
+	if err := r.recordPulse(p); err != nil {
+		r.reportError(err)
+		_ = r.closeFiles()
+	}
+}
+
+// eventState is the part of a snapshot that events.tsv reports transitions
+// of. Comparing successive values is what makes the file a record of what
+// changed rather than a sample of what was true.
+type eventState struct {
+	state        string
+	systemSource string
+	ppsQualified bool
+	preferLost   bool
+	sources      map[string]string // name -> "status/reachable"
+}
+
+const eventsHeader = "time\tkind\tsubject\tfrom\tto\n"
+
+// writeEvents records material state, selection and source changes.
+//
+// loop.tsv and sources.tsv are sampled per *loop update*, which is the
+// documented contract and stays exactly as it is — but it means the most
+// useful health changes, during filter starvation, holdover entry and expiry,
+// repeated failures or a source shutdown, may never be recorded at all
+// (RA6X-047). events.tsv is a separate, explicitly identified stream, so no
+// existing column changes meaning and no consumer has to be told that
+// `Updates` now means something else.
+//
+// Volume is bounded twice: only transitions are written, and a subject that
+// is flapping is recorded at most once a second.
+func (r *Recorder) writeEvents(st *engine.Status) error {
+	now := eventStateOf(st)
+	if r.lastEvents.sources == nil {
+		// First snapshot: record the starting point, not a transition from
+		// nothing to everything.
+		r.lastEvents = now
+		return nil
+	}
+	type change struct{ kind, subject, from, to string }
+	var changes []change
+	if now.state != r.lastEvents.state {
+		changes = append(changes, change{"state", "", r.lastEvents.state, now.state})
+	}
+	if now.systemSource != r.lastEvents.systemSource {
+		changes = append(changes, change{"system_source", "", r.lastEvents.systemSource, now.systemSource})
+	}
+	if now.ppsQualified != r.lastEvents.ppsQualified {
+		changes = append(changes, change{"pps_qualified", "", boolText(r.lastEvents.ppsQualified), boolText(now.ppsQualified)})
+	}
+	if now.preferLost != r.lastEvents.preferLost {
+		changes = append(changes, change{"prefer_lost", "", boolText(r.lastEvents.preferLost), boolText(now.preferLost)})
+	}
+	for name, to := range now.sources {
+		if from, ok := r.lastEvents.sources[name]; !ok || from != to {
+			was := from
+			if !ok {
+				was = "absent"
+			}
+			changes = append(changes, change{"source", name, was, to})
+		}
+	}
+	for name, from := range r.lastEvents.sources {
+		if _, ok := now.sources[name]; !ok {
+			changes = append(changes, change{"source", name, from, "absent"})
+		}
+	}
+	r.lastEvents = now
+	sort.Slice(changes, func(i, j int) bool {
+		if changes[i].kind != changes[j].kind {
+			return changes[i].kind < changes[j].kind
+		}
+		return changes[i].subject < changes[j].subject
+	})
+	for _, c := range changes {
+		key := c.kind + "\x00" + c.subject
+		if last, ok := r.lastEventAt[key]; ok && st.Now.Sub(last) < eventMinInterval {
 			continue
 		}
+		r.lastEventAt[key] = st.Now
 		line := strings.Join([]string{
-			ref.LastPulse.UTC().Format(time.RFC3339Nano), escape(name), number(ref.LastOffset),
-			strconv.FormatUint(uint64(ref.Sequence), 10),
+			st.Now.UTC().Format(time.RFC3339Nano), c.kind, escape(c.subject), escape(c.from), escape(c.to),
 		}, "\t") + "\n"
-		if err := r.write("pps", ref.LastPulse, "time\tsource\toffset_seconds\tsequence\n", line); err != nil {
+		if err := r.write("events", st.Now, eventsHeader, line); err != nil {
 			return err
 		}
-		r.lastPulse[name] = ref.LastPulse
 	}
 	return nil
+}
+
+func eventStateOf(st *engine.Status) eventState {
+	e := eventState{
+		state:        st.State.String(),
+		systemSource: st.SystemSource,
+		ppsQualified: st.PPSQualified,
+		preferLost:   st.PreferLost,
+		sources:      make(map[string]string, len(st.Sources)),
+	}
+	for _, s := range st.Sources {
+		reach := "unreachable"
+		if s.Reach != 0 {
+			reach = "reachable"
+		}
+		e.sources[s.Name] = s.Status.String() + "/" + reach
+	}
+	return e
+}
+
+func boolText(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
 }
 
 func (r *Recorder) recordServerAndReport() {
@@ -461,6 +619,11 @@ func (r *Recorder) reportError(err error) {
 func (r *Recorder) reportDrops() {
 	if n := r.dropped.Swap(0); n != 0 {
 		r.log.Warn("statistics snapshots dropped", "count", n)
+	}
+	if n := r.pulsesDropped.Swap(0); n != 0 {
+		// Reported separately: a snapshot drop costs a sampled row, a pulse
+		// drop costs a distinct recorded event.
+		r.log.Warn("accepted pulses not recorded", "count", n)
 	}
 }
 

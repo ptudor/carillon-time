@@ -2,11 +2,13 @@ package server
 
 import (
 	"errors"
+	"log/slog"
 	"math"
 	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -342,4 +344,92 @@ func TestAstra6ConcurrentEventsKeepOne(t *testing.T) {
 	if got.Before(base) || got.After(base.Add(10*time.Second)) {
 		t.Fatalf("last event %v is not one of the stored values", got)
 	}
+}
+
+// fakeBuffers is a kernel that accepts only the sizes it is told to.
+type fakeBuffers struct {
+	accept  map[int]bool
+	err     error
+	tried   []int
+	granted int
+}
+
+func (f *fakeBuffers) SetReadBuffer(n int) error {
+	f.tried = append(f.tried, n)
+	if f.err != nil {
+		return f.err
+	}
+	if f.accept[n] {
+		f.granted = n
+		return nil
+	}
+	return syscall.ENOBUFS
+}
+
+// TestAstra6ReceiveBufferFallbackReachesTheMinimum covers RA6X-043. Halving
+// an arbitrary request can step straight past the documented minimum without
+// ever asking for it — 100000 halves to 50000, below the 65536 floor — so
+// startup failed with an error claiming the minimum had been tried.
+func TestAstra6ReceiveBufferFallbackReachesTheMinimum(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	addr := netip.MustParseAddrPort("127.0.0.1:123")
+
+	t.Run("a non-power-of-two request reaches the floor", func(t *testing.T) {
+		f := &fakeBuffers{accept: map[int]bool{minRecvBuffer: true}}
+		if err := setReadBuffer(f, 100000, addr, log); err != nil {
+			t.Fatalf("a system that can grant the minimum must not fail: %v", err)
+		}
+		if f.granted != minRecvBuffer {
+			t.Fatalf("granted %d, want the %d floor (tried %v)", f.granted, minRecvBuffer, f.tried)
+		}
+		if got := f.tried[len(f.tried)-1]; got != minRecvBuffer {
+			t.Fatalf("the last attempt was %d, not the floor (tried %v)", got, f.tried)
+		}
+	})
+
+	t.Run("the floor is asked for exactly once", func(t *testing.T) {
+		f := &fakeBuffers{accept: map[int]bool{}}
+		if err := setReadBuffer(f, 100000, addr, log); err == nil {
+			t.Fatal("all attempts failing must be an error")
+		}
+		n := 0
+		for _, v := range f.tried {
+			if v == minRecvBuffer {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("the floor was attempted %d times: %v", n, f.tried)
+		}
+	})
+
+	t.Run("a power-of-two request still works", func(t *testing.T) {
+		f := &fakeBuffers{accept: map[int]bool{1 << 20: true}}
+		if err := setReadBuffer(f, 4<<20, addr, log); err != nil {
+			t.Fatal(err)
+		}
+		if f.granted != 1<<20 {
+			t.Fatalf("granted %d, want %d (tried %v)", f.granted, 1<<20, f.tried)
+		}
+	})
+
+	t.Run("a request equal to the floor is one attempt", func(t *testing.T) {
+		f := &fakeBuffers{accept: map[int]bool{minRecvBuffer: true}}
+		if err := setReadBuffer(f, minRecvBuffer, addr, log); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.tried) != 1 {
+			t.Fatalf("attempted %v, want one", f.tried)
+		}
+	})
+
+	t.Run("a non-capacity error stops immediately", func(t *testing.T) {
+		f := &fakeBuffers{err: syscall.EPERM}
+		if err := setReadBuffer(f, 4<<20, addr, log); err == nil {
+			t.Fatal("a non-capacity error must fail")
+		}
+		if len(f.tried) != 1 {
+			t.Fatalf("a non-capacity error was retried: %v", f.tried)
+		}
+	})
 }

@@ -40,6 +40,11 @@ func TestRecorderWritesAndDeduplicatesDailyFiles(t *testing.T) {
 	}
 	r.Record(st)
 	r.Record(st)
+	// Pulses travel their own immutable path now, so that one row is
+	// written per accepted edge rather than one per snapshot that happens
+	// to see a new LastPulse (RA6X-048). Offering the same pulse twice is
+	// not something a refclock does; one accepted edge is one call.
+	r.Pulse(source.Pulse{Source: "pps\t0", At: pulse, Offset: 9e-7, Sequence: 42})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.Run(ctx)

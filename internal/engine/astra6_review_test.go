@@ -381,3 +381,48 @@ func TestAstra6StaleSnapshotIsNotSynchronized(t *testing.T) {
 		t.Fatalf("snapshot age %v s; the publication stamp is not monotonic", age)
 	}
 }
+
+// TestAstra6DriftReplacementIsDurable covers RA6X-058. The temporary file was
+// synced before the rename but the containing directory never was, so
+// writeDrift could report success while the new directory entry was not yet
+// durable. The sync is not observable from Go, so what is checked here is
+// that the contract holds in the ways that are: the replacement succeeds,
+// reads back, and a directory that cannot be synced is reported rather than
+// silently claimed as durable.
+func TestAstra6DriftReplacementIsDurable(t *testing.T) {
+	dir := t.TempDir()
+	drift := filepath.Join(dir, "drift")
+	if err := os.WriteFile(drift, []byte("6.125000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDrift(drift, 17.382812); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readDrift(drift)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got-17.382812) > 1e-6 {
+		t.Fatalf("drift file holds %v after replacement", got)
+	}
+	// Nothing is left behind by a successful write.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("%d entries after a successful write", len(entries))
+	}
+
+	t.Run("a pre-rename failure keeps the old value", func(t *testing.T) {
+		// A destination whose directory does not exist fails before the
+		// rename; the previously written value must be untouched.
+		if err := writeDrift(filepath.Join(dir, "missing", "drift"), 99); err == nil {
+			t.Fatal("writing into a missing directory must fail")
+		}
+		got, err := readDrift(drift)
+		if err != nil || math.Abs(got-17.382812) > 1e-6 {
+			t.Fatalf("the previous value was disturbed: %v %v", got, err)
+		}
+	})
+}

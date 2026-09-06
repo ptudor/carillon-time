@@ -163,26 +163,48 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 // asks for 4 MB, so copying it to a FreeBSD host with default sysctls used to
 // stop the daemon starting. Serving time with a smaller buffer and a warning
 // naming the sysctl to raise is better than not serving time.
-func setReadBuffer(conn *net.UDPConn, want int, addr netip.AddrPort, log *slog.Logger) error {
+// bufferSetter is the seam setReadBuffer works through, satisfied by
+// *net.UDPConn and by a test's fake kernel.
+type bufferSetter interface {
+	SetReadBuffer(bytes int) error
+}
+
+func setReadBuffer(conn bufferSetter, want int, addr netip.AddrPort, log *slog.Logger) error {
 	var lastErr error
-	for size := want; size >= minRecvBuffer; size /= 2 {
+	var tried []int
+	// Halving an arbitrary request can step straight past the documented
+	// minimum without ever asking for it: 100000 halves to 50000, below the
+	// 65536 floor, and startup then failed with an error claiming the
+	// minimum had been tried (RA6X-043). The floor is therefore always the
+	// last attempt, exactly once.
+	for size := want; ; size /= 2 {
+		if size < minRecvBuffer {
+			size = minRecvBuffer
+		}
+		tried = append(tried, size)
 		err := conn.SetReadBuffer(size)
 		if err == nil {
 			if size != want {
 				log.Warn("receive buffer request was refused; using a smaller one",
 					"listen", addr, "requested", want, "granted_request", size,
+					"attempted", tried,
 					"hint", RecvBufferSysctl()+" must be raised before a larger buffer can be granted",
 					"error", lastErr)
 			}
 			return nil
 		}
 		lastErr = err
+		// Only a capacity refusal is worth retrying smaller; anything else
+		// will fail identically at every size.
 		if !errors.Is(err, syscall.ENOBUFS) && !errors.Is(err, syscall.EINVAL) {
 			break
 		}
+		if size == minRecvBuffer {
+			break
+		}
 	}
-	return fmt.Errorf("server: listen %s: receive buffer of %d bytes (down to %d): raise %s: %w",
-		addr, want, minRecvBuffer, RecvBufferSysctl(), lastErr)
+	return fmt.Errorf("server: listen %s: receive buffer of %d bytes (attempted %v, down to %d): raise %s: %w",
+		addr, want, tried, minRecvBuffer, RecvBufferSysctl(), lastErr)
 }
 
 // ReceiveBuffers returns each listener's effective SO_RCVBUF in bytes, in the

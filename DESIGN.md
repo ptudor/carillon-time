@@ -1542,7 +1542,14 @@ good-against-bad traffic chart.
 ### 10.5 Files
 
 - **Drift file:** one line, frequency in ppm, written atomically (temp +
-  rename) every hour and at shutdown, read at start. Same format as chrony's.
+  fsync + rename + **directory fsync**) every hour and at shutdown, read at
+  start. Same format as chrony's. The directory sync is what makes the
+  guarantee carillon states true — *a successful write is durable* — rather
+  than merely atomic to a concurrent reader: `rename(2)` is atomic at any
+  instant, but on the supported filesystems that says nothing about which
+  entry survives power loss. A directory that cannot be opened or synced is
+  reported as an error, because returning success there would be exactly the
+  false promise the guarantee is about.
   The write is **gated on the estimate having stopped moving *while it was
   being measured***: the engine keeps the last `drift_stable_seconds`
   (default 900) of base-frequency readings and writes only while that history
@@ -1580,7 +1587,7 @@ good-against-bad traffic chart.
 
 - **Statistics** (optional, `[stats] dir`): `loop.tsv` (per update: time, θ,
   freq, ψ, poll, state), `pps.tsv` (per accepted pulse: time, θ),
-  `sources.tsv`, and `server.tsv` (one row per address family per minute
+  `events.tsv`, `sources.tsv`, and `server.tsv` (one row per address family per minute
   while the listener is enabled, carrying every counter of §10.4 plus the
   mode 6 and 7 probe counts and the version histogram; values are cumulative
   since startup, so a reader takes differences and treats a drop as a
@@ -1601,6 +1608,24 @@ good-against-bad traffic chart.
   is removed until the clock has been synchronized at least once. The horizon
   can lag the current day, so retention sometimes keeps a little more than
   `keep_days`; that is the safe direction.
+  `pps.tsv` carries one row per **accepted pulse**, delivered by the refclock
+  itself over a bounded non-blocking queue. Deriving it from each source's
+  latest `Info` at snapshot time silently coalesced every pulse that arrived
+  between two publications, with no drop counted; a pulse that cannot be
+  queued is now counted and logged separately from snapshot drops, so a gap is
+  always accounted for.
+
+  `events.tsv` (`time, kind, subject, from, to`) records **transitions**:
+  synchronization state, system source, PPS qualification, prefer loss, and
+  each source's selection status and reachability. `loop.tsv` and
+  `sources.tsv` are sampled per *loop update*, which is their contract and is
+  unchanged — but it means the most useful health changes, during filter
+  starvation, holdover entry and expiry, repeated failures or a source
+  shutdown, may never appear in them at all. An explicitly separate stream
+  gives an operator the outage without redefining what `Updates` means for
+  anyone reading the existing files. Volume is bounded twice: only transitions
+  are written, and one subject is recorded at most once a second.
+
   Buffered, flushed each minute and on exit. Snapshot delivery to the writer is bounded and
   non-blocking: a stalled disk drops and counts statistics snapshots rather
   than delaying the engine. Output errors are rate-limited WARNs and retried;

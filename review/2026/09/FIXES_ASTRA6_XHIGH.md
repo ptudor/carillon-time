@@ -1825,3 +1825,197 @@ day and requires `started_at` and `uptime_seconds` not to move.
 `TestAstra6LastEventSurvivesAClockStep` requires a corrected time to replace a
 pre-step future one, and `TestAstra6ConcurrentEventsKeepOne` runs eight
 goroutines against one counter.
+
+---
+
+## Wave 9 — diagnostics, durability, and remaining validation
+
+## RA6X-047 — Statistics omit source loss and state transitions without loop updates — FIXED
+
+**Reason for implementing rather than skipping.** This finding is marked
+*Needs investigation*, but unlike RA6X-023 and RA6X-057 the decision it names
+does not choose between options with opposite consequences. Its fix
+specification says to use *"an explicitly identified event stream or
+compatible repeated snapshots rather than silently redefining `Updates`"* —
+and an additional file changes no existing column's meaning, no existing
+consumer, and nothing about what `Updates` means. The only thing being decided
+is whether the coverage exists at all, and adding it is reversible in a way
+that redefining an established schema is not.
+
+**Changed.** A new `events.tsv` records **transitions**, with the columns
+`time, kind, subject, from, to`: synchronization state, system source, PPS
+qualification, prefer loss, and each source's selection status and
+reachability. `loop.tsv` and `sources.tsv` remain sampled per loop update, so
+their documented contract is untouched — but during filter starvation,
+holdover entry and expiry, repeated failures or a source shutdown, they may
+record nothing at all, which is precisely when an operator needs the history.
+Volume is bounded twice: only transitions are written, and one subject is
+recorded at most once a second, so a flapping source cannot fill the disk.
+The work stays on the recorder's own goroutine, off the engine.
+
+**Files.** `internal/stats/writer.go`, `DESIGN.md`,
+`internal/stats/astra6_review_test.go`.
+
+**Verification.** `TestAstra6EventsReconstructAnOutage` drives synchronized →
+source loss → holdover → unsynchronized → recovery **with `Updates` never
+changing**, requires every transition to appear in `events.tsv`, and requires
+`loop.tsv` to still hold exactly its one per-update row — so the existing
+contract is demonstrably unchanged. `TestAstra6EventVolumeIsBounded` flaps a
+source ten times a second for twenty seconds and requires the rate bound to
+hold.
+
+## RA6X-048 — Per-pulse statistics can silently coalesce accepted PPS events — FIXED
+
+**Changed.** Pulse rows were derived from each source's latest `Info` when the
+engine published a snapshot, and `Info` retains only the newest pulse — so
+several pulses arriving between two publications collapsed into one row and the
+earlier ones vanished without the recorder's drop counter moving. Coalescing
+was possible even when the recorder queue never filled, because a source
+advances independently of engine consumption.
+
+Accepted pulses now travel their own immutable event path. `source.Pulse` is
+the record — source name, kernel timestamp, calibrated offset, device sequence
+— `PPSConfig.OnPulse` delivers it at the moment of acceptance, and
+`Recorder.Pulse` queues it without blocking the refclock goroutine. A pulse
+that cannot be queued increments a **separate** counter, logged separately
+from snapshot drops, so a gap in `pps.tsv` is always accounted for and zero
+loss is never inferred from an empty snapshot-drop counter. Sequence wrap
+handling, the existing TSV columns and the cumulative source counters are
+unchanged, and the NMEA lag tracker still receives the same edge.
+
+**Files.** `internal/source/source.go`, `internal/refclock/pps.go`,
+`internal/stats/writer.go`, `cmd/carillon/main.go`, `DESIGN.md`,
+`internal/stats/writer_test.go`, `internal/stats/astra6_review_test.go`.
+
+**Verification.** `TestAstra6EveryAcceptedPulseIsRecorded` accepts 25 pulses
+while nothing is draining the recorder — the case that used to coalesce — and
+requires 25 rows with each row's own timestamp and sequence, never a mixture.
+`TestAstra6PulseLossIsCounted` overfills the queue by exactly 50 and requires
+50 counted pulse drops and zero snapshot drops.
+`TestAstra6PulseQueueNeverBlocks` offers ten queue-lengths of pulses and
+requires the caller never to block.
+
+## RA6X-049 — JSON output failures are reported as successful empty responses — FIXED
+
+**Changed.** All three paths.
+
+*Monitor:* `writeJSON` committed HTTP 200 before encoding and discarded the
+encoder's error, so a non-finite value produced 200 with an empty body. It now
+marshals first and only then writes the status and the body; a failure becomes
+a bounded, stable HTTP 500 with a fixed JSON error object, and the detail goes
+to the log rather than to the client.
+
+*Control:* `reply` logged the marshal failure and closed the connection with
+nothing sent. It now sends `{"error":"control: internal encoding failure"}` —
+the same shape every other failure takes — so a client is told rather than
+left to guess.
+
+*CLI:* `carillonctl -json` used a streaming encoder and discarded its result,
+so it could exit 0 having printed nothing or half a document. It now
+serializes to a buffer, writes it in one call, and returns exit 2 on either an
+encoding or a write failure.
+
+The valid-data schema, units and status codes are unchanged, and the upstream
+finiteness guards from RA6X-014, RA6X-035 and RA6X-041 mean invalid numeric
+data is refused before it reaches here rather than being turned into healthy
+zeros.
+
+**Files.** `internal/monitor/server.go`, `internal/control/server.go`,
+`cmd/carillonctl/main.go`, `internal/monitor/astra6_review_test.go`.
+
+**Verification.** The named probe
+`TestAstra6JSONEncodingFailureIsNotSuccess` passes and additionally requires
+the status to be 500. `TestAstra6ValidJSONIsUnchanged` confirms ordinary data
+still produces 200, the right content type, and a body that parses.
+
+## RA6X-058 — Drift replacement lacks an explicit power-loss durability contract — FIXED
+
+**Reason for implementing rather than skipping.** This is marked *Needs
+investigation*, and the crash testing its verification asks for cannot be done
+from here. But the decision itself is one-sided in a way RA6X-023 and
+RA6X-057's are not: making the guarantee *stronger* cannot break any
+observable behaviour, costs one `fsync` an hour, and choosing **not** to make
+it is the option that would need justifying. The stated guarantee is therefore
+adopted and documented, and the crash-testing verification is deferred rather
+than the whole finding.
+
+**Changed.** The write sequence is now temp → write → fsync → chmod → rename →
+**fsync of the containing directory**. `rename(2)` is atomic to a concurrent
+reader at any instant, but on the supported filesystems that says nothing
+about which directory entry survives power loss, so `writeDrift` could return
+success on a calibration that then reverted or disappeared. A directory that
+cannot be opened or synced is reported as an error rather than silently
+claimed durable — that false promise is what the finding is about. Atomic
+reader visibility, the known-good contents on a pre-rename failure, the file
+mode and the stable-write gate (RA6X-013) are unchanged, and the work happens
+on the persistence worker (RA6X-044), so durability cannot block discipline.
+`DESIGN.md` §10.5 states the guarantee.
+
+**Files.** `internal/engine/engine.go`, `DESIGN.md`,
+`internal/engine/astra6_review_test.go`.
+
+**Verification.** `TestAstra6DriftReplacementIsDurable` checks the replacement
+succeeds and reads back, that nothing is left behind, and that a pre-rename
+failure leaves the previous value untouched. **Deferred to the target hosts:**
+filesystem fault and crash testing in a disposable environment on the
+supported Linux and FreeBSD filesystems, and injected syscall failures around
+write, sync, chmod, rename and the directory sync.
+
+## RA6X-043 — Receive-buffer fallback can skip the promised minimum — FIXED
+
+**Changed.** Halving an arbitrary request could step straight past the
+documented floor without ever asking for it — 100000 halves to 50000, below
+65536 — so a system able to grant the minimum failed startup with an error
+saying the minimum had been tried. The loop now clamps to `minRecvBuffer` and
+attempts it **exactly once** as the last try, terminates immediately on a
+non-capacity error (anything but `ENOBUFS`/`EINVAL` will fail identically at
+every size), and reports the sizes actually attempted in both the warning and
+the failure. `setReadBuffer` takes a small `bufferSetter` interface so the
+kernel can be faked. Current syscall hints, startup failure when even the
+minimum is unavailable, Linux's doubled `SO_RCVBUF` reporting and the
+configured maximum are unchanged.
+
+**Files.** `internal/server/listener.go`,
+`internal/server/astra6_review_test.go`.
+
+**Verification.** `TestAstra6ReceiveBufferFallbackReachesTheMinimum` injects a
+kernel that rejects 100000 but accepts 65536 and requires the floor to be
+reached and granted; further subtests require the floor to be attempted
+exactly once when everything fails, a power-of-two request to still work, a
+request equal to the floor to be a single attempt, and a non-capacity error to
+stop immediately.
+
+## RA6X-036 — Presence-sensitive refclock validation silently ignores explicit settings — FIXED
+
+**Changed.** Validation tested decoded *values*, so `baud = 0` on a bare PPS
+block was indistinguishable from absence and passed, while `baud = 9600` was
+rejected — the diagnostic depended on what the operator happened to write.
+`Parse` now decodes the document a second time into a generic map and records
+which keys each `[[refclock]]` actually contained; validation tests presence.
+Both directions are covered: GPS-only keys (`baud`, `pps`, `pps_edge`,
+`pps_offset`, `nmea_offset`, `sentences`) on a `type = "pps"` block, and
+PPS-only keys (`edge`, `offset`) on a `type = "gps"` block.
+
+`pps = "none"` needed the explicit policy the finding asks for. It is
+intentionally supported — an NMEA-only GPS — so `pps_edge` and `pps_offset`
+are then inapplicable in exactly the way the GPS keys are on a bare PPS block,
+and are rejected with a message that says what to set instead. One rule rather
+than two, and an operator who meant to enable PPS is told rather than silently
+getting NMEA only.
+
+The rule applies to *parsed* configuration only: a `Config` built in Go cannot
+observe presence and its zero values are legitimate defaults, which the field's
+doc comment states. Existing key names, valid defaults, correct
+`pps_offset`/`nmea_offset` behaviour and every shipped example are unaffected.
+
+**Files.** `internal/config/config.go`, `internal/config/config_test.go`.
+
+**Verification.** The review's own fixture
+`TestVerification021RejectsExplicitGPSOnlyZeros` — all six cases — now passes.
+`TestRefclockKeysAreRejectedByPresence` tables absent, zero, empty and nonzero
+variants for both types, the `pps = "none"` case, a set of valid blocks that
+must keep parsing, and a programmatically built `Config` that must not be
+affected. Six literal-`Refclock` cases in `TestValidateRules` were replaced by
+these TOML-driven ones, because a Go literal is exactly the case the rule does
+not apply to; `TestAstra6ShippedExamplesStillParse` continues to parse
+`deploy/carillon.toml.example`.

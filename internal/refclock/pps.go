@@ -76,7 +76,10 @@ type PPSConfig struct {
 	// predates the step. Nil disables the check.
 	Generation func() uint64
 
-	OnPulse func(time.Time)
+	// OnPulse receives every accepted edge as an immutable record. It must
+	// return promptly: it runs on the refclock's own goroutine, between one
+	// pulse and the next.
+	OnPulse func(source.Pulse)
 }
 
 // PPS consumes kernel-timestamped pulse edges and emits robust, averaged
@@ -425,7 +428,9 @@ func (p *PPS) accept(s pps.Sample) discipline.Measurement {
 	}
 	p.haveEverPulse = true
 	if p.cfg.OnPulse != nil {
-		p.cfg.OnPulse(s.Time)
+		p.cfg.OnPulse(source.Pulse{
+			Source: p.cfg.Name, At: s.Time, Offset: theta + p.cfg.Offset, Sequence: s.Sequence,
+		})
 	}
 	m.Reach = p.reach
 	p.appendWindow(s.Sequence, theta)
