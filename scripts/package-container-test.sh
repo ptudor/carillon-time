@@ -33,11 +33,7 @@ for service in $services; do
         exit 1
     fi
     systemd-analyze verify "/usr/lib/systemd/system/$service.service"
-    if [ "$service" = dnssec-tudor ]; then
-        config="/etc/$service/config.toml"
-    else
-        config="/etc/$service/$service.toml"
-    fi
+    config="/etc/$service/$service.toml"
     test "$(stat -c %a "$config")" = 640
     test "$(stat -c %U "$config")" = root
     test "$(stat -c %G "$config")" = "$service"
@@ -58,11 +54,7 @@ else
     dnf reinstall -y --setopt=localpkg_gpgcheck=0 "$@"
 fi
 for service in $services; do
-    if [ "$service" = dnssec-tudor ]; then
-        config="/etc/$service/config.toml"
-    else
-        config="/etc/$service/$service.toml"
-    fi
+    config="/etc/$service/$service.toml"
     grep -q '^# package-upgrade-sentinel$' "$config"
     test -f "/var/lib/$service/package-test-sentinel"
     test ! -e "/etc/systemd/system/multi-user.target.wants/$service.service"
