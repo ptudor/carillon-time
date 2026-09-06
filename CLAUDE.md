@@ -10,13 +10,23 @@ its clients.
 **Status (2026-09-05):** milestones M0–M4 of `DESIGN.md` §15 are implemented
 in code, plus a public-server hardening pass (2026-08-24) covering martian
 filtering, a counter for every dropped datagram, per-address-family statistics
-and the `[serve]` sizing knobs — see `DESIGN.md` §7 and §10.4. A 36-finding
-deep review (`review/2026/09/REVIEW_FABLE5_XHIGH.md`) was worked through on
-2026-09-05: 34 fixed, 2 skipped with reasons, all recorded per finding in
-`FIXES_FABLE5_XHIGH.md`. Note the two open items there — the FreeBSD half of
-RF5X-003 (directed broadcasts are still answered on FreeBSD; the constants the
-fix needs do not exist there) and RF5X-012 (the RFC filter dispersion, which
-cannot be applied without also changing the staleness rule).
+and the `[serve]` sizing knobs — see `DESIGN.md` §7 and §10.4. Two deep
+reviews have been worked through:
+
+- 36 findings (`review/2026/09/REVIEW_FABLE5_XHIGH.md`): 34 fixed, 2 skipped,
+  recorded per finding in `FIXES_FABLE5_XHIGH.md`. Both open items there are
+  now closed by the Astra6 pass — RF5X-003's FreeBSD half by RA6X-026 and
+  RF5X-012 by RA6X-024.
+- 59 findings (`review/2026/09/REVIEW_ASTRA6_XHIGH.md`): 55 fixed, 4 skipped,
+  recorded per finding in `FIXES_ASTRA6_XHIGH.md`. The four skipped —
+  RA6X-021, RA6X-023, RA6X-040, RA6X-057 — each need either hardware/peer
+  captures or a policy decision from the maintainer; each entry says exactly
+  what would close it. That pass changed the discipline core: observation-time
+  propagation, root-distance filter ranking, applied-word accounting, a
+  two-state clock epoch, and per-source freshness (`DESIGN.md` §5.1 and §6.3).
+  The review's own reproduction, `review/2026/09/takeover-repro/reproduce.py
+  baseline`, now passes in full.
+
 The authenticated topology is deployed on `gummi` (Fedora 43), `twocom`
 (FreeBSD 15) and `navlisten2026` (Debian 13, client-only): both clock
 backends, init systems, drift persistence, IPv4/IPv6 listeners, ACLs, CMAC,
@@ -96,11 +106,17 @@ Mac) and returns `ErrUnsupportedPlatform` at runtime. `go build ./...` and
 
 ```
 make build                 # host build of carillon + carillonctl into ./bin
-make test                  # go vet ./... && go test -race ./...
+make test                  # go vet ./... && CGO_ENABLED=1 go test -race ./...
+make abicheck              # compare the hand-declared kernel ABI against the
+                           # system headers; native only, needs a C compiler
 make freebsd               # GOOS=freebsd GOARCH=amd64
 make linux                 # GOOS=linux GOARCH=amd64 (+ arm64 target)
 go test -fuzz=FuzzDecode ./internal/ntp/   # wire-format fuzzing
 ```
+
+`make test` enables cgo because the race detector needs it on Linux and
+FreeBSD; production builds and cross-builds stay `CGO_ENABLED=0`.
+Cross-compiled race testing is not supported — run `make test` on each host.
 
 Prefer `go test -race ./...` over per-package runs before declaring anything
 done. `staticcheck` is welcome if it is installed; do not add it as a module
@@ -113,10 +129,15 @@ dependency.
    from a test. Every test uses `clock.Fake`. Tests that need a real PPS device
    or real clock privileges are build-tagged `hwtest` and gated on
    `CARILLON_HW_TESTS=1`; the user runs those on the target host, never Claude.
-2. **No cgo.** Kernel struct layouts (`timex`, `pps_info`, `pps_params`,
-   `pps_fetch_args`, Linux `pps_fdata`) are declared by hand per OS/arch. Each
-   gets a `//go:build cgo && hwtest` size/offset test that compares against the
-   C headers — it runs only on the target host, but it must exist.
+2. **No cgo in the daemon.** Kernel struct layouts (`timex`, `pps_info`,
+   `pps_params`, `pps_fetch_args`, Linux `pps_fdata`) are declared by hand per
+   OS/arch. Each gets a size/offset comparison against the C headers — it runs
+   only on the target host, but it must exist. Go rejects `import "C"` inside a
+   `_test.go` file, so the C side lives in `abi_*_cgo.go` files tagged
+   `//go:build <os> && cgo && abicheck` and the comparison lives in an ordinary
+   Go test with the same tag. `abicheck` is deliberately **not** `hwtest`:
+   reading header offsets opens no device and touches no clock, so the safe
+   check must not require enabling the tests that do. `make abicheck` runs it.
 3. **NTP modes 6 and 7 (control / private) are never implemented.** Status
    comes from the unix control socket. A reply is never larger than the request
    that produced it; the server is not an amplifier.
