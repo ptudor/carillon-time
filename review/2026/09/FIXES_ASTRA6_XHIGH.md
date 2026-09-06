@@ -14,6 +14,54 @@ real serial device, a live PPS edge, or a privileged clock is cross-compiled
 and type-checked here and marked **deferred to the target hosts** — per
 CLAUDE.md hard rule 1, Claude never runs those.
 
+## Outcome
+
+| | Count |
+|---|---:|
+| Fixed | 55 |
+| Skipped | 4 |
+| **Total** | **59** |
+
+The four skipped findings are RA6X-021, RA6X-023, RA6X-040 and RA6X-057. Each
+is one the review itself marks **Needs investigation**, and in each case the
+fix specification opens with evidence this session cannot gather (receiver
+captures, live peer captures) or a policy decision that changes documented
+behaviour and is the maintainer's to make. Each entry below states what is
+needed to close it and what the present behaviour is. The other two
+investigation findings, RA6X-047 and RA6X-058, were implemented; their entries
+explain why those decisions were one-sided in a way the four are not.
+
+## Final verification
+
+Run from the repository root after the last change:
+
+| Check | Result |
+|---|---|
+| `CGO_ENABLED=1 go test -race -count=2 ./...` | pass, all nineteen packages |
+| `make vet`, `make test`, `make dist` | pass; all four cross-builds report `CGO_ENABLED=0` |
+| `review/2026/09/takeover-repro/reproduce.py baseline` | **pass in full** — twelve delayed-feedback cases and the drift-persistence case, all of which failed on the reviewed baseline |
+| `verification_fable5_xhigh/run_probes.py` | 8 of 9 executable probes pass; see the caveats below |
+| `verification_fable5_xhigh/probe_signals.py` | pass |
+| `go list -test -tags abicheck` for six (GOOS, GOARCH, package) pairs | loads cleanly; was rejected on the baseline |
+| `go test -c` for `internal/serial` on linux and freebsd, amd64 and arm64 | builds |
+
+**Caveats on the Fable5 probe set**, which is a fixed set of text fixtures
+from the previous review and not part of the build:
+
+- `TestVerification036ReportsNeverReachablePreferAfterFallback` fails, and
+  correctly. It builds a `SourceState` with `Updated: 100` and then runs
+  selection at `now = 1000` to represent "900 s of fallback service" — but a
+  source that has said nothing for 900 s at poll 6 is fourteen missed polls
+  stale, which RA6X-003's freshness rule now makes ineligible. Real fallback
+  service means the source keeps reporting, which is what
+  `TestAstra6ReportsNeverReachablePreferAfterFallback` does; the property the
+  fixture is about is covered there and in `TestAstra6PreferLostPhases`.
+- The `internal/refclock` and `internal/source` fixtures no longer compile:
+  they call `n.consume` and assign `n.lookup` with the signatures those had
+  before RA6X-006 added the clock epoch to the NMEA framing path and RA6X-037
+  made DNS return every answer. Signature drift in an out-of-tree fixture, not
+  a regression.
+
 ---
 
 ## Wave 0 — enable native verification alongside the fixes
