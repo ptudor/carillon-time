@@ -613,6 +613,96 @@ instead of 34-plus, but that is a deliberate deviation from RFC 5905 §10 and
 from ntpd, and wants a simulation pass. Until it is fixed, expect this chain
 to repeat.
 
+## Astra6 review fixes — 2026-09-06 00:48–01:05 (UTC)
+
+Revision: `3b08543` (55 of the 59 `REVIEW_ASTRA6_XHIGH.md` findings fixed).
+Deployed to all three in-house hosts, upstream first per the runbook:
+`gummi` → `twocom` → `navlisten2026`, each reaching SYNCED before the next.
+
+Method on each host: stage the binary in `/tmp`, run `-check` against the live
+config with the *new* binary, keep the outgoing binary as
+`carillon.9cb190e`, install beside the target and `mv` over it (atomic, and
+avoids `ETXTBSY` on a running image), restart, `waitsync 300`.
+
+Results:
+
+- All three report `3b08543`, reached SYNCED with **no clock step**, and
+  restarted from their drift files. `gummi` in 6 s, `twocom` in 33 s,
+  `navlisten2026` in 8 s. No WARN or ERROR in any service log.
+- `gummi` (stratum 2→3, public pool): offset +1.9 ms, frequency −6.33 ppm
+  against −6.353 ppm before the restart — the drift file carried it across
+  unchanged. Root dispersion 130 ms at t+6 s decaying to 66 ms by t+100 s as
+  the filters primed, which is the RA6X-024 priming uncertainty behaving as
+  designed.
+- `twocom` (prefers `gummi`, authenticated): materially better than before.
+  Offset **+287 µs** against −1.13 ms, jitter **574 µs** against 2.50 ms, and
+  16 loop updates in the first 13 minutes against a pre-restart reference time
+  of 30 s. Still selects `gummi` at ~250 µs round-trip.
+
+### The field evidence for RA6X-001 and RA6X-013
+
+The hosts' own `loop.tsv` files record both defects happening, hours before
+the deploy:
+
+- `navlisten2026` held a stable **+9.4 ppm** from 13:17 to 13:49, then the old
+  code's delayed feedback took it through +11.8, −28, −30, +10, **−95.4**,
+  +62, and finally **+170.80**. The −95.4 ppm figure is the one already quoted
+  in `DESIGN.md` §6.3.
+- It then sat at **170.805461 ppm for eighteen minutes** (23:21–23:39) with no
+  loop update. That flat run is exactly what the old drift gate measured as
+  "stable", and it persisted it: `/var/lib/carillon/drift` held `170.805461`
+  while the running daemon had since walked to −26.8 ppm — a 197 ppm
+  disagreement between the file and the process that wrote it.
+- `twocom` shows the same shape: it loaded a known-good `6.126572`, then went
+  6.48 → 9.79 → 14.52 → **31.80** within three minutes, and its drift file was
+  left at `20.187612`, a mid-excursion value.
+
+On restart the new code loaded `navlisten2026`'s poisoned file, as it should —
+the file is the stated authority. That put the host 197 ppm fast. The drift
+file was replaced with `9.400000`, the value the host demonstrably held while
+stable, and the poisoned copy kept as `drift.poisoned-170ppm`. **Before that,
+on shutdown, the new gate refused to persist the bogus +172 ppm it was
+carrying** — insufficient evidence — leaving the file untouched. That is
+RA6X-013 working on the first host that could exercise it.
+
+`twocom`'s stale `20.187612` was deliberately left alone: it is converging on
+its own (18.3 ppm and falling, phase held at 287 µs), and the fixed gate will
+replace it once the estimate holds within 1 ppm for the 15-minute window with
+real loop updates behind it. That is the designed self-heal, and watching it
+is worth more than another restart of a serving host.
+
+### Closes the outstanding item from 2026-09-05
+
+The previous entry left the starvation "outstanding and unfixed", noting that
+root-distance ranking "wants a simulation pass". RA6X-002 made that change with
+the simulation pass (`review/2026/09/takeover-repro/`), together with the
+RA6X-001 observation-time propagation without which it does not help.
+
+### Regression found: loop-update cadence on navlisten2026
+
+`navlisten2026` now takes a loop update every 2–3 minutes where it previously
+took one every ~19 s. The clock still tracks correctly — pending slew drains,
+and all four sources agree the offset is converging — but frequency correction
+is slower there.
+
+The cause is not a fault in the new code so much as the removal of something
+that was masking an older one. RA6X-003 made loop-update consumption
+per-source; before that, a single system-wide watermark was reset to zero on
+every system-source change, so a host whose system source flaps got a forced
+loop update on each flap — re-integrating an observation the loop had already
+used, which is the RA6X-001 defect. With that gone, the loop runs only on
+genuinely new samples from the current system source, and on this host that is
+`debian-2`: the only stratum-2 survivor, a WAN server at poll 6 whose clock
+filter withholds. Its two excellent LAN sources, `gummi` at 300 µs and
+`twocom` at 345 µs, are stratum 3 and 4 and so never drive the loop, because
+RFC 5905 selection orders by stratum before distance.
+
+This wants a design decision rather than a patch, and it is not on the Astra6
+list: whether a much nearer, much lower-distance survivor should be able to
+drive the loop when the stratum-preferred source is withholding. `gummi` and
+`twocom`, whose source mixes do not have this shape, are unaffected — 7 and 16
+updates respectively over the same period.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
