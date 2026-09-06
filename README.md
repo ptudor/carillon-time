@@ -1,4 +1,4 @@
-![Carillon — A precise second. An understandable clock.](docs/banner.svg)
+# Carillon
 
 [![CI](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml/badge.svg)](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ptudor/carillon-time)](https://github.com/ptudor/carillon-time/releases/latest)
