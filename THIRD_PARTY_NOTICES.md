@@ -35,7 +35,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## Go runtime and standard library (go1.27.0)
+## Go runtime and standard library (go1.27.1)
 
 Source: https://go.dev/LICENSE
 
@@ -163,7 +163,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## github.com/pelletier/go-toml/v2 v2.2.4
+## github.com/pelletier/go-toml/v2 v2.4.3
 
 ### LICENSE
 
@@ -455,7 +455,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## github.com/prometheus/client_model v0.6.2
+## github.com/prometheus/client_model v0.6.3
 
 ### LICENSE
 
@@ -673,7 +673,7 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-## github.com/prometheus/common v0.70.1
+## github.com/prometheus/common v0.71.0
 
 ### LICENSE
 
@@ -891,7 +891,7 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-## github.com/prometheus/procfs v0.21.1
+## github.com/prometheus/procfs v0.22.0
 
 ### LICENSE
 
@@ -1145,7 +1145,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## google.golang.org/protobuf v1.36.11
+## google.golang.org/protobuf v1.36.12
 
 ### LICENSE
 
