@@ -1,7 +1,7 @@
 ![Carillon — A precise second. An understandable clock.](docs/banner.svg)
 
 [![CI](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml/badge.svg)](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/ptudor/carillon-time?include_prereleases)](https://github.com/ptudor/carillon-time/releases)
+[![Release](https://img.shields.io/github/v/release/ptudor/carillon-time?include_prereleases)](https://github.com/ptudor/carillon-time/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)](.go-version)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -72,8 +72,8 @@ timestamping, and OpenWrt deployment are outside the current release scope.
 
 ## Install
 
-Download an archive or package from [GitHub Releases](https://github.com/ptudor/carillon-time/releases)
-once the first release is published, then [verify the file](docs/releases.md#verify-a-download).
+Download an archive or package from [GitHub Releases](https://github.com/ptudor/carillon-time/releases/latest)
+for **v1.0.0**, then [verify the file](docs/releases.md#verify-a-download).
 Successful [CI runs](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml)
 also retain downloadable development builds.
 
@@ -109,7 +109,7 @@ You can inspect an NTP server without adjusting your machine’s clock:
 
 ```sh
 carillon -version
-carillon query -timeout 5s time.cloudflare.com
+carillon query -timeout 5s pool.ntp.org
 ```
 
 `query` sends an NTP request and reports the response. It does not run the discipline
@@ -119,7 +119,7 @@ loop. To build and check configuration from a clone:
 make build
 ./bin/carillon -version
 make check-examples
-./bin/carillon query -timeout 5s time.cloudflare.com
+./bin/carillon query -timeout 5s pool.ntp.org
 ```
 
 Use the Go toolchain in [.go-version](.go-version). `make check-examples` also needs
