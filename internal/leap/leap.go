@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -30,6 +29,9 @@ type Table struct {
 	Expiry      time.Time
 	Updated     time.Time
 	Transitions []Transition
+	// Baseline is the first TAI-UTC record, before the first transition.
+	Baseline time.Time
+	Offset   int
 }
 
 // Load opens and parses path.
@@ -66,7 +68,7 @@ func Parse(r io.Reader) (*Table, error) {
 		}
 		if strings.HasPrefix(line, "#@") || strings.HasPrefix(line, "#$") {
 			fields := strings.Fields(line)
-			if len(fields) != 2 {
+			if len(fields) != 2 || (fields[0] != "#@" && fields[0] != "#$") {
 				return nil, fmt.Errorf("line %d: %s timestamp is malformed", lineNo, fields[0])
 			}
 			stamp, err := parseNTPSeconds(fields[1])
@@ -92,6 +94,9 @@ func Parse(r io.Reader) (*Table, error) {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			return nil, fmt.Errorf("line %d: transition record is malformed", lineNo)
+		}
+		if len(fields) > 2 && !strings.HasPrefix(fields[2], "#") {
+			return nil, fmt.Errorf("line %d: unexpected transition fields", lineNo)
 		}
 		at, err := parseNTPSeconds(fields[0])
 		if err != nil {
@@ -121,6 +126,7 @@ func Parse(r io.Reader) (*Table, error) {
 	if !table.Updated.IsZero() && !table.Expiry.After(table.Updated) {
 		return nil, errors.New("#@ expiry is not after the #$ update timestamp")
 	}
+	table.Baseline, table.Offset = records[0].at, records[0].offset
 	for i := 1; i < len(records); i++ {
 		prev, cur := records[i-1], records[i]
 		if !cur.at.After(prev.at) {
@@ -143,10 +149,10 @@ func Parse(r io.Reader) (*Table, error) {
 
 func parseNTPSeconds(raw string) (time.Time, error) {
 	seconds, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || seconds > math.MaxInt64 {
+	if err != nil {
 		return time.Time{}, fmt.Errorf("NTP timestamp %q is invalid", raw)
 	}
-	return time.Unix(int64(seconds)-int64(ntpUnixEpoch), 0).UTC(), nil
+	return Date(seconds)
 }
 
 // Indicator returns the file-authoritative LI value. A warning is active

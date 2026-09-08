@@ -342,8 +342,8 @@ func TestEngineSourceExitMarksItUnreachableAndRestarts(t *testing.T) {
 	if err := e.Wait(ctx, unreachable); err != nil {
 		t.Fatalf("source never reported unreachable: %v (status %+v)", err, e.Status().Status)
 	}
-	if st := e.Status(); st.State != discipline.StateHoldover {
-		t.Fatalf("losing the only source must enter holdover, got %v", st.State)
+	if st := e.Status(); st.ClockState != discipline.StateHoldover || st.State != discipline.StateUnsynced {
+		t.Fatalf("the loop should hold over while missing leap evidence withholds service: %+v", st)
 	}
 
 	// The first retry is one second away; the source runs its script again.

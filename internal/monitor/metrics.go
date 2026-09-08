@@ -24,6 +24,10 @@ type collector struct {
 	leapPending    *prometheus.Desc
 	leapfileExpiry *prometheus.Desc
 	leapfileValid  *prometheus.Desc
+	leapReady      *prometheus.Desc
+	leapRequired   *prometheus.Desc
+	leapUpdated    *prometheus.Desc
+	leapEvents     *prometheus.Desc
 	buildInfo      *prometheus.Desc
 
 	sourceOffset     *prometheus.Desc
@@ -80,6 +84,10 @@ func newCollector(snapshot func() Snapshot) *collector {
 		leapPending:    desc("carillon_leap_pending", "Whether an insertion or deletion leap second is pending."),
 		leapfileExpiry: desc("carillon_leapfile_expiry_timestamp_seconds", "Unix timestamp at which the configured leap file expires; zero when absent."),
 		leapfileValid:  desc("carillon_leapfile_valid", "Whether the configured leap file is unexpired; zero when absent or expired."),
+		leapReady:      desc("carillon_leap_ready", "Whether current leap authority permits synchronization."),
+		leapRequired:   desc("carillon_leap_table_required", "Whether this topology requires a durable leap table."),
+		leapUpdated:    desc("carillon_leap_data_updated_timestamp_seconds", "Unix date of the accepted file's last change to leap records; zero when absent."),
+		leapEvents:     desc("carillon_leap_events_total", "Bounded leap acquisition and distribution counters.", "result"),
 		buildInfo:      desc("carillon_build_info", "Build information for this carillon process.", "version"),
 
 		sourceOffset:     desc("carillon_source_offset_seconds", "Filtered source offset estimate in seconds.", "source"),
@@ -117,6 +125,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		c.state, c.offset, c.frequency, c.jitter, c.rootDispersion, c.stratum,
 		c.steps, c.updates, c.leapPending, c.leapfileExpiry, c.leapfileValid, c.buildInfo,
+		c.leapReady, c.leapRequired, c.leapUpdated, c.leapEvents,
 		c.sourceOffset, c.sourceDelay, c.sourceJitter, c.sourceDistance,
 		c.sourceReach, c.sourceSelected, c.sourceLastRx, c.sourceNoKernelTS, c.sourceEvents,
 		c.ppsSamples, c.ppsJitter, c.ppsLocked, c.gpsFix, c.gpsSats, c.gpsLag,
@@ -154,7 +163,20 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	counter(c.updates, uint64(t.Updates))
 	gauge(c.leapPending, boolValue(t.Leap == "insert" || t.Leap == "delete"))
 	gauge(c.leapfileExpiry, optionalTimestampSeconds(t.LeapExpiry))
-	gauge(c.leapfileValid, boolValue(t.LeapExpiry != nil && t.LeapExpiry.After(t.Now)))
+	gauge(c.leapfileValid, boolValue(t.LeapValid))
+	gauge(c.leapReady, boolValue(t.LeapReady))
+	gauge(c.leapRequired, boolValue(t.LeapRequired))
+	gauge(c.leapUpdated, optionalTimestampSeconds(t.LeapUpdated))
+	lc := t.LeapUpdate.Counts
+	for _, v := range []struct {
+		label string
+		count uint64
+	}{
+		{"probes", lc.Probes}, {"bytes", lc.Bytes}, {"accepted", lc.Accepted}, {"failures", lc.Failures},
+		{"rollback", lc.Rollback}, {"conflict", lc.Conflict}, {"cache_failures", lc.CacheFailures}, {"served", lc.Served}, {"rate_limited", lc.RateLimited},
+	} {
+		counter(c.leapEvents, v.count, v.label)
+	}
 	gauge(c.buildInfo, 1, t.Version)
 
 	for _, src := range s.Sources {

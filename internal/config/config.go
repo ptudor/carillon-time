@@ -116,6 +116,35 @@ type Config struct {
 	Stats      Stats      `toml:"stats"`
 	Discipline Discipline `toml:"discipline"`
 	Step       Step       `toml:"step"`
+	Leap       Leap       `toml:"leap"`
+}
+
+// Leap controls acquisition; nil RequireTable selects the topology default.
+type Leap struct {
+	Acquire      string `toml:"acquire"`
+	RequireTable *bool  `toml:"require_table"`
+}
+
+func (cfg *Config) LeapMode() string {
+	if cfg.Leap.Acquire != "" {
+		return cfg.Leap.Acquire
+	}
+	if cfg.Daemon.LeapFile != "" {
+		return "manual"
+	}
+	for _, s := range cfg.Servers {
+		if s.LeapTrust {
+			return "peers"
+		}
+	}
+	return "off"
+}
+
+func (cfg *Config) LeapRequired() bool {
+	if cfg.Leap.RequireTable != nil {
+		return *cfg.Leap.RequireTable
+	}
+	return cfg.Serve.Enabled() || len(cfg.Refclocks) != 0
 }
 
 // Refclock is one local PPS or GPS reference clock. A GPS receiver always
@@ -216,6 +245,9 @@ type Server struct {
 	// Key is the id of the AES-128-CMAC key used to authenticate this
 	// association; 0 means unauthenticated.
 	Key uint32 `toml:"key"`
+	// LeapTrust explicitly authorizes this authenticated association to
+	// distribute leap data, independently of its time selection policy.
+	LeapTrust bool `toml:"leap_trust"`
 
 	// Prefer makes this the source whose offset is used unaltered whenever
 	// it survives selection. At most one server may be preferred.
@@ -249,6 +281,7 @@ type Serve struct {
 
 	// RequireKey maps client prefixes to mandatory AES-CMAC key ids.
 	RequireKey map[string]uint32 `toml:"require_key"`
+	LeapKeys   []uint32          `toml:"leap_keys"`
 
 	// RateLimitPPS and RateBurst configure the per-client token bucket.
 	RateLimitPPS float64 `toml:"rate_limit_pps"`
@@ -722,6 +755,7 @@ func Validate(cfg *Config) error {
 		fail("prefer is set on %d sources; at most one source may be preferred", preferred)
 	}
 	validateServe(&cfg.Serve, &needKeys, fail)
+	validateLeap(cfg, &needKeys, fail)
 	validateMonitor(&cfg.Monitor, fail)
 	if needKeys && cfg.Daemon.Keys == "" {
 		fail("daemon: keys must be set when an upstream server or serve.require_key uses a key id")
@@ -1074,7 +1108,7 @@ func Check(cfg *Config) error {
 		}
 	}
 	if cfg.Daemon.LeapFile != "" {
-		f, err := os.Open(cfg.Daemon.LeapFile)
+		f, err := os.OpenFile(cfg.Daemon.LeapFile, os.O_RDONLY|unix.O_NONBLOCK, 0)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("daemon: leapfile: %w", err))
 		} else {

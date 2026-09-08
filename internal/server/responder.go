@@ -12,6 +12,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/ptudor/carillon-time/internal/leap"
 	"github.com/ptudor/carillon-time/internal/ntp"
 	"github.com/ptudor/carillon-time/internal/ntp/auth"
 )
@@ -50,6 +51,7 @@ type Config struct {
 	Status func() SystemStatus
 	Now    func() time.Time
 	Stats  *Stats
+	Leap   *leap.Distributor
 }
 
 type keyRule struct {
@@ -70,6 +72,7 @@ type Handler struct {
 	status     func() SystemStatus
 	now        func() time.Time
 	stats      *Stats
+	leap       *leap.Distributor
 
 	// publishedClients is this handler's last contribution to the shared
 	// client-count gauge, so several listeners of the same address family
@@ -125,6 +128,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		status:  cfg.Status,
 		now:     cfg.Now,
 		stats:   cfg.Stats,
+		leap:    cfg.Leap,
 	}
 	for prefix, keyID := range cfg.RequireKey {
 		h.requireKey = append(h.requireKey, keyRule{prefix: prefix.Masked(), keyID: keyID})
@@ -159,8 +163,9 @@ func isClientRequest(p *ntp.Packet) bool {
 // the datagram must be dropped. receive is the kernel's CLOCK_REALTIME receive
 // timestamp; monotonicNow is used only for rate limiting and expiry.
 //
-// Every non-nil response is no longer than request. Extension fields are not
-// echoed; a verified AES-CMAC request receives a 68-byte authenticated reply.
+// Every non-nil response is no longer than request. Unknown extension fields
+// are not echoed; a verified AES-CMAC request receives a 68-byte authenticated
+// reply, plus a CLPS response when explicitly authorized.
 // Every drop increments exactly one counter, so an operator can chart what was
 // refused as well as what was served.
 func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monotonicNow time.Time) []byte {
@@ -268,6 +273,26 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 		return h.reply(&pkt, receive, h.status(), ntp.KissRATE, replyKey, true)
 	}
 
+	var extension *leap.Message
+	if pkt.Version == 4 && pkt.Mode == ntp.ModeClient && replyKey != nil && h.leap.Authorized(replyKey.ID) {
+		m, err := leap.DecodeFields(request[ntp.HeaderSize:macOffset])
+		if err != nil && !errors.Is(err, leap.ErrUnsupported) {
+			c.malformed.Add(1)
+			return nil
+		}
+		if m != nil && err == nil {
+			extension, err = h.leap.Respond(m, replyKey.ID, h.now(), monotonicNow)
+			if err != nil {
+				if leap.Reason(err) == "rate" {
+					c.rateLimited.Add(1)
+				} else {
+					c.malformed.Add(1)
+				}
+				return nil
+			}
+		}
+	}
+
 	// A request that survived the ACL, the limiter and authentication is
 	// one we are about to answer, which is what the version histogram and
 	// last_request are documented to describe. Counting them earlier made a
@@ -281,7 +306,7 @@ func (h *Handler) Handle(request []byte, client netip.AddrPort, receive, monoton
 	if !st.Synced && refID == (ntp.RefID{}) {
 		refID = ntp.KissINIT
 	}
-	response := h.reply(&pkt, receive, st, refID, replyKey, !st.Synced)
+	response := h.reply(&pkt, receive, st, refID, replyKey, !st.Synced, extension)
 	if response != nil {
 		c.served.Add(1)
 		c.lastServed.store(receive)
@@ -375,7 +400,7 @@ func (h *Handler) requiredKey(addr netip.Addr) uint32 {
 	return 0
 }
 
-func (h *Handler) reply(req *ntp.Packet, receive time.Time, st SystemStatus, refID ntp.RefID, key *auth.Key, special bool) []byte {
+func (h *Handler) reply(req *ntp.Packet, receive time.Time, st SystemStatus, refID ntp.RefID, key *auth.Key, special bool, extension ...*leap.Message) []byte {
 	p := ntp.Packet{
 		Leap:           st.Leap,
 		Version:        req.Version,
@@ -405,8 +430,15 @@ func (h *Handler) reply(req *ntp.Packet, receive time.Time, st SystemStatus, ref
 	}
 	// Keep this read as close to the eventual send as packet construction
 	// permits. Network code calls Handle immediately before WriteMsgUDP.
-	p.TransmitTime = ntp.FromTime(h.now())
 	out := p.Marshal()
+	if len(extension) > 0 && extension[0] != nil {
+		var err error
+		out, err = extension[0].AppendTo(out)
+		if err != nil {
+			return nil
+		}
+	}
+	binary.BigEndian.PutUint64(out[40:48], uint64(ntp.FromTime(h.now())))
 	if key != nil {
 		out = key.Append(out)
 	}

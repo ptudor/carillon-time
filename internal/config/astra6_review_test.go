@@ -13,6 +13,7 @@ import (
 // exactly one field and attribute the resulting error to it.
 func astra6Valid() *Config {
 	c := Default()
+	c.Leap.Acquire = "nist"
 	c.Servers = []Server{{Name: "a", Address: "192.0.2.1", PollMin: 6, PollMax: 10}}
 	c.Serve.Allow = []string{"127.0.0.0/8"}
 	c.Serve.Listen = []string{"127.0.0.1:123"}
@@ -23,7 +24,7 @@ func astra6Valid() *Config {
 // defaults an operator's file would, then validates the whole configuration.
 func astra6Refclock(t *testing.T, block string) error {
 	t.Helper()
-	doc := "[[server]]\naddress = \"192.0.2.1\"\n\n[serve]\nlisten = [\"127.0.0.1:123\"]\nallow = [\"127.0.0.0/8\"]\n\n" + block
+	doc := "[leap]\nacquire = \"nist\"\n[[server]]\naddress = \"192.0.2.1\"\n\n[serve]\nlisten = [\"127.0.0.1:123\"]\nallow = [\"127.0.0.0/8\"]\n\n" + block
 	cfg, err := Parse([]byte(doc))
 	if err != nil {
 		return err

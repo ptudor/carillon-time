@@ -112,6 +112,12 @@ type Measurement struct {
 	// case. Read it through IsAcquisition.
 	Acquired bool
 
+	// LeapSample carries the last accepted packet's LI independently of the
+	// clock filter winner. LeapObserved is its monotonic receive time.
+	LeapSample   bool
+	LeapValue    ntp.Leap
+	LeapObserved float64
+
 	// Invalidate explicitly discards the source's previous estimate while
 	// retaining reachability. Ordinary misses leave it false so an older NTP
 	// estimate can age naturally; a PPS window that loses lock sets it true.
@@ -160,6 +166,10 @@ type Options struct {
 	// PPS marks a pulse-per-second source, which must be qualified by a
 	// Numbering source before it may be used (see System).
 	PPS bool
+
+	// LeapIncapable marks RMC/ZDA calendar inputs, which cannot announce a
+	// leap. PPS is also excluded regardless of this flag.
+	LeapIncapable bool
 }
 
 // IsAcquisition reports whether this event is a successful acquisition from

@@ -195,6 +195,16 @@ func TestAstra6LeapResetBracketsItsEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Establish lastLeapWall before the boundary.
+	for range 3 {
+		clk.Advance(100 * time.Millisecond)
+		m := good(0.001)
+		m.Source = "gps"
+		m.Now = clk.Monotonic()
+		m.At = m.Now
+		if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+			t.Fatal(err)
+		}
+	}
 	e.crossLeap(e.clk.Monotonic())
 	before := gen.Load()
 	clk.Advance(2 * time.Second)
@@ -261,7 +271,7 @@ func TestAstra6LeapOnTheSameIterationAsATick(t *testing.T) {
 // direct handle calls.
 func TestAstra6RunProcessesLeapBeforeMeasurements(t *testing.T) {
 	transition := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	clk := clock.NewFake(transition.Add(-time.Second))
+	clk := clock.NewFake(transition.Add(-193 * time.Second))
 	src := &scripted{
 		name: "gps", clk: clk, gap: time.Millisecond,
 		script: []discipline.Measurement{good(0.001), good(0.001), good(0.001), good(0.001)},
@@ -539,9 +549,9 @@ func TestAstra6FilelessLeapBoundaryResets(t *testing.T) {
 	}
 }
 
-// TestAstra6FilelessLeapWarningClears checks a withdrawn warning drops the
-// pending boundary rather than leaving one armed for ever.
-func TestAstra6FilelessLeapWarningClears(t *testing.T) {
+// M5 deliberately latches an armed event through a subsequent LI withdrawal.
+// The boundary consumes it exactly once instead of silently cancelling it.
+func TestFilelessArmedLeapSurvivesWithdrawal(t *testing.T) {
 	boundary := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	clk := clock.NewFake(boundary.Add(-10 * time.Second))
 	src := &scripted{name: "up", clk: clk}
@@ -566,14 +576,14 @@ func TestAstra6FilelessLeapWarningClears(t *testing.T) {
 		t.Fatal("no pending boundary was tracked")
 	}
 	feed(ntp.LeapNone)
-	if !e.pendingLeap.IsZero() {
-		t.Fatalf("a withdrawn warning left a boundary armed at %v", e.pendingLeap)
+	if e.pendingLeap.IsZero() {
+		t.Fatal("a withdrawn warning cancelled the armed boundary")
 	}
 	resets := src.resets.Load()
 	clk.Advance(boundary.Sub(clk.TrueTime()) + time.Second)
 	e.crossLeap(e.processing(clk.Monotonic()))
-	if src.resets.Load() != resets {
-		t.Fatal("a withdrawn warning still produced a boundary reset")
+	if src.resets.Load() != resets+1 || !e.pendingLeap.IsZero() {
+		t.Fatal("armed boundary was not consumed exactly once")
 	}
 }
 

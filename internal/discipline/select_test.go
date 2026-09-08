@@ -251,19 +251,20 @@ func TestMajorityLeap(t *testing.T) {
 	a := src("a", 0, 0.01, Options{})
 	b := src("b", 0, 0.01, Options{})
 	c := src("c", 0, 0.01, Options{})
-	a.Leap, b.Leap = ntp.LeapInsert, ntp.LeapInsert
-	if l := majorityLeap([]*SourceState{a, b, c}); l != ntp.LeapInsert {
+	a.LiveLeap, b.LiveLeap = ntp.LeapInsert, ntp.LeapInsert
+	a.LeapKnown, b.LeapKnown, c.LeapKnown = true, true, true
+	if l := majorityLeap([]*SourceState{a, b, c}, 0); l != ntp.LeapInsert {
 		t.Fatalf("got %v", l)
 	}
-	b.Leap = ntp.LeapNone
-	if l := majorityLeap([]*SourceState{a, b, c}); l != ntp.LeapNone {
+	b.LiveLeap = ntp.LeapNone
+	if l := majorityLeap([]*SourceState{a, b, c}, 0); l != ntp.LeapNone {
 		t.Fatalf("got %v", l)
 	}
-	if l := majorityLeap([]*SourceState{a}); l != ntp.LeapInsert {
+	if l := majorityLeap([]*SourceState{a}, 0); l != ntp.LeapInsert {
 		t.Fatalf("got %v", l)
 	}
 	pps := &SourceState{Options: Options{PPS: true}, Leap: ntp.LeapNone}
-	if l := majorityLeap([]*SourceState{a, pps}); l != ntp.LeapInsert {
+	if l := majorityLeap([]*SourceState{a, pps}, 0); l != ntp.LeapInsert {
 		t.Fatalf("PPS without calendar data must not outvote numbering source: %v", l)
 	}
 }

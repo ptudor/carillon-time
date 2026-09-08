@@ -19,6 +19,7 @@ keys       = "/usr/local/etc/carillon/keys"
 name     = "home"
 address  = "10.9.0.1:123"
 key      = 1
+leap_trust = true
 prefer   = true
 iburst   = true
 poll_min = 4
@@ -118,6 +119,8 @@ func TestParseFull(t *testing.T) {
 
 func TestParsePPSRefclock(t *testing.T) {
 	cfg, err := Parse([]byte(`
+[leap]
+acquire = "nist"
 [[refclock]]
 name = "pps0"
 type = "pps"
@@ -142,6 +145,8 @@ prefer = true
 
 func TestParseGPSRefclock(t *testing.T) {
 	cfg, err := Parse([]byte(`
+[leap]
+acquire = "nist"
 [[refclock]]
 name = "roof"
 type = "gps"
@@ -167,6 +172,8 @@ prefer = true
 	}
 
 	nmeaOnly, err := Parse([]byte(`
+[leap]
+acquire = "nist"
 [[refclock]]
 name = "gps"
 type = "gps"
@@ -594,6 +601,7 @@ func TestServeTableAndBufferDefaults(t *testing.T) {
 // receiver's.
 func TestGPSWithSeparatePPSDeviceValidates(t *testing.T) {
 	cfg := validConfig()
+	cfg.Leap.Acquire = "nist"
 	cfg.Refclocks = []Refclock{{
 		Name: "gps", Type: "gps", Device: "/dev/cuaU0", Baud: 9600,
 		PPS: "/dev/cuau1", PPSEdge: "assert", Sentences: []string{"RMC", "ZDA"},
@@ -611,7 +619,7 @@ func TestGPSWithSeparatePPSDeviceValidates(t *testing.T) {
 // The rule therefore only applies to parsed configuration; a Config built in
 // Go cannot observe presence and its zero values are legitimate defaults.
 func TestRefclockKeysAreRejectedByPresence(t *testing.T) {
-	const preamble = "[[server]]\naddress = \"192.0.2.1\"\n\n[serve]\nlisten = [\"127.0.0.1:123\"]\nallow = [\"127.0.0.0/8\"]\n\n"
+	const preamble = "[leap]\nacquire = \"nist\"\n[[server]]\naddress = \"192.0.2.1\"\n\n[serve]\nlisten = [\"127.0.0.1:123\"]\nallow = [\"127.0.0.0/8\"]\n\n"
 	check := func(t *testing.T, block, want string) {
 		t.Helper()
 		cfg, err := Parse([]byte(preamble + block))
@@ -683,6 +691,7 @@ func TestRefclockKeysAreRejectedByPresence(t *testing.T) {
 
 	t.Run("a Config built in Go is unaffected", func(t *testing.T) {
 		cfg := validConfig()
+		cfg.Leap.Acquire = "nist"
 		cfg.Refclocks = []Refclock{{
 			Name: "p", Type: "pps", Device: "/dev/null", Edge: "assert",
 			LockJitter: 1e-6, PollMin: 4, PollMax: 7,

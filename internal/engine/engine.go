@@ -107,6 +107,11 @@ type Config struct {
 
 	// LeapTable, when non-nil, is authoritative over survivor LI bits.
 	LeapTable *leap.Table
+	// LeapState contains only revalidated durable generations. New imports
+	// enter through ApproveLeap/ActivateLeap, never through this constructor.
+	LeapState    leap.State
+	LeapRequired bool
+	LeapReport   *leap.Report
 
 	// Version is reported in status snapshots.
 	Version string
@@ -146,13 +151,28 @@ type Status struct {
 
 	// Now is the clock reading when the snapshot was taken; RefTime is the
 	// clock reading at the last loop update (zero if none).
-	Now        time.Time
-	RefTime    time.Time
-	Uptime     time.Duration
-	Precision  int8
-	Version    string
-	LeapSource string
-	LeapExpiry time.Time
+	Now              time.Time
+	RefTime          time.Time
+	Uptime           time.Duration
+	Precision        int8
+	Version          string
+	LeapSource       string
+	LeapExpiry       time.Time
+	ClockState       discipline.State
+	LeapReady        bool
+	LeapRequired     bool
+	LeapReason       string
+	LeapDisagreement bool
+	LeapHash         string
+	LeapUpdated      time.Time
+	LeapProvider     leap.Provider
+	LeapAccepted     time.Time
+	LeapUpdate       leap.UpdateStatus
+	// LeapObject is immutable and only set when eligible for redistribution.
+	LeapObject   *leap.Object
+	UTCbound     time.Time
+	TimeKnown    bool
+	LeapExecuted time.Time
 
 	// Infos carries each source's own view, keyed by name.
 	Infos map[string]source.Info
@@ -198,12 +218,27 @@ type Engine struct {
 	haveProcNow    bool
 	lastDriftWrite float64
 	lastLeapWall   time.Time
+	lastLeapMono   float64
 	lastFileLeap   ntp.Leap
 
 	// pendingLeap is the UTC boundary a survivor-majority leap warning
 	// implies, used when no leapfile is configured. Zero when no warning is
 	// active.
-	pendingLeap time.Time
+	pendingLeap      time.Time
+	pendingLeapKind  ntp.Leap
+	executedLeap     time.Time
+	activeLeap       *leap.Record
+	leapAnchor       *leap.Object
+	approvedLeap     leap.Manifest
+	utcBound         time.Time
+	startupUTCbound  time.Time
+	clockState       discipline.State
+	timeKnown        bool
+	leapReady        bool
+	leapReason       string
+	leapAuthority    string
+	leapDisagreement bool
+	leapExpiring     bool
 
 	gen        *atomic.Uint64
 	staleDrops map[string]uint64
@@ -274,18 +309,23 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 	gen.CompareAndSwap(0, source.FirstEpoch)
 
 	e := &Engine{
-		cfg:          cfg,
-		clk:          clk,
-		log:          log,
-		sys:          discipline.New(cfg.Discipline, freq, known),
-		sources:      make(map[string]SourceSpec, len(cfg.Sources)),
-		meas:         make(chan discipline.Measurement, 64),
-		reqs:         make(chan func() error, 16),
-		tick:         time.Second,
-		gen:          gen,
-		staleDrops:   make(map[string]uint64, len(cfg.Sources)),
-		sourceErrors: make(map[string]string, len(cfg.Sources)),
-		restarting:   make(map[string]bool, len(cfg.Sources)),
+		cfg:             cfg,
+		clk:             clk,
+		log:             log,
+		sys:             discipline.New(cfg.Discipline, freq, known),
+		sources:         make(map[string]SourceSpec, len(cfg.Sources)),
+		meas:            make(chan discipline.Measurement, 64),
+		reqs:            make(chan func() error, 16),
+		tick:            time.Second,
+		gen:             gen,
+		staleDrops:      make(map[string]uint64, len(cfg.Sources)),
+		sourceErrors:    make(map[string]string, len(cfg.Sources)),
+		restarting:      make(map[string]bool, len(cfg.Sources)),
+		activeLeap:      cfg.LeapState.Active,
+		leapAnchor:      cfg.LeapState.Anchor(),
+		utcBound:        cfg.LeapState.UTCbound,
+		startupUTCbound: cfg.LeapState.UTCbound,
+		executedLeap:    cfg.LeapState.Executed,
 	}
 	for _, s := range cfg.Sources {
 		name := s.Source.Name()
@@ -299,6 +339,7 @@ func New(cfg Config, clk clock.Clock, log *slog.Logger) (*Engine, error) {
 	e.started = clk.Now()
 	e.lastLeapWall = e.started
 	e.startedMono = clk.Monotonic()
+	e.lastLeapMono = e.startedMono
 	e.publish(e.startedMono)
 	return e, nil
 }
@@ -868,11 +909,8 @@ func (e *Engine) noteSourceAlive(name string) {
 func (e *Engine) crossLeap(now float64) {
 	wall := e.clk.Now()
 	var crossed bool
-	if e.cfg.LeapTable != nil {
-		crossed = e.cfg.LeapTable.Crossed(e.lastLeapWall, wall)
-	} else {
-		crossed = e.crossedAnnouncedLeap(wall)
-	}
+	crossed = e.crossedAnnouncedLeapAt(wall, now)
+	e.lastLeapMono = now
 	if !crossed {
 		e.lastLeapWall = wall
 		return
@@ -900,31 +938,46 @@ func (e *Engine) crossLeap(now float64) {
 // samples or generation after a leap and could carry the warning until some
 // later update happened to clear it (RA6X-022).
 func (e *Engine) crossedAnnouncedLeap(wall time.Time) bool {
+	return e.crossedAnnouncedLeapAt(wall, e.clk.Monotonic())
+}
+
+func (e *Engine) crossedAnnouncedLeapAt(wall time.Time, mono float64) bool {
 	if e.pendingLeap.IsZero() || e.lastLeapWall.IsZero() {
 		return false
 	}
-	if e.lastLeapWall.Before(e.pendingLeap) && !wall.Before(e.pendingLeap) {
+	// Linux/FreeBSD can repeat the final UTC second on insertion. The
+	// monotonic clock keeps moving: invalidate observations at that repeat,
+	// before accepting any sample that spans the kernel's discontinuity.
+	lostSecond := (mono - e.lastLeapMono) - wall.Sub(e.lastLeapWall).Seconds()
+	repeated := e.pendingLeapKind == ntp.LeapInsert && wall.Before(e.pendingLeap) &&
+		!wall.Before(e.pendingLeap.Add(-time.Second)) && !e.lastLeapWall.Before(e.pendingLeap.Add(-2*time.Second)) &&
+		lostSecond > 0.5 && lostSecond < 1.5
+	if repeated || (e.lastLeapWall.Before(e.pendingLeap) && !wall.Before(e.pendingLeap)) {
+		e.executedLeap = e.pendingLeap
+		if e.executedLeap.After(e.utcBound) {
+			e.utcBound = e.executedLeap
+		}
 		e.pendingLeap = time.Time{}
 		return true
 	}
 	return false
 }
 
-// notePendingLeap tracks the UTC boundary a survivor-majority warning implies.
-// It is only used when no leapfile is configured; with one, the file is the
-// authority for when the transition happens.
+// notePendingLeap latches the UTC boundary announced by the active authority:
+// a valid table, or fresh survivor LI for a client that does not require one.
 func (e *Engine) notePendingLeap(warning ntp.Leap, wall time.Time) {
-	if e.cfg.LeapTable != nil {
-		return
-	}
 	if warning != ntp.LeapInsert && warning != ntp.LeapDelete {
-		e.pendingLeap = time.Time{}
 		return
 	}
 	if e.pendingLeap.IsZero() {
 		utc := wall.UTC()
-		e.pendingLeap = time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
-		e.log.Warn("leap warning announced by the survivors", "leap", warning.String(),
+		boundary := time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+		if !boundary.After(e.executedLeap) {
+			return
+		}
+		e.pendingLeap = boundary
+		e.pendingLeapKind = warning
+		e.log.Warn("leap warning armed", "authority", e.leapAuthority, "leap", warning.String(),
 			"at", e.pendingLeap.Format(time.RFC3339))
 	}
 }
@@ -970,6 +1023,12 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 				return fmt.Errorf("engine: kernel refused step of %.6f s: %w", a.Value, err)
 			}
 			after := e.clk.Now()
+			// A clock step is ordinary recovery, never a retroactive leap.
+			e.lastLeapWall = after
+			if !e.pendingLeap.IsZero() && !after.Before(e.pendingLeap) {
+				e.executedLeap = e.pendingLeap
+				e.pendingLeap = time.Time{}
+			}
 			e.log.Warn("clock stepped", "seconds", a.Value, "before", before.UTC().Format(time.RFC3339Nano), "after", after.UTC().Format(time.RFC3339Nano))
 		case discipline.ActionResetFilters:
 			for _, s := range e.sources {
@@ -981,22 +1040,7 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 		e.logEvent(ev)
 	}
 	st := e.sys.Status(now)
-	wall := e.clk.Now()
-	e.notePendingLeap(st.Leap, wall)
-	if e.cfg.LeapTable != nil {
-		indicator := e.cfg.LeapTable.Indicator(wall)
-		if indicator != e.lastFileLeap {
-			if indicator == ntp.LeapNone {
-				e.log.Info("leap warning cleared")
-			} else {
-				e.log.Warn("leap warning active", "leap", indicator.String())
-			}
-			e.lastFileLeap = indicator
-		}
-		if st.State == discipline.StateSynced || st.State == discipline.StateHoldover {
-			st.Leap = indicator
-		}
-	}
+	e.applyLeap(&st, e.clk.Now())
 	if st.LastUpdate != e.lastLoopUpdate {
 		e.lastLoopUpdate = st.LastUpdate
 		e.refWall = e.clk.Now()
@@ -1091,28 +1135,43 @@ func (e *Engine) setKernel(ks clock.Status) error {
 func (e *Engine) publish(now float64) {
 	now = e.processing(now)
 	st := e.sys.Status(now)
-	if e.cfg.LeapTable != nil && (st.State == discipline.StateSynced || st.State == discipline.StateHoldover) {
-		st.Leap = e.cfg.LeapTable.Indicator(e.clk.Now())
-	}
+	e.applyLeap(&st, e.clk.Now())
 	e.publishStatus(&st, now)
 }
 
 func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 	s := &Status{
-		Status:        *st,
-		PublishedMono: now,
-		Now:           e.clk.Now(),
-		RefTime:       e.refWall,
-		Uptime:        time.Duration((now - e.startedMono) * float64(time.Second)),
-		Precision:     e.clk.Precision(),
-		Version:       e.cfg.Version,
-		Infos:         make(map[string]source.Info, len(e.sources)),
+		Status:           *st,
+		PublishedMono:    now,
+		Now:              e.clk.Now(),
+		RefTime:          e.refWall,
+		Uptime:           time.Duration((now - e.startedMono) * float64(time.Second)),
+		Precision:        e.clk.Precision(),
+		Version:          e.cfg.Version,
+		Infos:            make(map[string]source.Info, len(e.sources)),
+		ClockState:       e.clockState,
+		LeapReady:        e.leapReady,
+		LeapRequired:     e.cfg.LeapRequired,
+		LeapReason:       e.leapReason,
+		LeapDisagreement: e.leapDisagreement,
+		LeapSource:       e.leapAuthority,
+		UTCbound:         e.utcBound,
+		TimeKnown:        e.timeKnown,
+		LeapExecuted:     e.executedLeap,
+		LeapUpdate:       e.cfg.LeapReport.Snapshot(),
 	}
-	if e.cfg.LeapTable != nil {
-		s.LeapSource = "file"
+	if e.activeLeap != nil {
+		r := e.activeLeap
+		s.LeapExpiry = r.Object.Expiry()
+		s.LeapUpdated = r.Object.Updated()
+		s.LeapHash = r.Object.Manifest().Hash()
+		s.LeapProvider = r.Provider
+		s.LeapAccepted = r.Accepted
+		if e.leapReady && e.leapAuthority != "sources" {
+			s.LeapObject = r.Object
+		}
+	} else if e.cfg.LeapTable != nil {
 		s.LeapExpiry = e.cfg.LeapTable.Expiry
-	} else {
-		s.LeapSource = "sources"
 	}
 	for name, spec := range e.sources {
 		info := spec.Source.Info()

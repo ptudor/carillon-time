@@ -56,16 +56,18 @@ hosts. Live GPS/PPS stratum-1 acceptance and a sustained accuracy comparison are
 still pending. Microsecond accuracy is a hardware-dependent target, not a published
 measurement or guarantee.
 
-Four review items remain open: GPS ZDA time-validity policy, expired leapfile
-authority, source independence/quorum, and negative root-delay interoperability.
+Three review items remain open: GPS ZDA time-validity policy,
+source independence/quorum, and negative root-delay interoperability.
 Read [known limitations](docs/limitations.md) before choosing a deployment.
 
-The [leap-data design](docs/leap-distribution.md) specifies one NIST-fetching
-seed, authenticated distribution over NTP, durable downstream caches, and
-server/refclock readiness tied to a valid table. This is planned M5 work.
-For autonomous GPS/PPS operation, current releases need a manually installed
-leapfile and a restart after updates; configured NTP backups do not supply
-leap warnings during an outage.
+Carillon implements [durable leap data and authenticated distribution](docs/leap-distribution.md):
+one configured seed downloads from NIST, and downstreams learn and cache the
+original file over authenticated NTP. Manual files are supported and updates
+activate without restarting the loop. Refclock and serving hosts require a
+current table before reporting synchronization. Configure an acquisition mode
+when upgrading those hosts; plain network clients can use fresh upstream LI.
+PPS and NMEA cannot supply advance leap warnings. Offline autonomy lasts through
+the cached table's expiry; live GPS/PPS leap acceptance remains pending.
 
 | Platform | Release builds | Runtime scope |
 | --- | --- | --- |

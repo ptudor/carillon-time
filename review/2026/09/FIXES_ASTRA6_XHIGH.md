@@ -16,6 +16,11 @@ CLAUDE.md hard rule 1, Claude never runs those.
 
 ## Outcome
 
+The table records the original review pass. **2026-09-08 follow-up:** M5
+implements the maintainer's selected leap policy and closes RA6X-023. Three
+items remain open: RA6X-021, RA6X-040 and RA6X-057. See
+[M5 implementation verification](M5_IMPLEMENTATION.md).
+
 | | Count |
 |---|---:|
 | Fixed | 55 |
@@ -988,7 +993,16 @@ MAC, an unusable stratum, a reset notice and a PPS spike do not.
 `TestSystemLeavesSettlingWithoutAFreshLoopUpdate` still passes and remains
 meaningful under the new semantics. `CGO_ENABLED=1 go test -race ./...` passes.
 
-## RA6X-023 — An expired authoritative leapfile can suppress valid upstream warnings — SKIPPED
+## RA6X-023 — An expired authoritative leapfile can suppress valid upstream warnings — FIXED IN M5
+
+**2026-09-08 resolution.** Refclock and serving hosts require a current durable
+table; pure network clients may use fresh leap-capable survivor consensus.
+The engine withdraws expired-file authority, gates kernel/NTP synchronization,
+and retains an established UTC bound across updates and restart. NMEA and PPS
+cannot vote on LI. Runtime readiness and expiry are reported in tracking,
+health, metrics and logs. M5 tests cover expiry, backward clocks, restart,
+upstream fallback and disconnected positive/negative leap execution. The
+following paragraphs preserve why this was deferred in the original pass.
 
 **Reason.** The fix specification presents a fork the maintainer has to choose:
 *"either cease synchronized service or allow explicitly configured fallback to
@@ -1008,7 +1022,7 @@ authoritative, and runtime near-expiry and expiry transitions are logged rather
 than being reported only at startup — which is the part that reaches an
 operator whose daemon crosses expiry months after it started.
 
-**Present behaviour, unchanged.** `leap.Table.Indicator` never checks `Expiry`;
+**Behaviour at the original review.** `leap.Table.Indicator` never checks `Expiry`;
 `handle` and `publish` override the survivor majority with its result whenever
 `LeapTable` is non-nil. Monitor health already reports an expired file as
 unhealthy, and the expiry and provenance are already exposed in JSON and

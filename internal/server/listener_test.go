@@ -12,9 +12,19 @@ import (
 )
 
 func TestUDPListenerRoundTrip(t *testing.T) {
+	// Exercise both source-selection paths. FreeBSD rejects IP_SENDSRCADDR
+	// with a specific IPv4 bind; wildcard listeners need it to answer from
+	// the address the client queried.
+	for _, bind := range []string{"127.0.0.1:0", "0.0.0.0:0"} {
+		t.Run(bind, func(t *testing.T) { testUDPListenerRoundTrip(t, bind) })
+	}
+}
+
+func testUDPListenerRoundTrip(t *testing.T, bind string) {
+	t.Helper()
 	stats := &Stats{}
 	s, err := Listen(ServiceConfig{
-		Listen: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:0")},
+		Listen: []netip.AddrPort{netip.MustParseAddrPort(bind)},
 		Handler: Config{
 			Allow:        []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
 			RateLimitPPS: 8,
@@ -35,11 +45,16 @@ func TestUDPListenerRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx) }()
-
-	conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(s.Addrs()[0]))
-	if err != nil {
+	defer func() {
 		cancel()
-		<-done
+		if err := <-done; err != nil {
+			t.Errorf("serve shutdown: %v", err)
+		}
+	}()
+
+	peer := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), s.Addrs()[0].Port())
+	conn, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(peer))
+	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
@@ -69,10 +84,6 @@ func TestUDPListenerRoundTrip(t *testing.T) {
 		t.Fatalf("stats %+v", got)
 	}
 
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("serve shutdown: %v", err)
-	}
 }
 
 func TestListenRejectsEmptyAddresses(t *testing.T) {

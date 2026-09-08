@@ -162,11 +162,17 @@ type NTP struct {
 	metaNext    int
 	lastStratum uint8
 	haveStratum bool
+	liveLeap    ntp.Leap
+	liveLeapAt  float64
 
-	badAuthSeen uint64
-	bogusSeen   uint64
-	staleSeen   uint64
+	badAuthSeen  uint64
+	bogusSeen    uint64
+	staleSeen    uint64
+	exchangeBusy atomic.Bool
 }
+
+// Busy lets optional leap transfer traffic yield to an ordinary time poll.
+func (n *NTP) Busy() bool { return n.exchangeBusy.Load() }
 
 // NewNTP validates cfg and returns a source ready to Run.
 func NewNTP(cfg NTPConfig, clk clock.Clock, log *slog.Logger) (*NTP, error) {
@@ -466,6 +472,8 @@ func (n *NTP) metaAt(t float64) (stageMeta, bool) {
 // pollOnce performs one exchange, updates state, and emits a measurement.
 // It returns false when ctx is done.
 func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) bool {
+	n.exchangeBusy.Store(true)
+	defer n.exchangeBusy.Store(false)
 	gen := n.generation()
 	res, err := exchange(ctx, exchangeParams{
 		addr:     n.addr,
@@ -669,6 +677,7 @@ func (n *NTP) hit(res exchangeResult) *sample {
 	}
 	n.lastStratum, n.haveStratum = pkt.Stratum, true
 	at := n.clk.Monotonic()
+	n.liveLeap, n.liveLeapAt = pkt.Leap, at
 	n.noteMeta(stageMeta{
 		at: at, stratum: pkt.Stratum, refID: pkt.ReferenceID,
 		rootDelay: pkt.RootDelay.Seconds(), rootDisp: pkt.RootDispersion.Seconds(),
@@ -751,12 +760,15 @@ func (n *NTP) miss(reason string) {
 // emit sends the measurement for the poll that just completed.
 func (n *NTP) emit(ctx context.Context, out chan<- discipline.Measurement, s *sample, gen uint64, acquired bool) bool {
 	m := discipline.Measurement{
-		Source:     n.cfg.Name,
-		Now:        n.clk.Monotonic(),
-		Reach:      n.reach,
-		Poll:       n.poll,
-		Generation: gen,
-		Acquired:   acquired,
+		Source:       n.cfg.Name,
+		Now:          n.clk.Monotonic(),
+		Reach:        n.reach,
+		Poll:         n.poll,
+		Generation:   gen,
+		Acquired:     acquired,
+		LeapSample:   acquired,
+		LeapValue:    n.liveLeap,
+		LeapObserved: n.liveLeapAt,
 	}
 	if s != nil {
 		m.Valid = true
