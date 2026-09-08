@@ -57,7 +57,12 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK is required: the daemon enumerates its own interface addresses
+# at startup to refuse a source that is itself or is synchronized to it, and
+# to recognise directed broadcasts. Without it net.InterfaceAddrs() fails with
+# "netlinkrib: address family not supported by protocol", and both checks are
+# silently skipped -- the daemon keeps time, but with those guards off.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # Serial port and PPS devices for the refclock. Adjust the tty to match the
 # configured device. A client-only or server-only host has no refclock: delete

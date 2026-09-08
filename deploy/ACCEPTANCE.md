@@ -703,6 +703,73 @@ drive the loop when the stratum-preferred source is withholding. `gummi` and
 `twocom`, whose source mixes do not have this shape, are unaffected — 7 and 16
 updates respectively over the same period.
 
+## Leap authority, manual acquisition — 2026-09-08 (UTC)
+
+Deployed `v1.0.0-4-g3413e23` to all three hosts, replacing `3b08543`.
+
+`3413e23` makes a leap table mandatory for any host with `[serve]` or a
+refclock, so the existing configs no longer validate. Running the new binary's
+`-check` against the live configs before installing anything showed exactly
+that, on the two serving hosts:
+
+    carillon: config /etc/carillon/carillon.toml: leap: required table needs
+    manual, nist or peers acquisition
+
+`navlisten2026` passed unchanged, being client-only. Had the binaries gone in
+first, `ExecStartPre` and the rc.d check would have refused to start and left
+both servers down.
+
+Acquisition: `manual`, from the `leap-seconds.list` each host already had —
+`/usr/share/zoneinfo/leap-seconds.list` from tzdata on the two Linux hosts,
+`/var/db/ntpd.leap-seconds.list` on FreeBSD. All three are the same 5069 bytes
+and the same SHA-256 `506e737d…`, carry both `#$` and `#@`, and expire
+2026-12-28. Only `leapfile` was added under `[daemon]`; `LeapMode()` returns
+`manual` on its own once that is set, so no `[leap]` section was needed. Each
+candidate config was validated with `-check` on a temp copy before replacing
+the live file, and the previous file kept as `carillon.toml.prev`.
+
+Order was `gummi` → `twocom` → `navlisten2026`, waiting for `synced` and not
+merely for the restart to return, which is the rule the 2026-08-28 entry got
+wrong twice.
+
+Results:
+
+- All three report `Leap source file`, `Leap ready true`, the same digest, and
+  `manual: activated`. All synced with zero steps and `/healthz` 200.
+- Topology intact: `twocom` stratum 4 on `gummi`, `navlisten2026` on `junia`.
+- Zero dropped datagrams in every category on both servers.
+
+Fixed while deploying: the shipped systemd unit set
+
+    RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+with no `AF_NETLINK`, so `net.InterfaceAddrs()` failed on both Linux hosts with
+`netlinkrib: address family not supported by protocol`. That silently disabled
+self-synchronization and timing-loop detection (RA6X-038) and directed-broadcast
+recognition — the daemon says so at WARN and keeps time, so the guards were off
+on every Linux install without anything failing. `AF_NETLINK` added to the unit
+here and on both hosts; the warning is gone and both resynced clean. FreeBSD was
+never affected.
+
+Two things to know:
+
+- **The table expires 2026-12-28.** Missing or expired required data withholds
+  synchronized service, so on that date `gummi` and `twocom` stop serving
+  unless the file is refreshed. The Linux hosts get a new one whenever tzdata
+  updates; `twocom`'s copy is ntpd's, and ntpd is disabled there, so it will
+  not refresh on its own. Moving a seed to `acquire = "nist"` and the others to
+  `peers` is the design's answer and removes the cliff; `peers` needs a
+  `leap_trust` CMAC key per hop, which `navlisten2026` does not yet have to
+  either server.
+- `journalctl -p warning` does not filter this daemon's warnings. Carillon logs
+  slog levels in the message text and systemd stamps the whole stderr stream at
+  one priority, so `-p warning` returns nothing while warnings are present.
+  Grep for `level=WARN` instead. Earlier entries here that reported "no
+  warnings" on a Linux host were reading that filter, not the log.
+
+Rollback: `.prev` copies of both binaries, `carillon.toml.prev`, and
+`carillon.service.prev` are on each host; the previous release is `3b08543`.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
