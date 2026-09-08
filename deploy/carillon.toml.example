@@ -26,8 +26,12 @@
 # Unix socket used by carillonctl.
 #control = "/var/run/carillon/carillon.sock"
 
-# IERS/NIST leap-seconds.list. Optional for a client; required to announce
-# leap seconds on a host that has no upstream servers.
+# IERS/NIST leap-seconds.list. Provision on refclock and NTP-serving hosts.
+# GPS/NMEA/PPS needs it through network loss even with backup servers listed.
+# A network-only client can use upstream LI. Current releases load this file
+# only at startup; refresh before expiry and restart to activate the update.
+# Automatic trusted-peer distribution is designed, not yet implemented:
+# docs/leap-distribution.md. Current expiry monitoring does not gate service.
 #leapfile = "/var/db/carillon/leap-seconds.list"
 
 # AES-128-CMAC keys in ntp.keys syntax, mode 0600. Required if any upstream

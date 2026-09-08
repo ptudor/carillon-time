@@ -170,11 +170,33 @@ out is a per-day removal. Set `[stats] keep_days` to have carillon do that
 itself; the default of 0 keeps everything.
 
 For a GPS-led stratum-1 host, install a current NIST/IERS
-`leap-seconds.list` and set `daemon.leapfile`. `carillon -check` parses the
-file, warns 30 days before expiry, and warns when it is expired. Monitoring
-reports an expiring file as degraded and an expired file as unhealthy. The
-file overrides survivor leap bits and drives the kernel insertion/deletion
-flag only during the final UTC day.
+`leap-seconds.list` and set `daemon.leapfile`, even when backup NTP servers are
+configured. PPS and the supported NMEA sentences do not supply an advance
+leap warning; those backup servers cannot supply it while disconnected. Check
+that the file stays valid through the intended offline period. Provision a
+current table on NTP-serving hosts as well.
+
+NIST publishes the file at
+[`https://tf.nist.gov/leap-seconds.list`](https://tf.nist.gov/leap-seconds.list),
+as documented by its
+[Internet Time Service](https://www.nist.gov/pml/time-and-frequency-division/time-distribution/internet-time-service-its).
+The same validated file can be copied to multiple hosts; a separate NIST
+download on every host is unnecessary.
+
+In the **current release**, `carillon -check` parses the file and reports
+impending expiry (30 days) or expiry. Monitoring marks these degraded and
+unhealthy respectively. The daemon reads the file only at startup: replace
+it and restart Carillon to activate an update. The file overrides survivor
+leap bits and drives the kernel insertion/deletion flag during the final UTC
+day, but an expired file currently retains that override (RA6X-023). Monitoring
+does not prevent synchronized service when leap information is missing or
+expired, so operators must maintain the file themselves.
+
+[The revised design](../DESIGN.md#68-leap-seconds) requires current local data
+for server/refclock readiness and removes expired-file authority. Its
+[NIST seed and authenticated NTP distribution](../docs/leap-distribution.md)
+will let downstream Carillons cache updates without per-host downloads or
+restarts. That is M5 work, not an available configuration feature today.
 
 ## FreeBSD with rc.d
 
