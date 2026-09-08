@@ -60,6 +60,13 @@ Four review items remain open: GPS ZDA time-validity policy, expired leapfile
 authority, source independence/quorum, and negative root-delay interoperability.
 Read [known limitations](docs/limitations.md) before choosing a deployment.
 
+The [leap-data design](docs/leap-distribution.md) specifies one NIST-fetching
+seed, authenticated distribution over NTP, durable downstream caches, and
+server/refclock readiness tied to a valid table. This is planned M5 work.
+For autonomous GPS/PPS operation, current releases need a manually installed
+leapfile and a restart after updates; configured NTP backups do not supply
+leap warnings during an outage.
+
 | Platform | Release builds | Runtime scope |
 | --- | --- | --- |
 | Linux | amd64, arm64 | NTP client/server; Linux PPS and serial backends |

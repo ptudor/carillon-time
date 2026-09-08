@@ -20,7 +20,9 @@ FreeBSD kernel or change a runner’s clock.
 ## Acceptance still needed
 
 - A live GPS/NMEA/PPS stratum-1 run on the supported hardware, including pulse
-  loss, antenna loss, reacquisition, and long holdover.
+  loss, antenna loss, reacquisition, and long holdover. Autonomous leap handling
+  also needs the disconnected positive/negative leap simulations and native
+  checks specified in [the M5 acceptance matrix](leap-distribution.md#observability-and-acceptance).
 - A sustained accuracy comparison against a measured reference. UART, USB,
   receiver, kernel, and host scheduling behavior all matter.
 - Native FreeBSD ABI/race checks and device acceptance on each deployed
@@ -31,13 +33,30 @@ FreeBSD kernel or change a runner’s clock.
 | Item | Current concern | Operator implication |
 | --- | --- | --- |
 | RA6X-021 | ZDA can supply time while recent receiver status reports an invalid fix. Receiver-specific time-validity policy needs captures and a decision. | Do not equate accepted ZDA measurements with independently established receiver time validity. Validate startup, invalid-status, and antenna-loss behavior with your receiver. |
-| RA6X-023 | An expired configured leapfile can remain authoritative over upstream leap warnings. | Monitor leapfile expiry and replace it before expiry. Unhealthy monitoring does not itself revoke the file’s authority. |
+| RA6X-023 | An expired configured leapfile can remain authoritative over upstream leap warnings. The revised §6.8 policy is specified, but its implementation remains open. | Monitor leapfile expiry, replace it before expiry and restart. Unhealthy monitoring does not itself revoke the file’s authority. |
 | RA6X-057 | Source count does not prove an achievable, independent quorum. | Choose independent upstreams and test source loss; several hostnames can resolve to the same underlying source. |
 | RA6X-040 | Negative root-delay interoperability needs an explicit representation policy and peer evidence. | Test the intended peer implementations and inspect root-delay behavior before depending on this edge case. |
 
 The details and closure criteria are recorded in the
 [Astra6 review fixes](../review/2026/09/FIXES_ASTRA6_XHIGH.md). These items are
 not closed by packaging or by a successful CI build.
+
+## Leap-data implementation gap
+
+Current releases load a manual `daemon.leapfile` at startup. They do not fetch
+NIST data, learn or redistribute tables over NTP, activate updates without a
+restart, or withhold synchronized service for missing/expired leap authority.
+The NMEA driver's `LeapNone` does not prove the absence of a pending leap.
+GPS/PPS operation therefore needs a current manually provisioned file even
+when network backups are configured.
+
+[DESIGN §6.8](../DESIGN.md#68-leap-seconds) and
+[Leap-table distribution](leap-distribution.md) specify the required policy and
+authenticated transfer as M5. Proposed configuration keys and the experimental
+extension are not implemented. A hash verifies content identity; learning a
+table will also require explicitly configured distributor trust and CMAC
+authentication. Existing network-client acceptance does not establish readiness
+for disconnected GPS/PPS leap handling.
 
 ## Scope
 
