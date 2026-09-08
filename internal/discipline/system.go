@@ -360,7 +360,7 @@ func (s *System) reselect(now float64) Result {
 	// filter output. A leap warning announced by other survivors while the
 	// system source's own winner is unchanged used to be ignored entirely,
 	// because this assignment sat below the early returns (RA6X-022).
-	s.leap = majorityLeap(sel.Survivors)
+	s.leap = majorityLeap(sel.Survivors, now)
 
 	if sel.System == nil {
 		s.sysName = ""

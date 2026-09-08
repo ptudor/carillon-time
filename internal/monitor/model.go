@@ -128,11 +128,37 @@ func healthOf(st *engine.Status, servedAt time.Time, mono float64) Health {
 		h.Status = statusUnhealthy
 		h.Reasons = append(h.Reasons, "snapshot_stale")
 	}
+	if st.LeapRequired && !st.LeapReady {
+		h.Status = statusUnhealthy
+		h.Reasons = append(h.Reasons, "leap_table_unavailable")
+	}
+	if st.LeapDisagreement {
+		if h.Status == statusHealthy {
+			h.Status = statusDegraded
+		}
+		h.Reasons = append(h.Reasons, "leap_source_disagreement")
+	}
+	if st.LeapUpdate.LastRejection == "conflict" || st.LeapUpdate.LastRejection == "armed" {
+		if h.Status == statusHealthy {
+			h.Status = statusDegraded
+		}
+		h.Reasons = append(h.Reasons, "leap_conflict")
+	}
 	if !st.LeapExpiry.IsZero() {
-		remaining := st.LeapExpiry.Sub(st.Now)
+		utc := st.Now
+		if st.UTCbound.After(utc) {
+			utc = st.UTCbound
+		}
+		remaining := st.LeapExpiry.Sub(utc)
 		switch {
 		case remaining <= 0:
-			h.Status = statusUnhealthy
+			if st.LeapSource == "sources" && !st.LeapRequired {
+				if h.Status == statusHealthy {
+					h.Status = statusDegraded
+				}
+			} else {
+				h.Status = statusUnhealthy
+			}
 			h.Reasons = append(h.Reasons, "leapfile_expired")
 		case remaining <= 30*24*time.Hour:
 			if h.Status == statusHealthy {

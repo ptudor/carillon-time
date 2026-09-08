@@ -41,6 +41,14 @@ monitoring. OpenWrt is explicitly deferred to a separate, smaller C project;
 this Go daemon targets Linux and FreeBSD. A live PPS/GPS test and the
 long-duration accuracy comparison remain ahead.
 
+**M5 code (2026-09-08):** durable leap-table authority, NIST seed acquisition,
+authenticated CLPS redistribution, atomic runtime activation and effective
+readiness gating are implemented. RA6X-023 is closed. See
+`docs/leap-distribution.md` and `review/2026/09/M5_IMPLEMENTATION.md` for policy,
+verification and remaining hardware acceptance. Refclock/serving deployments
+must select an acquisition mode before upgrading; existing network backups
+do not waive the requirement for local leap data.
+
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
 source of truth, the code follows it.

@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,12 +123,31 @@ func runDaemon(args []string) int {
 		log.Error("keys", "error", err)
 		return exitUsage
 	}
-	leapTable, err := loadLeapTable(cfg)
+	leapState, manualLeap, err := loadLeapState(cfg)
 	if err != nil {
 		log.Error("leap file", "error", err)
 		return exitUsage
 	}
+	var leapStore *leap.Store
+	if cfg.LeapMode() != "off" {
+		leapStore, err = leap.OpenStore(leap.CacheDir(cfg.Daemon.DriftFile))
+		if err != nil {
+			log.Error("leap cache", "error", err)
+			return exitUsage
+		}
+		defer leapStore.Close()
+		// The read-only preflight may have overlapped the previous owner's
+		// final commit. Reload under the process lock so startup cannot use
+		// an older generation or rollback anchor than the durable cache.
+		leapState, err = leapStore.Load()
+		if err != nil {
+			log.Error("leap cache", "error", err)
+			return exitUsage
+		}
+	}
+	leapTable := leapDisplayTable(leapState, manualLeap)
 	reportConfigurationWarnings(log, cfg, leapTable, time.Now())
+	leapReport := new(leap.Report)
 
 	clk, err := clock.New()
 	if err != nil {
@@ -152,6 +172,7 @@ func runDaemon(args []string) int {
 	generation := new(atomic.Uint64)
 
 	var specs []engine.SourceSpec
+	var leapPeers []leap.Peer
 	for i := range cfg.Servers {
 		s := &cfg.Servers[i]
 		var key *auth.Key
@@ -183,6 +204,9 @@ func runDaemon(args []string) int {
 			Source:  src,
 			Options: discipline.Options{Prefer: s.Prefer, NoSelect: s.NoSelect, Numbering: true},
 		})
+		if s.LeapTrust {
+			leapPeers = append(leapPeers, leap.Peer{Name: s.Name, Address: net.JoinHostPort(host, strconv.Itoa(int(port))), Key: *key, Busy: src.Busy})
+		}
 	}
 	// The statistics recorder is created below, after the listener counters
 	// it needs; refclocks constructed here hand it every accepted pulse
@@ -239,7 +263,7 @@ func runDaemon(args []string) int {
 		specs = append(specs, engine.SourceSpec{
 			Source: nmea,
 			Options: discipline.Options{
-				Prefer: r.Prefer && !r.HasPPS(), NoSelect: r.NoSelect, Numbering: true,
+				Prefer: r.Prefer && !r.HasPPS(), NoSelect: r.NoSelect, Numbering: true, LeapIncapable: true,
 			},
 		})
 		if !r.HasPPS() {
@@ -307,7 +331,9 @@ func runDaemon(args []string) int {
 		DriftStableWindow: time.Duration(cfg.Daemon.DriftStableSeconds * float64(time.Second)),
 		DriftStableSpread: cfg.Daemon.DriftStableSpreadPPM,
 		Sources:           specs,
-		LeapTable:         leapTable,
+		LeapState:         leapState,
+		LeapRequired:      cfg.LeapRequired(),
+		LeapReport:        leapReport,
 		Version:           buildinfo.Version,
 		Observe:           observe,
 		Generation:        generation,
@@ -318,6 +344,7 @@ func runDaemon(args []string) int {
 	}
 
 	var timeServer *ntpserver.Service
+	leapDistributor := leap.NewDistributor(cfg.Serve.LeapKeys, eng.CurrentLeap, &leapReport.Counters)
 	if cfg.Serve.Enabled() {
 		allow, deny, require := cfg.ServePrefixes()
 		timeServer, err = ntpserver.Listen(ntpserver.ServiceConfig{
@@ -327,6 +354,7 @@ func runDaemon(args []string) int {
 				Deny:              deny,
 				RequireKey:        require,
 				Keys:              keys,
+				Leap:              leapDistributor,
 				RateLimitPPS:      cfg.Serve.RateLimitPPS,
 				RateBurst:         cfg.Serve.RateBurst,
 				RateLimitV6Prefix: cfg.Serve.RateLimitV6Prefix,
@@ -437,6 +465,10 @@ func runDaemon(args []string) int {
 	defer stopStats()
 	auxErr := make(chan error, 3)
 	aux := newAuxiliaries()
+	if leapStore != nil {
+		updater := leap.NewUpdater(leap.UpdaterConfig{Mode: cfg.LeapMode(), ManualPath: cfg.Daemon.LeapFile, Peers: leapPeers, Store: leapStore, Initial: leapState, Controller: eng, Report: leapReport, Log: log})
+		aux.start("leap acquisition", func() { updater.Run(ctx) })
+	}
 	if statsRecorder != nil {
 		log.Info("statistics enabled", "directory", cfg.Stats.Dir)
 		aux.start("statistics", func() { statsRecorder.Run(statsCtx) })
@@ -581,14 +613,42 @@ func loadKeys(cfg *config.Config) (auth.Keys, error) {
 			return nil, fmt.Errorf("serve require_key %q: key %d is not in %s", prefix, id, cfg.Daemon.Keys)
 		}
 	}
+	for _, id := range cfg.Serve.LeapKeys {
+		if _, ok := keys[id]; !ok {
+			return nil, fmt.Errorf("serve leap_keys: key %d is not in %s", id, cfg.Daemon.Keys)
+		}
+	}
 	return keys, nil
 }
 
 func loadLeapTable(cfg *config.Config) (*leap.Table, error) {
-	if cfg.Daemon.LeapFile == "" {
-		return nil, nil
+	s, m, err := loadLeapState(cfg)
+	return leapDisplayTable(s, m), err
+}
+
+func loadLeapState(cfg *config.Config) (leap.State, *leap.Object, error) {
+	if cfg.LeapMode() == "off" {
+		return leap.State{}, nil, nil
 	}
-	return leap.Load(cfg.Daemon.LeapFile)
+	s, err := leap.InspectStore(leap.CacheDir(cfg.Daemon.DriftFile))
+	if err != nil {
+		return leap.State{}, nil, err
+	}
+	var manual *leap.Object
+	if cfg.LeapMode() == "manual" {
+		manual, err = leap.LoadObject(cfg.Daemon.LeapFile)
+	}
+	return s, manual, err
+}
+
+func leapDisplayTable(s leap.State, manual *leap.Object) *leap.Table {
+	if manual != nil {
+		return manual.Table()
+	}
+	if s.Active != nil {
+		return s.Active.Object.Table()
+	}
+	return nil
 }
 
 type configurationWarning struct {
@@ -604,11 +664,8 @@ func configurationWarnings(cfg *config.Config, table *leap.Table, now time.Time)
 func leapWarnings(cfg *config.Config, table *leap.Table, now time.Time) []configurationWarning {
 	var warnings []configurationWarning
 	if table == nil {
-		for i := range cfg.Refclocks {
-			if cfg.Refclocks[i].Type == "gps" {
-				warnings = append(warnings, configurationWarning{message: "GPS refclock has no leapfile; a stratum-1 server cannot announce leap seconds from NMEA alone"})
-				break
-			}
+		if cfg.LeapMode() != "off" || cfg.LeapRequired() {
+			warnings = append(warnings, configurationWarning{message: fmt.Sprintf("awaiting durable leap table (acquire=%s); synchronized service requires current leap authority", cfg.LeapMode())})
 		}
 		return warnings
 	}

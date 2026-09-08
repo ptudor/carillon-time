@@ -50,8 +50,9 @@ func martianReceiveFlags(int) bool { return false }
 // control message that sends the reply back from it, so a multi-homed host
 // answers on the address it was asked on. An invalid address means the kernel
 // reported none and must choose the reply's source itself. martian reports a
-// destination this server must not answer at all; on FreeBSD the broadcast
-// case is caught by martianReceiveFlags instead.
+// destination this server must not answer at all; directed broadcasts are
+// checked by localBroadcasts in the listener. A specifically bound IPv4
+// listener also removes the unnecessary IP_SENDSRCADDR before sending.
 func destination(oob []byte, network string) (dst netip.Addr, replyOOB []byte, martian bool) {
 	msgs, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {

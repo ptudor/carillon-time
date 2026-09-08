@@ -240,6 +240,26 @@ func printTracking(t *control.Tracking) {
 	fmt.Fprintf(w, "Root dispersion\t%s\n", seconds(t.RootDisp, false))
 	fmt.Fprintf(w, "Leap\t%s\n", t.Leap)
 	fmt.Fprintf(w, "Leap source\t%s\n", t.LeapSource)
+	fmt.Fprintf(w, "Leap ready\t%t (table required: %t)\n", t.LeapReady, t.LeapRequired)
+	if t.LeapReason != "" {
+		fmt.Fprintf(w, "Leap readiness reason\t%s\n", t.LeapReason)
+	}
+	if t.LeapHash != "" {
+		fmt.Fprintf(w, "Leap SHA-256\t%s\n", t.LeapHash)
+		fmt.Fprintf(w, "Leap provider\t%s %s (key %d)\n", t.LeapProvider.Kind, t.LeapProvider.Name, t.LeapProvider.KeyID)
+	}
+	if t.LeapUpdated != nil {
+		fmt.Fprintf(w, "Leap data updated\t%s\n", t.LeapUpdated.UTC().Format(time.RFC3339))
+	}
+	if t.LeapUpdate.LastResult != "" {
+		fmt.Fprintf(w, "Leap acquisition\t%s: %s\n", t.LeapUpdate.Mode, t.LeapUpdate.LastResult)
+	}
+	if t.LeapUpdate.Pending != "" {
+		fmt.Fprintf(w, "Leap pending SHA-256\t%s\n", t.LeapUpdate.Pending)
+	}
+	if t.LeapUpdate.LastRejection != "" {
+		fmt.Fprintf(w, "Leap last rejection\t%s\n", t.LeapUpdate.LastRejection)
+	}
 	if t.LeapExpiry != nil {
 		fmt.Fprintf(w, "Leap file expires\t%s\n", t.LeapExpiry.UTC().Format(time.RFC3339))
 	}

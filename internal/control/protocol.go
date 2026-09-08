@@ -11,6 +11,7 @@ import (
 
 	"github.com/ptudor/carillon-time/internal/discipline"
 	"github.com/ptudor/carillon-time/internal/engine"
+	"github.com/ptudor/carillon-time/internal/leap"
 	"github.com/ptudor/carillon-time/internal/ntp"
 	ntpserver "github.com/ptudor/carillon-time/internal/server"
 )
@@ -211,27 +212,38 @@ func timeOrZero(t *time.Time) time.Time {
 
 // Tracking is the system-level state.
 type Tracking struct {
-	State        string     `json:"state"`
-	Stratum      uint8      `json:"stratum"`
-	RefID        string     `json:"refid"`
-	Leap         string     `json:"leap"`
-	LeapSource   string     `json:"leap_source"`
-	LeapExpiry   *time.Time `json:"leapfile_expires,omitempty"`
-	RefTime      *time.Time `json:"reftime,omitempty"`
-	Now          time.Time  `json:"now"`
-	Uptime       float64    `json:"uptime_seconds"`
-	Offset       float64    `json:"offset"`
-	Frequency    float64    `json:"frequency_ppm"`
-	FreqKnown    bool       `json:"frequency_known"`
-	Jitter       float64    `json:"jitter"`
-	Pending      float64    `json:"pending_slew"`
-	RootDelay    float64    `json:"root_delay"`
-	RootDisp     float64    `json:"root_dispersion"`
-	SystemSource string     `json:"system_source,omitempty"`
-	PreferLost   bool       `json:"prefer_lost"`
-	Updates      int        `json:"updates"`
-	Steps        int        `json:"steps"`
-	Version      string     `json:"version"`
+	State            string            `json:"state"`
+	Stratum          uint8             `json:"stratum"`
+	RefID            string            `json:"refid"`
+	Leap             string            `json:"leap"`
+	LeapSource       string            `json:"leap_source"`
+	LeapExpiry       *time.Time        `json:"leapfile_expires,omitempty"`
+	ClockState       string            `json:"clock_state"`
+	LeapReady        bool              `json:"leap_ready"`
+	LeapValid        bool              `json:"leap_table_valid"`
+	LeapDisagreement bool              `json:"leap_source_disagreement"`
+	LeapRequired     bool              `json:"leap_required"`
+	LeapReason       string            `json:"leap_reason,omitempty"`
+	LeapHash         string            `json:"leap_sha256,omitempty"`
+	LeapUpdated      *time.Time        `json:"leap_data_updated,omitempty"`
+	LeapAccepted     *time.Time        `json:"leap_accepted_at,omitempty"`
+	LeapProvider     leap.Provider     `json:"leap_provider"`
+	LeapUpdate       leap.UpdateStatus `json:"leap_acquisition"`
+	RefTime          *time.Time        `json:"reftime,omitempty"`
+	Now              time.Time         `json:"now"`
+	Uptime           float64           `json:"uptime_seconds"`
+	Offset           float64           `json:"offset"`
+	Frequency        float64           `json:"frequency_ppm"`
+	FreqKnown        bool              `json:"frequency_known"`
+	Jitter           float64           `json:"jitter"`
+	Pending          float64           `json:"pending_slew"`
+	RootDelay        float64           `json:"root_delay"`
+	RootDisp         float64           `json:"root_dispersion"`
+	SystemSource     string            `json:"system_source,omitempty"`
+	PreferLost       bool              `json:"prefer_lost"`
+	Updates          int               `json:"updates"`
+	Steps            int               `json:"steps"`
+	Version          string            `json:"version"`
 }
 
 // Source is one source's line: the discipline's view merged with the
@@ -269,28 +281,43 @@ type Source struct {
 
 // TrackingOf converts an engine snapshot.
 func TrackingOf(st *engine.Status) *Tracking {
+	utc := st.Now
+	if st.UTCbound.After(utc) {
+		utc = st.UTCbound
+	}
 	return &Tracking{
-		State:        st.State.String(),
-		Stratum:      st.Stratum,
-		RefID:        st.RefID.String(),
-		Leap:         st.Leap.String(),
-		LeapSource:   st.LeapSource,
-		LeapExpiry:   optionalTime(st.LeapExpiry),
-		RefTime:      optionalTime(st.RefTime),
-		Now:          st.Now,
-		Uptime:       st.Uptime.Seconds(),
-		Offset:       st.Offset,
-		Frequency:    st.Frequency,
-		FreqKnown:    st.FreqKnown,
-		Jitter:       st.Jitter,
-		Pending:      st.Pending,
-		RootDelay:    st.RootDelay,
-		RootDisp:     st.RootDisp,
-		SystemSource: st.SystemSource,
-		PreferLost:   st.PreferLost,
-		Updates:      st.Updates,
-		Steps:        st.Steps,
-		Version:      st.Version,
+		State:            st.State.String(),
+		Stratum:          st.Stratum,
+		RefID:            st.RefID.String(),
+		Leap:             st.Leap.String(),
+		LeapSource:       st.LeapSource,
+		LeapExpiry:       optionalTime(st.LeapExpiry),
+		ClockState:       st.ClockState.String(),
+		LeapReady:        st.LeapReady,
+		LeapValid:        !st.LeapExpiry.IsZero() && st.LeapExpiry.After(utc),
+		LeapDisagreement: st.LeapDisagreement,
+		LeapRequired:     st.LeapRequired,
+		LeapReason:       st.LeapReason,
+		LeapHash:         st.LeapHash,
+		LeapUpdated:      optionalTime(st.LeapUpdated),
+		LeapAccepted:     optionalTime(st.LeapAccepted),
+		LeapProvider:     st.LeapProvider,
+		LeapUpdate:       st.LeapUpdate,
+		RefTime:          optionalTime(st.RefTime),
+		Now:              st.Now,
+		Uptime:           st.Uptime.Seconds(),
+		Offset:           st.Offset,
+		Frequency:        st.Frequency,
+		FreqKnown:        st.FreqKnown,
+		Jitter:           st.Jitter,
+		Pending:          st.Pending,
+		RootDelay:        st.RootDelay,
+		RootDisp:         st.RootDisp,
+		SystemSource:     st.SystemSource,
+		PreferLost:       st.PreferLost,
+		Updates:          st.Updates,
+		Steps:            st.Steps,
+		Version:          st.Version,
 	}
 }
 

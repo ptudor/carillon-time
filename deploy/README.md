@@ -183,20 +183,25 @@ as documented by its
 The same validated file can be copied to multiple hosts; a separate NIST
 download on every host is unnecessary.
 
-In the **current release**, `carillon -check` parses the file and reports
-impending expiry (30 days) or expiry. Monitoring marks these degraded and
-unhealthy respectively. The daemon reads the file only at startup: replace
-it and restart Carillon to activate an update. The file overrides survivor
-leap bits and drives the kernel insertion/deletion flag during the final UTC
-day, but an expired file currently retains that override (RA6X-023). Monitoring
-does not prevent synchronized service when leap information is missing or
-expired, so operators must maintain the file themselves.
+`carillon -check` stays offline and validates the manual file, acquisition
+policy, private keys and existing cache. Manual mode checks for replacements
+hourly. Missing or expired required data withholds synchronization from the
+kernel, NTP server and `waitsync`; time acquisition continues. Monitoring reports
+missing data, expiry, conflicts and the 30-day expiry warning.
 
-[The revised design](../DESIGN.md#68-leap-seconds) requires current local data
-for server/refclock readiness and removes expired-file authority. Its
-[NIST seed and authenticated NTP distribution](../docs/leap-distribution.md)
-will let downstream Carillons cache updates without per-host downloads or
-restarts. That is M5 work, not an available configuration feature today.
+For automatic updates, configure `[leap] acquire = "nist"` on one seed.
+On learners, set `leap_trust = true` on the chosen authenticated `[[server]]`
+association; acquisition then defaults to `peers`. Enable redistribution with
+`[serve] leap_keys = [<key IDs>]` in addition to the ordinary listener ACL and
+keys. Every hop requires explicit trust. Changes to trust and configuration
+require a restart; data updates do not. See the
+[configuration and wire specification](../docs/leap-distribution.md#configuration).
+
+**Upgrade:** a refclock or serving configuration that lacks a manual file or
+an acquisition mode now fails validation. Choose the seed/learner role before
+restarting. Empty automatic caches are accepted by `-check`, with service
+awaiting UTC acquisition and a durably accepted table. The private cache is
+`leap/` beside the drift file. Preserve it across package upgrades and restarts.
 
 ## FreeBSD with rc.d
 

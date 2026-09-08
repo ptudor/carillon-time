@@ -313,6 +313,13 @@ func (l *udpListener) serve(ctx context.Context) error {
 			c.martian.Add(1)
 			continue
 		}
+		// FreeBSD accepts a nonzero IP_SENDSRCADDR only on a wildcard
+		// IPv4 socket. A specific bind already selects the reply's source;
+		// supplying it again makes sendmsg fail with EINVAL. Destination
+		// metadata is still needed for the broadcast checks below.
+		if runtime.GOOS == "freebsd" && l.network == "udp4" && !l.addr.Addr().IsUnspecified() {
+			replyOOB = nil
+		}
 		// A *directed* broadcast — 192.0.2.255 on a /24 — cannot be
 		// recognised from the address alone; it depends on the interface's
 		// own configuration. Linux reports the delivery in the flags word

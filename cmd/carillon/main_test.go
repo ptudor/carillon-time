@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ func TestConfigurationWarnings(t *testing.T) {
 	cfg := config.Default()
 	cfg.Refclocks = []config.Refclock{{Name: "gps", Type: "gps"}}
 	warnings := configurationWarnings(cfg, nil, now)
-	if len(warnings) != 1 || !strings.Contains(warnings[0].message, "no leapfile") || warnings[0].error {
+	if len(warnings) != 1 || !strings.Contains(warnings[0].message, "awaiting durable leap table") || warnings[0].error {
 		t.Fatalf("missing leapfile warning: %+v", warnings)
 	}
 
@@ -57,13 +58,21 @@ func TestPublicServeWarnings(t *testing.T) {
 		t.Fatalf("the warning must quote the prefixes: %q", warnings[0].message)
 	}
 
-	// Tuned for a public server: still announced, but nothing left to fix.
+	// Tuned for a public server: still announced. FreeBSD also explains
+	// the kernel buffer limit even when a buffer has been configured.
 	warnings = public(func(c *config.Config) {
 		c.Serve.RateLimitPPS = 0.25
 		c.Serve.RecvBuffer = 4 << 20
 	})
-	if len(warnings) != 1 || !strings.Contains(warnings[0].message, "public internet") {
+	wantWarnings := 1
+	if runtime.GOOS == "freebsd" {
+		wantWarnings = 2
+	}
+	if len(warnings) != wantWarnings || !strings.Contains(warnings[0].message, "public internet") {
 		t.Fatalf("tuned public server: %+v", warnings)
+	}
+	if runtime.GOOS == "freebsd" && (!strings.Contains(warnings[1].message, "kern.ipc.maxsockbuf") || warnings[1].error) {
+		t.Fatalf("FreeBSD buffer warning: %+v", warnings[1])
 	}
 
 	// A LAN ACL says nothing at all, and neither does a disabled server.

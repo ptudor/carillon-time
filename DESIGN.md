@@ -8,10 +8,10 @@ upstream for a colocated server which serves time to the rest of the world.
 This document is the specification. When the code and this document disagree,
 one of them is wrong and the document is fixed first.
 
-**Design ahead of implementation (2026-09-08):** §6.8 and §8.5 specify durable
-leap authority, automatic refresh, and authenticated distribution between
-Carillon hosts. These requirements are tracked as M5; they are not present in
-the current daemon. Current deployment instructions remain in `deploy/README.md`.
+**M5 implementation (2026-09-08):** §6.8 and §8.5 describe durable leap
+authority, automatic refresh, and authenticated distribution between Carillon
+hosts. See `review/2026/09/M5_IMPLEMENTATION.md` for verification and remaining
+hardware acceptance, and `deploy/README.md` for configuration and upgrade notes.
 
 Contents
 
@@ -1010,7 +1010,7 @@ type Clock interface {
 
 ### 6.8 Leap seconds
 
-**Required behavior; M5 implementation pending.** PPS supplies an edge, and
+PPS supplies an edge, and
 the supported NMEA RMC/ZDA sentences supply UTC date/time. Neither supplies an
 advance leap warning. Listing NTP servers in a configuration does not supply
 leap information during an outage. Every refclock host and every NTP-serving
@@ -1033,7 +1033,7 @@ to compare SHA-256, a 64-bit leap-record update date, and a 64-bit expiry
 date. A changed, acceptable version is pulled in bounded chunks, validated,
 persisted, and activated without restarting the clock loop. A downstream can
 redistribute those unchanged bytes, so it needs no routine NIST download.
-Network-only clients can also opt into caching. The protocol and proposed
+Network-only clients can also opt into caching. The protocol and
 configuration are specified in [Leap-table distribution](docs/leap-distribution.md).
 NIST can advance expiry without changing the record-update date; that is a
 valid renewal. Both dates participate in rollback checks, so neither a fresh
@@ -1096,7 +1096,7 @@ pending leap, set `STA_INS`/`STA_DEL` at 00:00 UTC; the kernel performs the
 insertion at midnight; the flag is cleared and the PPS/NMEA filters are reset
 afterwards because the PPS seconds numbering shifts by one. A late update
 must never apply a past event retroactively, cancel an already armed event,
-or execute it twice. A conflicting update during the armed day is quarantined
+or execute it twice. A conflicting update during the armed day is rejected
 for operator review; normal refreshes that leave the event unchanged proceed.
 
 The NMEA parser cannot represent the leap second itself: `23:59:60` has no
@@ -1106,12 +1106,12 @@ Second 60 at any other minute is malformed. Losing one sentence per leap
 second costs nothing at a 16-sample window. A `"slew"` mode (spread the second
 over a window, chrony-style) is future work (§15).
 
-**Current implementation gap.** The daemon loads `daemon.leapfile` only at
-startup, warns for GPS without one, and leaves expired files authoritative
-(RA6X-023). It has no automatic fetch, transfer, cache activation, readiness
-gate, or distinction between NMEA's missing leap knowledge and `LeapNone`.
-M5 must implement and test these requirements before autonomous leap handling
-is claimed; this design change does not close the code review item.
+The implementation also recognizes an insertion's repeated final UTC second
+by comparing monotonic and wall elapsed time while the event is armed. It
+resets observations at the repeat and records execution so midnight does not
+reset them again. M5 closes the expired-authority defect RA6X-023. Fake-clock
+simulations do not establish live receiver/kernel accuracy; that hardware
+acceptance remains required.
 
 ---
 
@@ -1366,7 +1366,7 @@ one file can be shared with chrony/ntpd hosts):
 
 `carillon -check` refuses a keys file that is group/world readable.
 
-### 8.5 Leap-table extension (M5; not implemented)
+### 8.5 Leap-table extension (M5)
 
 An opt-in NTPv4 mode 3/4 extension advertises the SHA-256, 64-bit record-update
 and expiry dates, and size of a validated leap table. Authorized downstreams
@@ -1395,10 +1395,8 @@ the client and the server side use it.
 
 M5 treats validated leap-table updates as runtime data, separate from this
 configuration policy. Trust settings and keys still require a restart. The
-examples here use the currently supported manual `daemon.leapfile`; proposed
-automatic seed/learner settings are isolated in
-[Leap-table distribution](docs/leap-distribution.md#proposed-configuration)
-and must not be passed to the current strict parser.
+examples here use manual `daemon.leapfile`; automatic seed/learner settings
+are described in [Leap-table distribution](docs/leap-distribution.md#configuration).
 
 Full example, **home** (stratum 1):
 
@@ -1495,7 +1493,7 @@ first config above with the `gps` block replaced by a `pps` block and a
 
 `carillon -check` validates the file, resolves nothing over the network, checks
 device existence and permissions, keys-file mode, `pps_mode` on FreeBSD, and
-currently warns about GPS without a leapfile and about an ACL that reaches
+warns about missing cached leap data and about an ACL that reaches
 past private address space while `rate_limit_pps` and `recv_buffer` still hold
 their LAN defaults.
 
@@ -2010,7 +2008,7 @@ SHA-256 alone is never an authority.
 | M2 ✅ 2026-08-23 (real hosts) | Server, ACL, rate limiting, KoD, MAC auth, systemd + rc.d | `gummi` → authenticated `twocom` topology runs end to end without a refclock; see `deploy/ACCEPTANCE.md` |
 | M3 ✅ 2026-08-23 (code) | `pps` refclock (FreeBSD uart, Linux ldisc + `/dev/ppsN`), qualification, lock, holdover | kernel API/capability/fetch paths pass on both real hosts; stratum-1 acceptance awaits a live pulse on one of their serial inputs |
 | M4 ✅ 2026-08-23 (code) | `gps` refclock (NMEA), leapfile, stats files, read-only JSON/health/Prometheus monitoring, `-check` | race suite and Linux/FreeBSD cross-builds pass; live GPS stratum-1 acceptance remains |
-| M5 — designed 2026-09-08; not implemented | durable leap authority, expiry/readiness policy, NIST seed retrieval and authenticated NTP leap-table distribution | distribution acceptance matrix passes, including disconnected GPS/PPS leaps, restart/expiry/poisoning cases and native platform checks; RA6X-023 implementation verified |
+| M5 — code implemented 2026-09-08 | durable leap authority, expiry/readiness policy, NIST seed retrieval and authenticated NTP leap-table distribution | see `review/2026/09/M5_IMPLEMENTATION.md`; live GPS/PPS hardware acceptance remains |
 | deferred | OpenWrt | moved to a separate C project because the static Go footprint is too large for the intended routers |
 | later | Capsicum socket pool; further systemd sandboxing | deployment hardening after source/client socket ownership is redesigned |
 | later | NTS (RFC 8915) server+client; interleaved mode; `SO_TIMESTAMPING` TX timestamps; slew leap mode; auto `nmea_offset`; regression estimator; FLL branch | as wanted |
@@ -2126,7 +2124,7 @@ distributor trust authorizes it. Expired files lose authority. The transport
 uses an experimental opt-in extension with bounded pull requests and preserves
 ordinary NTP behavior. Trust is inherited through configured distributors;
 untrusted public relaying would require origin signatures. See §6.8, §8.5 and
-the M5 specification; current code does not yet implement this decision.
+the M5 specification and implementation verification record.
 
 ---
 

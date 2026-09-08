@@ -1,9 +1,10 @@
 # Leap-table distribution over NTP
 
-Status: **design accepted 2026-09-08; implementation pending (M5)**. This is
+Status: **implemented 2026-09-08; hardware acceptance remains pending**. This is
 the detailed specification for [DESIGN §6.8](../DESIGN.md#68-leap-seconds)
-and §8.5. Configuration below is proposed syntax; current releases reject
-the new keys. This document does not describe a deployed wire protocol.
+and §8.5. The CLPS wire protocol is experimental. See
+[implementation verification](../review/2026/09/M5_IMPLEMENTATION.md) for
+automated and native checks; those checks do not establish live GPS/PPS accuracy.
 
 ## Purpose and deployment
 
@@ -78,9 +79,9 @@ extend it. SHA-256 covers the entire object. Its manifest contains:
 Both dates are unsigned, big-endian **64-bit whole seconds since
 1900-01-01T00:00:00Z**. They are not NTP's 32.32 timestamp format and do not
 wrap in 2036. Values outside the implementation's supported UTC calendar are
-rejected before conversion. HTTP timestamps, file mtime and local receipt time
-never become `data_updated`. The current parser accepts manual files
-without `#$`; M5 requires it for new manual imports too. An operator must
+rejected before conversion; both dates must be nonzero and within UTC years
+1900..9999. HTTP timestamps, file mtime and local receipt time
+never become `data_updated`. New manual imports require `#$` too. An operator must
 obtain a dated source file rather than invent an update date locally.
 
 **Date encoding rationale.** These are absolute file dates, with
@@ -115,6 +116,13 @@ or Last-Modified, but `304 Not Modified` never renews the table's expiry.
 Refreshing because an unchanged table approaches expiry does not justify a
 tighter retry loop. Peer mode never automatically switches to NIST: this
 keeps one designated fetcher and one externally observable download policy.
+Persist the last successful seed check separately from acceptance/expiry, so
+restarting a seed with a valid cache does not force another NIST download.
+The normal listener rate limits also apply to transfers. A learner retains
+an authenticated RATE minimum across retries; if that interval cannot fit the
+advertised object into the 30-minute transfer bound, it reports the rate-policy
+conflict instead of exceeding either limit. Size listener budgets for the
+additional authenticated traffic when enabling exports.
 
 Offline operators may provision an authenticated copy as a local file. Before
 departing the network they must check coverage through the intended deployment
@@ -229,6 +237,11 @@ The worker validates a candidate before proposing it to the engine:
   and the last transition. Manifest dates and size match the parsed bytes.
 - Establish plausible UTC from normal GPS calendar/NTP acquisition or an
   operator-established clock before trusting expiry or performing HTTPS.
+  The implementation accepts a selected time estimate during settling once
+  absolute offset plus pending correction is within the 0.4-second numbering
+  guard, as well as normal synchronization/holdover. It can therefore export
+  valid data while its time-service header still says LI=3. Kernel leap events
+  are armed only when the clock also meets normal synchronization conditions.
   Acquisition may run while kernel/server synchronization remains withheld.
   Without a usable UTC estimate, downloaded data stays provisional and cannot
   be activated or redistributed. Reject `data_updated` more than five minutes
@@ -249,8 +262,8 @@ The worker validates a candidate before proposing it to the engine:
   bytes and digest, and is an ordinary accepted update.
 
 Multiple peers carrying one digest are copies, not independent votes. On a
-conflict with identical dates, retain the accepted object, quarantine the candidate
-and alert. Automatic recovery must not lower stored dates to escape a
+conflict with identical dates, retain the accepted object, discard the candidate
+and report its digest and rejection reason. Automatic recovery must not lower stored dates to escape a
 poisoned future revision. An operator can explicitly replace trust settings
 and locally reset the acceptance record with an audited action; no network
 message can request that reset. An authorized distributor's compromise remains
@@ -280,10 +293,15 @@ the active table and readiness, subject to its original expiry.
 Apply the active table and leap-readiness result in the engine before the
 next kernel status and server snapshot are published. Keep an armed
 transition and its execution record separate from table replacement. During
-the final day, quarantine revisions that remove or change the armed event;
+the final day, reject revisions that remove or change the armed event;
 unchanged events and expiry-only updates can proceed. Reset boundary-spanning
 measurements exactly once when the kernel executes the event. Recovery after
 a missed boundary requires fresh time evidence under the ordinary step policy.
+For an insertion, detect the repeated final UTC second using elapsed monotonic
+time versus wall time while the event is armed; waiting only for a forward
+crossing of midnight would admit observations spanning the repeated second.
+Record that execution separately so reaching midnight later does not reset the
+filters twice. A deletion's skipped second crosses the boundary forward.
 
 An expired hash remains expired across backward clock changes and restart;
 persist that fact and the last established UTC bound. Until a new clock
@@ -295,15 +313,23 @@ with experimental refid `XLEP`; clock acquisition continues. A network-only
 client may fall back to fresh leap-capable survivors. RMC/ZDA and bare PPS
 never vote "no leap" merely because they cannot announce one.
 
-## Proposed configuration
+## Configuration
 
-These additions are **not accepted by current releases**. `daemon.leapfile`
-remains the read-only manual source. With it configured, acquisition defaults
+`daemon.leapfile` remains the read-only manual source. With it configured, acquisition defaults
 to `manual`; otherwise it defaults to `peers` when a leap-trusted association
 exists, or `off` when none exists. Selecting any mode other than `manual`
 together with `daemon.leapfile` is an error, so authority is never ambiguous.
 Automatic modes use a cache directory `leap` beneath the platform's normal
-state directory (`/var/db/carillon` or `/var/lib/carillon`).
+state directory (`/var/db/carillon` or `/var/lib/carillon`). A customized
+`daemon.drift_file` moves the cache to `leap` in that file's parent directory;
+the drift path must be configured whenever acquisition is enabled. The cache
+directory is private (0700), with a single-writer lock and private state file.
+`state.json` couples the active and pending objects, original bytes, rollback
+metadata, executed boundary, UTC checkpoint and last successful NIST check.
+The worker checkpoints established UTC at least once a minute and on observed
+expiry or execution, subject to successful durable writes. A restart always
+requires fresh clock acquisition; a clock behind the saved UTC bound cannot
+reactivate or export data. Disk failures are reported and retried with backoff.
 
 `require_table` defaults true whenever a refclock or NTP service is configured,
 and false for a network-only client. Setting it false with a refclock or NTP

@@ -90,6 +90,9 @@ type SourceState struct {
 	Jitter     float64
 
 	Leap        ntp.Leap
+	LiveLeap    ntp.Leap
+	LeapUpdated float64
+	LeapKnown   bool
 	Stratum     uint8
 	RefID       ntp.RefID
 	SourceRefID ntp.RefID
@@ -150,6 +153,17 @@ func (s *SourceState) apply(m Measurement) {
 	s.Poll = m.Poll
 	if m.Invalidate {
 		s.Valid = false
+		s.LeapKnown = false
+	}
+	if m.IsAcquisition() && !s.PPS && !s.LeapIncapable {
+		if m.LeapSample {
+			s.LiveLeap, s.LeapUpdated = m.LeapValue, m.LeapObserved
+		} else if m.Valid {
+			s.LiveLeap, s.LeapUpdated = m.Leap, m.Now
+		}
+		if m.LeapSample || m.Valid {
+			s.LeapKnown = s.LiveLeap < ntp.LeapUnsync
+		}
 	}
 	if !m.Valid {
 		return
@@ -175,6 +189,7 @@ func (s *SourceState) apply(m Measurement) {
 // invalidate discards the estimate (after a step) while keeping reach.
 func (s *SourceState) invalidate() {
 	s.Valid = false
+	s.LeapKnown = false
 	s.sinceStep = 0
 }
 
@@ -626,28 +641,24 @@ func cluster(surv []*SourceState) []*SourceState {
 }
 
 // majorityLeap returns the leap indication agreed by more than half of the
-// survivors, or LeapNone.
-func majorityLeap(surv []*SourceState) ntp.Leap {
-	var ins, del, voters int
+// fresh, leap-capable survivors. Lack of agreement is unknown, not LI=0.
+func majorityLeap(surv []*SourceState, now float64) ntp.Leap {
+	var votes [3]int
+	voters := 0
 	for _, s := range surv {
 		// A bare PPS edge has no calendar information. Its selected numbering
 		// sources, not the pulse itself, vote on leap warnings.
-		if s.PPS {
+		age := now - s.LeapUpdated
+		if s.PPS || s.LeapIncapable || !s.LeapKnown || s.LiveLeap >= ntp.LeapUnsync || !(age >= 0 && age <= 2*ntp.Log2Seconds(s.Poll)) {
 			continue
 		}
 		voters++
-		switch s.Leap {
-		case ntp.LeapInsert:
-			ins++
-		case ntp.LeapDelete:
-			del++
+		votes[s.LiveLeap]++
+	}
+	for i, n := range votes {
+		if n*2 > voters {
+			return ntp.Leap(i)
 		}
 	}
-	switch {
-	case ins*2 > voters:
-		return ntp.LeapInsert
-	case del*2 > voters:
-		return ntp.LeapDelete
-	}
-	return ntp.LeapNone
+	return ntp.LeapUnsync
 }
