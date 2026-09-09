@@ -1,8 +1,9 @@
 # M5 Fable 5.1 review fixes
 
 Work date: 2026-09-09. Review: [REVIEW_M5_FABLE51.md](REVIEW_M5_FABLE51.md).
-Starting commit: `2d3b07c`. Entries are updated with each completed checkpoint.
-All clock tests use fake clocks.
+Starting commit: `2d3b07c`. All eight findings are addressed below, across
+regular commits. All clock tests use fake clocks; network fixtures use
+loopback or in-memory connections.
 
 ## RM5-001 — Network-only client synchronization
 
@@ -19,6 +20,11 @@ to holdover, recovery on one reply, holdover expiry, and a split final-day
 vote. The expired-table regression also checks that loss of fresh LI keeps an
 already armed kernel insertion. Updated the older source-exit test to match
 the documented plain-client holdover policy.
+
+Health also preserves this distinction: an expired optional table remains a
+degraded warning even when fresh LI disappears; it does not turn a plain
+client's healthy clock or ordinary holdover into an unhealthy leap state.
+The required-table expiration test remains unhealthy.
 
 ## RM5-006 — SETTLING leap status
 
@@ -57,7 +63,7 @@ permanently untransferable while preserving the existing listener budgets.
 
 Validation for RM5-002/003/005: `go test -race ./internal/leap` passes. An
 in-memory authenticated transfer uses simulated time to download a file over
-12 KiB after a 64-second RATE minimum, checking every chunk at four-second
+12,000 bytes after a 64-second RATE minimum, checking every chunk at four-second
 spacing. Scheduling regressions exercise `Updater.Run` itself: configured
 peer order and failover, transient timeout retry, unsupported capability's
 24-hour floor, DENY/RSTR stops, and RATE retention followed by recovery.
@@ -68,9 +74,42 @@ replacement with conflicting bytes or a temporarily missing file. The
 original active table survives each rejection. Scheduler tests use standard
 library simulated time and synchronized fixtures, without external hosts.
 
-## Remaining work
+## RM5-007 — Coverage gaps
 
-The remaining RM5-007 coverage is in progress.
+Added all listed coverage areas:
+
+- Plain-client lost polls, holdover/recovery/expiry and split votes; a delayed
+  insertion crossing with one filter reset per source and no daemon step.
+- `Updater.Run` peer order, timeout/unsupported/RATE/denial schedules,
+  activation retries and cache-write retry timing, as detailed above.
+- Health reasons `leap_table_unavailable`, `leap_conflict` (including armed
+  rejection), `leap_source_disagreement`, optional-table expiry and ordinary
+  fetch failure with valid data. Metrics verify all nine bounded event labels,
+  readiness, table validity and SETTLING's zero pending indicator, and exclude
+  provider names and candidate hashes from labels.
+- Control `LeapValid` uses the greater of wall UTC and the saved bound,
+  including exact expiry and missing data; JSON preserves provider and
+  candidate diagnostics. `carillonctl tracking` output assertions cover the
+  new readiness, provider, dates, acquisition and rejection lines.
+- Store loading rejects invalid provider/key metadata, inconsistent pending
+  generations, acceptance/execution/seed checks after the UTC bound, oversize
+  state and permissive file modes.
+- `CheckUpdate` accepts the exact 400-day expiry boundary and refuses one
+  second beyond it, rejects changed baseline dates/offsets, and rejects UTC
+  before the baseline.
+- Manual reload conflicts/missing files preserve active data. Real `-check`
+  calls inspect existing valid and corrupt caches, refuse an undated manual
+  file even with a cache, leave existing state unchanged, and create no cache
+  for an empty automatic configuration.
+- A real loopback UDP listener exports a running relay engine's durable
+  peer-sourced cache to a second running fake-clock engine. The learner
+  activates only after persistence, records the immediate relay/key, preserves
+  original bytes and restart state, and keeps CLPS packets out of time-source
+  measurements and reach.
+
+The full race suite passes. The UDP integration additionally waits for the
+worker's acceptance acknowledgment before shutdown and passed its targeted
+race rerun.
 
 ## RM5-004 — Operator recovery
 
@@ -103,3 +142,22 @@ a final bound not yet seen by the worker ticker, retained seed-check state,
 and a failed shutdown write preserving prior disk state and reporting the
 failure. The reset documentation was checked against cache naming, locking,
 validation, startup and persistence code.
+
+## Final verification
+
+All passed with Go 1.27.1 on darwin/arm64, with module and build caches in
+the session scratch directory:
+
+- `CGO_ENABLED=1 go test -race ./...` (the complete suite).
+- `CGO_ENABLED=0 go vet ./...` and `CGO_ENABLED=0 go build ./...`.
+- Pure-Go command builds for darwin/arm64, linux/amd64 and freebsd/amd64.
+- `scripts/check-configs.py` against the newly built host daemon: both shipped
+  configurations pass offline.
+- The review's two original engine overlay probes pass with `-race`.
+  The permanent proxy regression replaces the original proxy probe's possible
+  external fetch with an intercepted dial and verifies the fixed destination.
+- Go formatting and `git diff --check` are clean.
+
+Native Linux/FreeBSD race/ABI checks and live GPS/PPS leap-event acceptance
+remain target-host validation. Cross-builds and fake-clock simulations do not
+claim that hardware evidence.

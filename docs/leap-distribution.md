@@ -319,8 +319,9 @@ with experimental refid `XLEP`; clock acquisition continues. A network-only
 client may fall back to fresh leap-capable survivors. If their LI becomes
 unknown after two poll intervals or a split vote, status reports LI=3 while
 discipline state, stratum, kernel synchronization and `waitsync` continue
-under the ordinary holdover policy. Unknown LI sets no new kernel leap flag;
-an already armed event remains scheduled. During SETTLING, a valid table can
+under the ordinary holdover policy. An expired optional table remains a
+degraded health warning in this state. Unknown LI sets no new kernel leap
+flag; an already armed event remains scheduled. During SETTLING, a valid table can
 be exported, but status LI remains 3 and no kernel event is armed.
 RMC/ZDA and bare PPS
 never vote "no leap" merely because they cannot announce one.

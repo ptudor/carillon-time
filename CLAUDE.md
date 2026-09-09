@@ -48,10 +48,10 @@ readiness gating are implemented. RA6X-023 is closed. See
 verification and remaining hardware acceptance. Refclock/serving deployments
 must select an acquisition mode before upgrading; existing network backups
 do not waive the requirement for local leap data. A review of that commit
-(`review/2026/09/REVIEW_M5_FABLE51.md`, 2026-09-09) found 8 items, none
-originally fixed: follow-up work is recorded in
-`review/2026/09/FIXES_M5_FABLE51.md`. RM5-001 now follows the design's plain
-client policy: unknown LI preserves normal synchronization and holdover.
+(`review/2026/09/REVIEW_M5_FABLE51.md`, 2026-09-09) found 8 items, now
+addressed in `review/2026/09/FIXES_M5_FABLE51.md`. Plain clients preserve
+synchronization and holdover when LI is unknown; acquisition recovers from
+transient loss and RATE; recovery and checkpoint behavior are documented.
 The review probes live in `review/2026/09/m5-review-repro/`.
 
 `DESIGN.md` is the specification. Read it before writing code, and update it
