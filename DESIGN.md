@@ -1056,7 +1056,7 @@ the normal discipline conditions and the applicable leap policy:
 | Valid table covering established UTC | File is authoritative, including a known absence of an event; conflicting survivor LI is logged and reported |
 | Table expires within 30 days | Remains authoritative; health degraded; refresh attempts continue |
 | Missing, expired, invalid or time-unverified table; refclock or serving host | Clock acquisition continues, but kernel is unsynchronized and NTP replies LI=3 / stratum 16; health unhealthy |
-| Missing or expired table; network-only client | Fresh consensus from eligible leap-capable survivors may supply LI; otherwise leap knowledge is unknown |
+| Missing or expired table; network-only client | Fresh consensus from eligible leap-capable survivors may supply LI; otherwise LI=3 reports unknown leap knowledge while discipline state, stratum and kernel synchronization continue through normal holdover |
 
 Expired data is retained for diagnosis and rollback protection but loses its
 authority immediately. It must never override a fresh upstream warning with
@@ -1081,6 +1081,12 @@ most two current poll intervals old. A strict majority must agree on 0, 1 or
 2; no voters or no majority means unknown. This fallback supplies the final-day
 warning for a network-only client; it cannot establish durable future
 coverage for a server.
+
+Unknown survivor LI alone never sets `STA_UNSYNC` on a network-only client.
+With no armed event the kernel leap flags are clear; an already armed event
+remains latched until execution. Status and any wire response retain LI=3
+when leap knowledge is unknown. A valid table during SETTLING may be exported,
+but the published LI stays 3 until normal synchronization is reached.
 
 Both authorities have a **boundary**, and both reset boundary-spanning
 evidence exactly once when the kernel applies the leap. With a `leapfile` the

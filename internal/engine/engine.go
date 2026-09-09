@@ -1108,6 +1108,16 @@ func (e *Engine) syncKernel(st *discipline.Status) error {
 	synced := st.State == discipline.StateSynced || st.State == discipline.StateHoldover
 	ks := clock.Status{Synced: synced, Leap: st.Leap}
 	if synced {
+		if ks.Leap == ntp.LeapUnsync {
+			// A plain client's unknown LI does not withdraw its clock
+			// synchronization. The actuator uses LI=3 to set STA_UNSYNC,
+			// so express only the event flags here, preserving an armed leap
+			// independently of the freshness of the original warning.
+			ks.Leap = ntp.LeapNone
+			if !e.pendingLeap.IsZero() && e.clk.Now().Before(e.pendingLeap) {
+				ks.Leap = e.pendingLeapKind
+			}
+		}
 		// Saturating rather than failing: an uncertainty too large to
 		// express is honestly reported as the largest bound both kernels
 		// accept, which is what an unknown error bound is (RA6X-041).
