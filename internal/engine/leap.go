@@ -84,7 +84,9 @@ func (e *Engine) applyLeap(st *discipline.Status, wall time.Time) {
 			}
 		}
 		e.leapDisagreement = disagree
-		st.Leap = indicator
+		if synced {
+			st.Leap = indicator
+		}
 	} else if !e.cfg.LeapRequired && st.Leap != ntp.LeapUnsync && e.timeKnown {
 		e.leapReady = true
 		e.leapAuthority = "sources"
@@ -98,14 +100,14 @@ func (e *Engine) applyLeap(st *discipline.Status, wall time.Time) {
 		// renewals proceed; an LI withdrawal does not silently disarm it.
 		if synced {
 			e.notePendingLeap(st.Leap, wall)
+			if !e.pendingLeap.IsZero() && wall.Before(e.pendingLeap) {
+				st.Leap = e.pendingLeapKind
+			}
+			if !e.executedLeap.IsZero() && wall.Before(e.executedLeap) {
+				st.Leap = ntp.LeapNone
+			}
 		}
-		if !e.pendingLeap.IsZero() && wall.Before(e.pendingLeap) {
-			st.Leap = e.pendingLeapKind
-		}
-		if !e.executedLeap.IsZero() && wall.Before(e.executedLeap) {
-			st.Leap = ntp.LeapNone
-		}
-	} else if synced {
+	} else if synced && e.cfg.LeapRequired {
 		st.State = discipline.StateUnsynced
 		st.Leap = ntp.LeapUnsync
 		st.Stratum = 16

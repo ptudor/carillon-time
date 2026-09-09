@@ -342,7 +342,7 @@ func TestExpiredTableFallsBackOnlyToFreshNetworkEvidence(t *testing.T) {
 	if err := e.handle(e.sys.Tick(clk.Monotonic()), clk.Monotonic()); err != nil {
 		t.Fatal(err)
 	}
-	if st := e.Status(); st.LeapReady || st.Leap != ntp.LeapUnsync || clk.Status().Synced {
+	if st := e.Status(); st.LeapReady || st.Leap != ntp.LeapUnsync || !clk.Status().Synced || clk.Status().Leap != ntp.LeapInsert {
 		t.Fatalf("stale LI still authoritative: %+v", st)
 	}
 }
@@ -369,7 +369,7 @@ func TestSettlingUTCMayExportWithoutArmingKernel(t *testing.T) {
 	if err := e.handle(e.sys.Update(m), m.Now); err != nil {
 		t.Fatal(err)
 	}
-	if st := e.Status(); !st.TimeKnown || st.State != discipline.StateSettling || e.CurrentLeap() == nil {
+	if st := e.Status(); !st.TimeKnown || st.State != discipline.StateSettling || st.Leap != ntp.LeapUnsync || e.CurrentLeap() == nil {
 		t.Fatalf("coarse UTC did not permit independent distribution: %+v", st)
 	}
 	if !e.pendingLeap.IsZero() || clk.Status().Synced || clk.Status().Leap != ntp.LeapUnsync {

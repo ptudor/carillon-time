@@ -49,10 +49,10 @@ verification and remaining hardware acceptance. Refclock/serving deployments
 must select an acquisition mode before upgrading; existing network backups
 do not waive the requirement for local leap data. A review of that commit
 (`review/2026/09/REVIEW_M5_FABLE51.md`, 2026-09-09) found 8 items, none
-fixed yet: the High one (RM5-001) is a policy conflict — a network-only
-client is demoted to unsynchronized whenever survivor LI is unknown, which
-covers ordinary lost polls and all of holdover — and needs a maintainer
-decision; its probes live in `review/2026/09/m5-review-repro/`.
+originally fixed: follow-up work is recorded in
+`review/2026/09/FIXES_M5_FABLE51.md`. RM5-001 now follows the design's plain
+client policy: unknown LI preserves normal synchronization and holdover.
+The review probes live in `review/2026/09/m5-review-repro/`.
 
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
