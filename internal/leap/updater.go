@@ -184,6 +184,24 @@ type peerSchedule struct {
 	spacing time.Duration
 }
 
+const checkpointInterval = 15 * time.Minute
+
+// checkpoint keeps object and rollback metadata in one atomic state file,
+// coalescing routine UTC movement while persisting expiry and execution at
+// the next worker iteration. Shutdown forces the latest observed bound.
+func (u *Updater) checkpoint(v View, force bool) {
+	executed := v.Executed.After(u.state.Executed)
+	if executed {
+		u.state.Executed = v.Executed
+		u.dirty = true
+	}
+	expired := u.state.Active != nil && !v.UTCbound.Before(u.state.Active.Object.table.Expiry) && u.state.UTCbound.Before(u.state.Active.Object.table.Expiry)
+	if v.UTCbound.After(u.state.UTCbound) && (force || executed || expired || v.UTCbound.Sub(u.state.UTCbound) >= checkpointInterval) {
+		u.state.UTCbound = v.UTCbound
+		u.dirty = true
+	}
+}
+
 func (u *Updater) Run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -197,6 +215,14 @@ func (u *Updater) Run(ctx context.Context) {
 			case <-time.After(2 * time.Second):
 			}
 		}
+		u.checkpoint(u.cfg.Controller.LeapView(), true)
+		if u.dirty {
+			// The process's auxiliary shutdown deadline bounds a stuck disk;
+			// keep this final attempt on the sole cache-owning goroutine.
+			if err := u.save(); err != nil {
+				u.cfg.Log.Error("leap shutdown checkpoint failed", "error", err)
+			}
+		}
 	}()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -206,6 +232,9 @@ func (u *Updater) Run(ctx context.Context) {
 	nextActivation := time.Time{}
 	initialSchedule := true
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		v := u.cfg.Controller.LeapView()
 		now := time.Now() // scheduling only, never leap validity
 		if v.Known && initialSchedule {
@@ -218,20 +247,7 @@ func (u *Updater) Run(ctx context.Context) {
 				nextJob = now.Add(max(0, 24*time.Hour+jitter(24*time.Hour)-v.Now.Sub(checked)))
 			}
 		}
-		if v.Executed.After(u.state.Executed) {
-			u.state.Executed = v.Executed
-			u.dirty = true
-			if v.UTCbound.After(u.state.UTCbound) {
-				u.state.UTCbound = v.UTCbound
-			}
-		}
-		// Persist a UTC checkpoint at least once a minute and immediately
-		// upon observed expiry. The object itself supplies the expiry fence.
-		expired := u.state.Active != nil && !v.UTCbound.Before(u.state.Active.Object.table.Expiry) && u.state.UTCbound.Before(u.state.Active.Object.table.Expiry)
-		if v.UTCbound.After(u.state.UTCbound) && (v.UTCbound.Sub(u.state.UTCbound) >= time.Minute || expired) {
-			u.state.UTCbound = v.UTCbound
-			u.dirty = true
-		}
+		u.checkpoint(v, false)
 		if u.dirty && !now.Before(u.nextPersist) {
 			if err := u.save(); err != nil {
 				u.reject(err, nil)

@@ -203,6 +203,56 @@ restarting. Empty automatic caches are accepted by `-check`, with service
 awaiting UTC acquisition and a durably accepted table. The private cache is
 `leap/` beside the drift file. Preserve it across package upgrades and restarts.
 
+## Leap cache recovery
+
+A future UTC bound, a conflicting manual file, or a pending generation that
+cannot activate can prevent leap readiness. Diagnose with
+`carillonctl -json tracking` and the daemon log first. Fix the time source,
+manual file or trust configuration before resetting state; the
+[recovery policy](../docs/leap-distribution.md#operator-recovery) describes
+when restoring the accepted file or providing a newer generation is enough.
+
+For a full acceptance-record reset, perform these steps as the host's
+operator. They remove all rollback, execution and seed-schedule history,
+as well as the cached tables. Required-table hosts withhold synchronized
+service until acquisition succeeds again. There is no selective reset command.
+
+1. Save the tracking output and relevant logs to the incident record. Record
+   the prior accepted/pending hashes and why the reset is necessary. Verify
+   the correct UTC against a trusted independent source and resolve any
+   armed or just-executed leap before discarding its execution record.
+2. Stop the daemon: `systemctl stop carillon.service` on Linux, or
+   `service carillon stop` on FreeBSD. Verify it has fully stopped, including
+   any manually started instance sharing the cache. Leave the private cache
+   directory and `.lock` in place.
+3. Locate the cache beside the configured `daemon.drift_file`: normally
+   `/var/lib/carillon/leap` on Linux or `/var/db/carillon/leap` on FreeBSD.
+   Move `state.json` to a unique audit filename in that same private
+   directory. This preserves the old record while removing its canonical
+   entry. For example on Linux, replacing the timestamp and reason:
+
+   ```sh
+   mv -i /var/lib/carillon/leap/state.json /var/lib/carillon/leap/state.before-reset-20260909T120000Z.json
+   sync
+   logger -t carillon-leap-reset 'Offline acceptance reset: corrected time source; prior state preserved as state.before-reset-20260909T120000Z.json'
+   ```
+
+   Confirm the move completed and `state.json` is absent before continuing.
+   Preserve mode 0600 on the audit file and 0700 on the directory. Do not
+   remove the configured operator-owned `daemon.leapfile` or drift file.
+4. Apply the corrected time/trust configuration and provision current manual
+   data or a reachable trusted distributor. Run `carillon -check -config`
+   with the actual configuration path; an empty automatic cache reports
+   awaiting acquisition. Start with `systemctl start carillon.service` or
+   `service carillon start`, then verify `carillonctl tracking`,
+   `carillonctl waitsync 120`, health and the activation log. A NIST seed may
+   perform a new fetch because its prior check schedule was discarded.
+
+An old audit copy is diagnostic evidence, not a current trust anchor. Restore
+it only while the daemon is stopped and after checking that its original
+bound and generations are appropriate; restoring it also restores the issue
+that prompted the reset if those conditions have not changed.
+
 ## FreeBSD with rc.d
 
 Create the daemon account and directories, then install the binaries, rc.d
