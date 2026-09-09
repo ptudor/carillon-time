@@ -325,6 +325,42 @@ be exported, but status LI remains 3 and no kernel event is armed.
 RMC/ZDA and bare PPS
 never vote "no leap" merely because they cannot announce one.
 
+## Operator recovery
+
+The durable UTC bound never moves backward automatically. A forward-wrong
+clock that reaches synchronization or coarse settling can therefore fence
+off an otherwise current table after the clock is corrected. This can follow
+an accepted bad time source or RTC correction: the ordinary `step.panic`
+limit is 1,000 seconds, while `panic_at_startup` can admit a larger first
+correction. Recovery normally occurs when established UTC catches the saved
+bound; until then a required-table host remains unavailable. A restart alone
+does not lower the bound.
+
+First correct the clock source and any wrong trust/key configuration. A manual
+same-date conflict can be resolved by restoring the accepted bytes and
+restarting (which clears transient rejection status), or by installing a
+valid replacement whose dates advance under the acceptance rules. A pending
+generation can similarly be superseded by an acceptable newer generation.
+Neither operation needs to discard the durable record.
+
+When the record itself prevents recovery, an operator may perform the
+[offline reset procedure](../deploy/README.md#leap-cache-recovery). Stop the
+daemon, preserve an audit copy of `leap/state.json`, remove that canonical
+state entry, and restart with corrected sources/trust and current leap data.
+There is no reset subcommand or selective UTC-bound/pending reset in this
+version. Never edit individual JSON fields or reset a running daemon; its
+single-writer lock and atomic saves require an offline operation.
+
+This full reset discards the active and pending objects, rollback dates and
+hashes, UTC bound, executed-event record, and last successful NIST check.
+Older tables can be accepted again, a seed can fetch immediately, and a
+required-table host withholds service until it reacquires UTC and a durable
+valid table. Loss of the execution record can make a final-day warning arm
+again: do not reset across an armed or just-executed leap without first
+resolving the event and clock state. The preserved copy and operator log must
+identify the reason, prior accepted/pending hashes, and corrected trust or
+time source. No network response can authorize or perform this reset.
+
 ## Configuration
 
 `daemon.leapfile` remains the read-only manual source. With it configured, acquisition defaults
@@ -338,8 +374,15 @@ the drift path must be configured whenever acquisition is enabled. The cache
 directory is private (0700), with a single-writer lock and private state file.
 `state.json` couples the active and pending objects, original bytes, rollback
 metadata, executed boundary, UTC checkpoint and last successful NIST check.
-The worker checkpoints established UTC at least once a minute and on observed
-expiry or execution, subject to successful durable writes. A restart always
+The worker checkpoints established UTC every 15 minutes and on observed
+expiry or execution, subject to successful durable writes. It attempts a final
+save of the latest bound and pending metadata on orderly shutdown; failures
+are logged, and the process's auxiliary shutdown deadline bounds a stuck disk.
+Keeping one atomic state file preserves object/rollback coupling. The longer
+routine interval reduces full-state writes from about 1,440 to 96 per day,
+plus acquisition and event writes; after an abrupt stop the UTC checkpoint
+can lag by up to 15 minutes. Table expiry remains an independent fence even
+between checkpoints. A restart always
 requires fresh clock acquisition; a clock behind the saved UTC bound cannot
 reactivate or export data. Disk failures are reported and retried with backoff.
 

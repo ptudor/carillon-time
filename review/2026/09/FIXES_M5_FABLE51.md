@@ -70,4 +70,36 @@ library simulated time and synchronized fixtures, without external hosts.
 
 ## Remaining work
 
-RM5-004, the remaining RM5-007 coverage and RM5-008 are in progress.
+The remaining RM5-007 coverage is in progress.
+
+## RM5-004 — Operator recovery
+
+Documented diagnosis and a complete offline acceptance-record reset in
+`deploy/README.md` and `docs/leap-distribution.md`: stop and verify the daemon
+has exited, preserve tracking/logs and a private audit copy of `state.json`,
+remove its canonical entry by moving it, record the reason, correct sources
+and trust, validate offline, restart and verify activation/readiness.
+
+The instructions explain forward-wrong UTC bounds and how long they persist,
+alternatives for manual conflicts/pending generations, and the consequences
+of losing rollback, execution, cached objects and seed-check history. They
+explicitly cover final-day rearming risk and state that no selective reset
+subcommand exists. No host state was reset as part of this work.
+
+## RM5-008 — Checkpoint write volume and shutdown
+
+Routine UTC checkpoints now coalesce 15 minutes of progress: about 96 full
+state writes per day instead of 1,440, plus acquisition/event writes. The
+single atomic file continues coupling objects and rollback metadata. Observed
+expiry and execution still request an immediate worker save. Shutdown drains
+the network job and attempts a final save on the cache owner, with errors
+logged and the existing process auxiliary deadline bounding a stuck disk.
+The design/specification explicitly document up to 15 minutes of routine
+checkpoint loss after an abrupt stop.
+
+Validation: `go test -race ./internal/leap` passes. Regressions check the
+15-minute cadence, no per-minute writes, immediate expiry/execution saves,
+a final bound not yet seen by the worker ticker, retained seed-check state,
+and a failed shutdown write preserving prior disk state and reporting the
+failure. The reset documentation was checked against cache naming, locking,
+validation, startup and persistence code.

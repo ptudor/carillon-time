@@ -1073,6 +1073,15 @@ the kernel status and the NTP responder all use the same effective readiness.
 Restoring a valid table also requires current acceptable time evidence before
 synchronized service resumes.
 
+Durable UTC checkpoints share the atomic object/rollback record. Routine
+movement is saved every 15 minutes to limit flash writes; observed expiry and
+execution are saved at the next worker iteration, and orderly shutdown
+attempts a final save under the process shutdown deadline. An abrupt stop can
+lose the last 15 minutes of routine UTC progress, but the saved object's
+expiry still limits authority. A wrong future bound is never lowered
+automatically; [operator recovery](docs/leap-distribution.md#operator-recovery)
+documents the offline reset, its audit record, and the history it discards.
+
 Survivor leap consensus is **published as soon as it is accepted**, not only
 after the system source contributes a new filter output. Only fresh,
 leap-capable survivors vote; stale measurements and leap-incapable refclocks
