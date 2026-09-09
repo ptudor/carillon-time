@@ -770,6 +770,113 @@ Two things to know:
 Rollback: `.prev` copies of both binaries, `carillon.toml.prev`, and
 `carillon.service.prev` are on each host; the previous release is `3b08543`.
 
+## M5 review fixes — 2026-09-09 13:04–13:21 (UTC)
+
+Deployed `v1.0.0-11-ga8f56b5` to all three hosts, replacing
+`v1.0.0-4-g3413e23`. This carries the eight fixes from the M5 leap-authority
+review (`review/2026/09/REVIEW_M5_FABLE51.md`, recorded per finding in
+`FIXES_M5_FABLE51.md`): a plain client keeps its synchronization and holdover
+when LI is unknown, SETTLING publishes LI=3 and cannot arm a kernel leap, the
+NIST transport ignores proxy environment variables, unanswered CLPS probes get
+an ordinary timeout backoff instead of the 24-hour capability floor, a
+transfer recovers its normal spacing after RATE, and the leap cache is
+checkpointed every 15 minutes with a final save on orderly shutdown. It also
+brings the repository copy of the systemd unit (`c290aeb`, the `AF_NETLINK`
+change made on the hosts on 2026-09-08) and the deployed units back into
+agreement, below.
+
+Pre-flight, before anything was replaced:
+
+- `make test` (vet plus the race detector) passed on the build commit.
+- The new binary was staged in `/tmp` on each host and run `-check` against
+  that host's live configuration. All three passed unchanged; `twocom` reported
+  only its three standing public-server warnings. No configuration needed
+  changing: all three hosts have been on `manual` acquisition from a
+  `leapfile` since 2026-09-08, so the M5 upgrade gate was already satisfied.
+- Both candidate unit files passed `systemd-analyze verify` on their hosts.
+
+### Units brought back to the repository's version
+
+The two Linux units had drifted from `deploy/systemd/carillon.service`: they
+were hand-edited for `AF_NETLINK` on 2026-09-08 and still carried
+`ReadWritePaths=/var/lib/carillon /run`, which the repository narrowed to
+`/var/lib/carillon` some time ago on the grounds that `RuntimeDirectory=`
+already makes `/run/carillon` writable under `ProtectSystem=strict` and that
+listing `/run` opens every other daemon's runtime directory. `gummi`'s also
+lacked `ntpsec.service` in `Conflicts=`.
+
+`gummi` got the repository unit verbatim. `navlisten2026` got it minus
+`SupplementaryGroups=dialout` and the two `DeviceAllow=` lines, as the unit's
+own comment prescribes for a client-only host and as that host has been
+deployed since 2026-08-25. `systemctl show` confirms
+`ReadWritePaths=/var/lib/carillon` on both, and both restarts created the
+control socket under `/run/carillon` without incident, which is the thing the
+narrowing could have broken. The FreeBSD rc.d script was already identical to
+`deploy/freebsd/carillon`.
+
+### Method and order
+
+On each host: `cp -p` the outgoing binaries to `.prev`, install the new ones
+beside the target and `mv` over it, `restorecon` on `gummi`, install the unit
+and `daemon-reload` on the Linux hosts, restart, `waitsync 300`. `.prev` now
+holds `3413e23` everywhere; the `.9cb190e` copies remain; `3b08543` is no
+longer on any host.
+
+Upstream first, with the slew rule from 2026-09-05 applied literally:
+
+- `gummi` restarted 13:04:48. It came up with −2.83 ms of phase and took 13
+  minutes to slew it out: −2.7 ms at 13:05, −1.6 ms after its second loop
+  update at 13:09, −211 µs at 13:18.
+- `twocom` restarted 13:18:50, once `gummi` was under 300 µs. Its own pending
+  slew then held between −75 and −85 µs for four consecutive 30 s samples.
+- `navlisten2026` restarted 13:21:17.
+
+### Results
+
+| host | `waitsync` | offset at restart | frequency before → after | drift file | system source |
+|---|---|---|---|---|---|
+| `gummi` | 7 s | −2.83 ms | −5.597 → −5.554 ppm (−5.582 at +17 min) | −5.547275, untouched | `fedora-1` |
+| `twocom` | 3 s | −116 µs | +19.000 → +20.674 ppm (+20.191 at +3 min) | 20.687926, untouched | `gummi` |
+| `navlisten2026` | 3 s | −878 µs | +9.375 → +9.393 ppm | 9.401391, untouched | `debian-2` |
+
+- Zero clock steps on all three. Zero `level=WARN` or `level=ERROR` lines in
+  any service log since its restart, apart from `twocom`'s three standing
+  configuration warnings at startup.
+- Leap: all three report `Leap ready true`, `manual: unchanged`, and the same
+  digest `506e737d…`; each rewrote `state.json` on start.
+- The outgoing `3413e23` binaries each declined to persist the drift file at
+  stop, for three different reasons the gate gives — `gummi` "only 1 loop
+  updates in the last 15m0s", `twocom` "frequency moved 1.708 ppm in the last
+  15m0s", `navlisten2026` "less than 15m0s of frequency history" — and each new
+  binary started from the value on disk. The files are unchanged.
+- Server paths, from the new builds: `twocom`'s authenticated query to `gummi`
+  (key 1) measured −84 µs offset at 210 µs delay; `gummi`'s unauthenticated,
+  ACL-authorized query to `twocom` measured +120 µs at 258 µs. Both carried
+  kernel receive timestamps.
+- `gummi` and `twocom` each own IPv4 and IPv6 UDP/123 exclusively and served
+  zero requests while unsynchronized (50 and 18 served in the first minutes).
+  `navlisten2026` binds nothing but its loopback monitor. `/healthz` is 200
+  `healthy` on all three.
+- Topology intact: `twocom` stratum 4 on `gummi`; `navlisten2026` stratum 3
+  with both LAN hosts as survivors. It chose `debian-2` as system source on
+  its first three samples with `junia` an outlier, which is early-sample
+  selection and is expected to settle.
+
+### Observed, not acted on
+
+`twocom` has logged `ignored offset spike` at WARN 20–40 times a day since
+2026-09-06, against one a day before 2026-09-05; `gummi` logs 1–2 a day and
+`navlisten2026` 3–7. Today's rejected offsets on `twocom` ranged from 2 µs to
+461 µs against a reported jitter of 27–41 µs. Several of them — 2 µs, 4 µs,
+38 µs — are well inside the jitter, so either the spike gate (RF5X-001) is
+keying on something other than the offset it logs, or it is rejecting good
+samples on the host with the tightest path. Worth checking against
+`twocom`'s `loop.tsv` and `sources.tsv`; it is not a deployment issue and the
+binaries were not changed for it.
+
+Rollback: `.prev` copies of both binaries (`3413e23`) and
+`carillon.service.prev` on each host; configurations unchanged.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
