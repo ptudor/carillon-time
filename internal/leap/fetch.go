@@ -20,6 +20,7 @@ const NISTURL = "https://tf.nist.gov/leap-seconds.list"
 // Neither a peer nor configuration can replace the URL or TLS policy.
 func FetchNIST(ctx context.Context) (*Object, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil // acquisition policy never comes from the environment
 	transport.DisableCompression = true
 	defer transport.CloseIdleConnections()
 	return fetchHTTPS(ctx, &http.Client{Transport: transport, Timeout: 30 * time.Second,
@@ -163,7 +164,7 @@ func (p *peerClient) exchange(ctx context.Context, request Message) (*Message, e
 		}
 	}
 	if request.Operation == Probe {
-		return nil, &PeerError{Reason: "unsupported or probe timeout", RetryAfter: 24 * time.Hour}
+		return nil, Reject("timeout", "probe timed out after three attempts")
 	}
 	return nil, Reject("timeout", "chunk timed out after three attempts")
 }
@@ -220,6 +221,10 @@ func (p Peer) fetch(ctx context.Context, cached *Object, now time.Time, count *C
 	defer stop()
 	c := peerClient{conn: conn, peer: p, spacing: spacing, timeout: 4 * time.Second,
 		probes: func() { count.Probes.Add(1) }, bytes: func(n uint64) { count.Bytes.Add(n) }}
+	return c.fetch(ctx, cached, now)
+}
+
+func (c *peerClient) fetch(ctx context.Context, cached *Object, now time.Time) (*Object, error) {
 	req := Message{Operation: Probe}
 	if cached != nil {
 		req.Manifest = cached.manifest
@@ -228,6 +233,12 @@ func (p Peer) fetch(ctx context.Context, cached *Object, now time.Time, count *C
 	if err != nil {
 		return nil, err
 	}
+	// A successful authenticated probe is recovery evidence after RATE.
+	// The scheduler has already honored the kiss's retry floor. Resume the
+	// normal request interval so a single old kiss cannot strand a large
+	// object behind the overall transfer deadline indefinitely.
+	c.spacing = min(c.spacing, 4*time.Second)
+	c.next = time.Now().Add(c.spacing)
 	if manifest.Result == NoTable {
 		return nil, Reject("missing", "distributor has no current table")
 	}
@@ -238,7 +249,7 @@ func (p Peer) fetch(ctx context.Context, cached *Object, now time.Time, count *C
 		return nil, nil
 	}
 	chunks := (manifest.Manifest.Size + ChunkSize - 1) / ChunkSize
-	if time.Duration(chunks)*spacing >= 30*time.Minute {
+	if time.Duration(chunks)*c.spacing >= 30*time.Minute {
 		return nil, Reject("rate", "peer RATE interval cannot fit this object in the 30-minute transfer bound")
 	}
 	data := make([]byte, 0, manifest.Manifest.Size)

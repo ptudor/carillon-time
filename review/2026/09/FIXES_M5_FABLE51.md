@@ -33,6 +33,41 @@ RM5-007 boundary coverage is also added here: a delayed engine tick spanning
 an insertion's repeated second and midnight resets each source once, records
 execution, and preserves valid service without a daemon step.
 
+## RM5-002 — Fixed NIST transport
+
+The cloned HTTPS transport explicitly disables proxies. A regression sets
+both proxy environment spellings and intercepts dialing before any DNS or
+network I/O; the destination must remain `tf.nist.gov:443`. TLS verification,
+redirect refusal, encoding, size and time limits remain enforced.
+
+## RM5-003 — Transient probe retry
+
+Three unanswered probes now produce an ordinary timeout rejection, using
+15-minute to six-hour error backoff. Only authenticated evidence of missing
+or unsupported CLPS capability receives the 24-hour capability floor.
+The specification now distinguishes unanswered requests from legacy replies.
+
+## RM5-005 — Recovery after RATE
+
+A successful authenticated probe resumes normal four-second request spacing
+after honoring the previous kiss's retry minimum. A new RATE aborts the
+transfer and reinstates backoff. Successful fetches also clear retained
+scheduler spacing. This prevents a transient RATE from making larger files
+permanently untransferable while preserving the existing listener budgets.
+
+Validation for RM5-002/003/005: `go test -race ./internal/leap` passes. An
+in-memory authenticated transfer uses simulated time to download a file over
+12 KiB after a 64-second RATE minimum, checking every chunk at four-second
+spacing. Scheduling regressions exercise `Updater.Run` itself: configured
+peer order and failover, transient timeout retry, unsupported capability's
+24-hour floor, DENY/RSTR stops, and RATE retention followed by recovery.
+
+Additional RM5-007 coverage in this checkpoint checks the 15-minute retry
+after a failed cache commit, pending activation retry, and hourly manual
+replacement with conflicting bytes or a temporarily missing file. The
+original active table survives each rejection. Scheduler tests use standard
+library simulated time and synchronized fixtures, without external hosts.
+
 ## Remaining work
 
-RM5-002, RM5-003, RM5-004, RM5-005, RM5-007 and RM5-008 are in progress.
+RM5-004, the remaining RM5-007 coverage and RM5-008 are in progress.
