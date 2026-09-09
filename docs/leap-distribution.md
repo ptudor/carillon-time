@@ -107,7 +107,9 @@ the HTTPS location published by
 It validates the system CA chain, hostname and certificate dates, requests
 identity content encoding, rejects redirects, and caps the response at 64 KiB
 with a 30-second overall deadline. HTTP downgrade and TLS verification bypass
-are prohibited. The embedded file hash, if present, is not an origin signature.
+are prohibited. Process proxy environment variables are ignored; the fetch
+connects directly to the fixed HTTPS endpoint. The embedded file hash, if
+present, is not an origin signature.
 
 The seed checks on startup when no usable table exists, then every 24 hours
 with ±10% jitter. Errors back off from 15 minutes to six hours with jitter;
@@ -119,9 +121,10 @@ keeps one designated fetcher and one externally observable download policy.
 Persist the last successful seed check separately from acceptance/expiry, so
 restarting a seed with a valid cache does not force another NIST download.
 The normal listener rate limits also apply to transfers. A learner retains
-an authenticated RATE minimum across retries; if that interval cannot fit the
-advertised object into the 30-minute transfer bound, it reports the rate-policy
-conflict instead of exceeding either limit. Size listener budgets for the
+an authenticated RATE minimum across failed retries. A successful authenticated
+probe resumes the normal four-second request spacing; a new RATE aborts the
+transfer and reinstates its retry minimum. This lets a transient kiss recover
+without permanently excluding larger files. Size listener budgets for the
 additional authenticated traffic when enabling exports.
 
 Offline operators may provision an authenticated copy as a local file. Before
@@ -220,10 +223,13 @@ time polls; retry an operation at most three times with backoff and a new
 request ID and transmit nonce each time. Duplicate, delayed and unsolicited
 responses have no effect. Other authorized peers can be tried after failure.
 
-An older server may return an ordinary authenticated NTP reply without CLPS,
-or drop the extension-bearing request. Record unsupported capability and
-retry no sooner than 24 hours later; ordinary time polling continues on its
-own schedule. Unsupported version responses behave likewise. No CLPS is sent
+An older server may return an ordinary authenticated NTP reply without CLPS.
+Record unsupported capability and retry no sooner than 24 hours later;
+authenticated unsupported-version responses behave likewise. Unanswered probes
+cannot distinguish a legacy peer from temporary packet loss, so their three
+bounded attempts use ordinary error backoff (15 minutes to six hours), not
+the unsupported floor. Ordinary time polling continues on its own schedule.
+No CLPS is sent
 to unconfigured or unauthenticated public peers, and ordinary requests receive
 ordinary NTP replies. Missing capability never weakens acceptance policy.
 

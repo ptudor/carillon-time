@@ -48,6 +48,7 @@ type Updater struct {
 	committed   bool
 	nextPersist time.Time
 	fetchNIST   func(context.Context) (*Object, error)
+	fetchPeer   func(Peer, context.Context, *Object, time.Time, *Counters, time.Duration) (*Object, error)
 	spacing     time.Duration
 }
 
@@ -58,7 +59,7 @@ func NewUpdater(cfg UpdaterConfig) *Updater {
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.DiscardHandler)
 	}
-	u := &Updater{cfg: cfg, state: cfg.Initial, committed: true, fetchNIST: FetchNIST, spacing: 4 * time.Second}
+	u := &Updater{cfg: cfg, state: cfg.Initial, committed: true, fetchNIST: FetchNIST, fetchPeer: Peer.fetch, spacing: 4 * time.Second}
 	u.status.Mode = cfg.Mode
 	u.status.LastFetch = cfg.Initial.LastCheck
 	u.status.LastResult = "awaiting UTC"
@@ -275,7 +276,7 @@ func (u *Updater) Run(ctx context.Context) {
 					case "peers":
 						p := u.cfg.Peers[peer]
 						r.provider = Provider{Kind: "peer", Name: p.Name, KeyID: p.Key.ID}
-						r.object, r.err = p.fetch(ctx, anchor, utc, &u.cfg.Report.Counters, spacing)
+						r.object, r.err = u.fetchPeer(p, ctx, anchor, utc, &u.cfg.Report.Counters, spacing)
 					}
 					done <- r
 				}(peer)
@@ -323,6 +324,7 @@ func (u *Updater) Run(ctx context.Context) {
 					interval = s.backoff
 				} else {
 					s.backoff = 0
+					s.spacing = 0
 				}
 				var pe *PeerError
 				if errors.As(err, &pe) {

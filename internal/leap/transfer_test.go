@@ -415,7 +415,12 @@ func TestProbeTimeoutIsBoundedAndCancels(t *testing.T) {
 	p := peerClient{conn: conn, peer: Peer{Key: transferKey()}, spacing: time.Millisecond, timeout: time.Millisecond}
 	_, err = p.exchange(context.Background(), Message{Operation: Probe})
 	var pe *PeerError
-	if !errors.As(err, &pe) || pe.RetryAfter < 24*time.Hour {
+	if Reason(err) != "timeout" || errors.As(err, &pe) {
 		t.Fatalf("timeout backoff: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.exchange(ctx, Message{Operation: Probe}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled probe: %v", err)
 	}
 }
