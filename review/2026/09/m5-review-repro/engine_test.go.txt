@@ -1,0 +1,141 @@
+package engine
+
+// M5 review probes (2026-09-09). They assert the behaviour DESIGN.md §6.5
+// (HOLDOVER is served as synchronized by the wire and the kernel) and the
+// §6.8 network-only client row (fresh survivor LI may supply the warning,
+// otherwise leap knowledge is unknown) describe, so they fail on 3413e23.
+// Everything runs on clock.Fake; no real clock or network is touched.
+
+import (
+	"testing"
+	"time"
+
+	"github.com/ptudor/carillon-time/internal/clock"
+	"github.com/ptudor/carillon-time/internal/discipline"
+	"github.com/ptudor/carillon-time/internal/ntp"
+)
+
+func m5Upstream(t *testing.T, e *Engine, clk *clock.Fake, name string, li ntp.Leap, advance time.Duration) {
+	t.Helper()
+	clk.Advance(advance)
+	m := good(0)
+	m.Source = name
+	m.Leap = li
+	m.Now = clk.Monotonic()
+	m.At = m.Now
+	e.crossLeap(m.Now)
+	if err := e.handle(e.sys.Update(m), m.Now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func m5Tick(t *testing.T, e *Engine, clk *clock.Fake, advance time.Duration) {
+	t.Helper()
+	clk.Advance(advance)
+	now := clk.Monotonic()
+	e.crossLeap(now)
+	if err := e.handle(e.sys.Tick(now), now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func m5Report(t *testing.T, label string, st *Status, clk *clock.Fake) {
+	t.Helper()
+	t.Logf("%s: clock_state=%s state=%s stratum=%d refid=%s leap=%s leap_ready=%t leap_source=%s reason=%q kernel_synced=%t kernel_leap=%s",
+		label, st.ClockState, st.State, st.Stratum, st.RefID, st.Leap, st.LeapReady, st.LeapSource, st.LeapReason, clk.Status().Synced, clk.Status().Leap)
+}
+
+// A plain network client (no table, no acquisition, require_table false — the
+// configuration docs/leap-distribution.md says "needs no new leap settings")
+// with one upstream at poll 6. The discipline keeps the source as a survivor
+// for eight poll intervals and then coasts in HOLDOVER for holdover_max, but
+// the leap vote is only fresh for two poll intervals, and applyLeap demotes
+// the effective state to UNSYNCED/XLEP and clears the kernel's synchronized
+// status as soon as the vote is unknown.
+func TestVerificationM5NetworkOnlyClientKernelSyncFollowsLeapVoteAge(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC))
+	src := &scripted{name: "upstream", clk: clk}
+	cfg := testConfig("", SourceSpec{Source: src, Options: discipline.Options{Numbering: true}})
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		m5Upstream(t, e, clk, "upstream", ntp.LeapNone, 64*time.Second)
+	}
+	st := e.Status()
+	m5Report(t, "baseline", st, clk)
+	if st.State != discipline.StateSynced || !st.LeapReady || st.LeapSource != "sources" || !clk.Status().Synced {
+		t.Fatalf("baseline is not a synchronized plain client: %+v", st)
+	}
+
+	// Two consecutive lost polls: 129 s after the last packet.
+	m5Tick(t, e, clk, 129*time.Second)
+	st = e.Status()
+	m5Report(t, "after two lost polls", st, clk)
+	if st.ClockState != discipline.StateSynced {
+		t.Fatalf("the discipline itself dropped the survivor early: %s", st.ClockState)
+	}
+	if !clk.Status().Synced || st.State != discipline.StateSynced {
+		t.Errorf("two lost polls unsynchronized a plain client: state=%s stratum=%d refid=%s kernel_synced=%t", st.State, st.Stratum, st.RefID, clk.Status().Synced)
+	}
+
+	// Holdover proper: the survivor's own freshness deadline (8 polls) passes.
+	m5Tick(t, e, clk, 400*time.Second)
+	st = e.Status()
+	m5Report(t, "holdover", st, clk)
+	if st.ClockState != discipline.StateHoldover {
+		t.Fatalf("expected the discipline to be coasting: %s", st.ClockState)
+	}
+	if !clk.Status().Synced || st.State != discipline.StateHoldover {
+		t.Errorf("HOLDOVER is not served as synchronized by the kernel: state=%s refid=%s kernel_synced=%t", st.State, st.RefID, clk.Status().Synced)
+	}
+
+	// One packet restores everything: the flap is bounded only by packet loss.
+	m5Upstream(t, e, clk, "upstream", ntp.LeapNone, time.Second)
+	st = e.Status()
+	m5Report(t, "one packet later", st, clk)
+	if st.State != discipline.StateSynced || !clk.Status().Synced {
+		t.Fatalf("recovery: %+v", st)
+	}
+}
+
+// Two upstreams that disagree during a final day (one announces the leap,
+// the other never does, which is common on the public pool). The vote is a
+// tie, so leap knowledge is unknown, and the client is served as UNSYNCED
+// with the kernel flag cleared for the whole day rather than as synchronized
+// with an unknown leap indicator.
+func TestVerificationM5NetworkOnlyClientSplitFinalDayVote(t *testing.T) {
+	clk := clock.NewFake(time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC))
+	a := &scripted{name: "a", clk: clk}
+	b := &scripted{name: "b", clk: clk}
+	cfg := testConfig("", SourceSpec{Source: a, Options: discipline.Options{Numbering: true}}, SourceSpec{Source: b, Options: discipline.Options{Numbering: true}})
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Agreeing votes first, so the client synchronizes; then the warning
+	// appears on one upstream only. Both replies land in the same poll slot
+	// so the system source stays stable while settling.
+	for range 4 {
+		m5Upstream(t, e, clk, "a", ntp.LeapNone, 64*time.Second)
+		m5Upstream(t, e, clk, "b", ntp.LeapNone, 0)
+	}
+	st := e.Status()
+	m5Report(t, "agreeing vote", st, clk)
+	if st.State != discipline.StateSynced || !clk.Status().Synced {
+		t.Fatalf("baseline is not synchronized: %+v", st)
+	}
+	for range 2 {
+		m5Upstream(t, e, clk, "a", ntp.LeapInsert, 64*time.Second)
+		m5Upstream(t, e, clk, "b", ntp.LeapNone, 0)
+	}
+	st = e.Status()
+	m5Report(t, "split vote", st, clk)
+	if st.ClockState != discipline.StateSynced {
+		t.Fatalf("the discipline did not synchronize: %s", st.ClockState)
+	}
+	if st.State != discipline.StateSynced || !clk.Status().Synced {
+		t.Errorf("a split final-day vote unsynchronized the client for the day: state=%s stratum=%d refid=%s leap=%s kernel_synced=%t", st.State, st.Stratum, st.RefID, st.Leap, clk.Status().Synced)
+	}
+}
