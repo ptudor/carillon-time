@@ -152,7 +152,7 @@ func healthOf(st *engine.Status, servedAt time.Time, mono float64) Health {
 		remaining := st.LeapExpiry.Sub(utc)
 		switch {
 		case remaining <= 0:
-			if st.LeapSource == "sources" && !st.LeapRequired {
+			if !st.LeapRequired {
 				if h.Status == statusHealthy {
 					h.Status = statusDegraded
 				}

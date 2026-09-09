@@ -91,6 +91,8 @@ func TestHealthStates(t *testing.T) {
 func TestHealthReportsLeapfileFreshness(t *testing.T) {
 	now := time.Date(2026, 8, 23, 20, 0, 0, 0, time.UTC)
 	st := testEngineStatus(now, discipline.StateSynced)
+	st.LeapRequired = true
+	st.LeapReady = true
 	st.LeapExpiry = now.Add(20 * 24 * time.Hour)
 	if h := healthOf(st, now.Add(time.Second), testPublishedMono+1); h.Status != "degraded" || !slices.Contains(h.Reasons, "leapfile_expiring") {
 		t.Fatalf("expiring: %+v", h)
