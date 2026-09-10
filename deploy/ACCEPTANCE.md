@@ -1004,6 +1004,57 @@ requires its `.prev` config too, since `a8f56b5` does not know `iers`; the
 cache stays usable either way, because `state.json` kept its format and
 `seed.json` is a separate file an older binary never opens.
 
+## N_PPS shared-tty verification — gummi, 2026-09-10 04:06–04:09 (UTC)
+
+Revision `0a864d7` (`Stop describing one tty for NMEA and PPS as a
+FreeBSD-only arrangement`). No daemon, config or binary on any host was
+touched: this run only executed the test suite on `gummi` and removed
+everything it copied.
+
+### What was being checked
+
+carillon used to refuse `pps = "dcd"` on Linux because DESIGN.md §5.3 held
+that `N_PPS` replaced normal tty input. It does not, and the code, the spec
+and the deployment docs have been changed accordingly. Since the old rule was
+itself a confident but wrong statement about the kernel, the replacement is
+not left resting on a reading of `drivers/pps/clients/pps-ldisc.c`.
+
+### Result
+
+`gummi` runs Fedora 43, kernel `6.19.14-200.fc43.x86_64`, `go1.25.9`, with
+`pps_ldisc` loaded and its own `/dev/pps0` present throughout.
+
+- `TestNPPSKeepsDeliveringSerialData` passed — it did not skip. It read a
+  sentence through a pseudo-terminal under `N_TTY`, attached `N_PPS` with
+  `TIOCSETD`, confirmed the discipline had actually changed with `TIOCGETD`,
+  and read a second sentence written after the attach. Five consecutive runs,
+  then again under `-race`.
+- The kernel log corroborates it independently: each run registered `pps
+  pps1` for the pty and logged `removed` when the descriptor closed, so the
+  discipline genuinely was `pps_ldisc` and not a no-op.
+- The three `internal/config` Linux checks passed: `pps = "dcd"` and a path
+  equal to the NMEA device are accepted, `pps = "cts"` is refused with a
+  message naming DCD, and non-PPS refclocks are untouched.
+- The whole suite passed natively with cgo and `-race`, which is the
+  per-host run the Mac cannot do for the `_linux.go` files: `go vet ./...`
+  clean, all 17 packages `ok`.
+
+### What this does and does not establish
+
+It establishes the kernel property the lifted restriction depends on, on a
+current kernel: a tty with `N_PPS` attached keeps delivering serial data.
+
+It does not establish stratum-1 behaviour. No configured input on any host
+has a live pulse, so a GPS receiver sharing one tty between its NMEA stream
+and its DCD pulse has still never been run end to end. `docs/limitations.md`
+continues to list that.
+
+### Host left as found
+
+The source tree, module cache and test binaries were removed and the module
+cache emptied with `go clean -modcache`; `~/go` predates this session and was
+not touched. `/sys/class/pps/` holds `pps0` alone again.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's

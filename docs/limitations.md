@@ -24,10 +24,11 @@ FreeBSD kernel or change a runner’s clock.
   still needs hardware evidence beyond the fake-clock positive/negative leap
   simulations in [the M5 acceptance matrix](leap-distribution.md#observability-and-acceptance).
 - A Linux run with NMEA and DCD PPS sharing one tty (`pps = "dcd"`). The
-  daemon attaches `N_PPS` itself and relies on `pps_ldisc` inheriting the
-  `N_TTY` operations so the sentence stream survives; that is what the kernel
-  source and `ldattach(8)` practice say, but no carillon host has yet run it
-  against a live pulse.
+  kernel property this depends on — a tty keeps delivering serial data with
+  `N_PPS` attached — is verified on Fedora 43, kernel 6.19.14, by
+  `TestNPPSKeepsDeliveringSerialData` (see `deploy/ACCEPTANCE.md`,
+  2026-09-10). A receiver actually sharing one port between its sentences and
+  its pulse has still not been run against a live signal.
 - A sustained accuracy comparison against a measured reference. UART, USB,
   receiver, kernel, and host scheduling behavior all matter.
 - Native FreeBSD ABI/race checks and device acceptance on each deployed
