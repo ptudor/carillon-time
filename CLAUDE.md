@@ -54,6 +54,17 @@ synchronization and holdover when LI is unknown; acquisition recovers from
 transient loss and RATE; recovery and checkpoint behavior are documented.
 The review probes live in `review/2026/09/m5-review-repro/`.
 
+**Leap seed publisher (2026-09-10):** the seed can fetch from IERS
+(`acquire = "iers"`) as well as NIST, and behaves as a polite client (version
+and contact `User-Agent`, conditional requests persisted in `seed.json`,
+`Retry-After` obeyed, a 15-minute floor that survives restarts). IERS
+publishes first and the two publishers date `#$` differently, so they are not
+interchangeable under the rollback rule: choose one per deployment
+(`docs/leap-distribution.md`). The test hosts run the automatic chain: `gummi`
+seeds from IERS and exports with key 1, `twocom` learns from `gummi`,
+`navlisten2026` stays on its tzdata file. The first real-host CLPS transfer
+is recorded in `deploy/ACCEPTANCE.md`.
+
 `DESIGN.md` is the specification. Read it before writing code, and update it
 whenever protocol or discipline behaviour changes — the design doc is the
 source of truth, the code follows it.

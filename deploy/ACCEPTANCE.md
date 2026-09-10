@@ -877,6 +877,133 @@ binaries were not changed for it.
 Rollback: `.prev` copies of both binaries (`3413e23`) and
 `carillon.service.prev` on each host; configurations unchanged.
 
+## Leap authority, automatic chain — 2026-09-10 02:28–02:49 (UTC)
+
+Deployed `v1.0.0-13-g533e693` to all three hosts, replacing
+`v1.0.0-11-ga8f56b5`, and moved the two serving hosts from manual leap files
+to the design's automatic chain: `gummi` seeds from IERS over HTTPS and
+exports with key 1, `twocom` learns from `gummi` over the authenticated
+association. This is the first real-host run of the CLPS exchange.
+
+### Why now
+
+The 2026-09-08 entry left a cliff: every host was on `manual` acquisition
+from a distribution copy of `leap-seconds.list` expiring 2026-12-28, after
+which `gummi` and `twocom` would withhold synchronized service. Checked
+before touching anything:
+
+- IERS, which issues Bulletin C, published the renewal on 2026-07-06:
+  `#$ 3992312697`, `#@ 4023129600` (expires 2027-06-28), SHA-256
+  `db5a895f…`. IANA's copy is byte-identical and is in tzdata 2026c. NIST
+  still served the December file (`#$ 3676924800`, 2016; `#@ 4007404800`),
+  two months behind.
+- Neither Linux host had the renewal: `gummi` runs tzdata 2026a (Fedora 43),
+  `navlisten2026` tzdata 2026b (Debian 13). Both would pick it up hourly once
+  their distribution packages 2026c, on nobody's schedule.
+- `twocom` would never refresh: its file is ntpd's `/var/db` copy, and the
+  FreeBSD 15 daily job `480.leapfile-ntpd` runs `service ntpd needfetch` only
+  after `service ntpd enabled`, which `ntpd_enable=NO` fails.
+- The design's original answer, a NIST seed, has a trap the spec did not
+  state: NIST dates `#$` by the last change to the leap records and IERS by
+  the last edit of the file, so every host's accepted record (`#$`
+  2026-01-06) sees NIST's copy as a rollback and would reject it without the
+  offline cache reset. The reverse direction is an ordinary advance.
+
+`533e693` therefore adds `acquire = "iers"` beside `"nist"`, no IANA mode
+and no fallback between publishers, and makes the seed a deliberately polite
+client. `docs/leap-distribution.md` records the publisher choice and the
+client policy; `deploy/README.md` the rollback consequence.
+
+### Pre-flight
+
+- `make test` (vet plus the race detector) passed on the build commit.
+- The new binary was staged in `/tmp` on each host and run `-check` against
+  that host's intended configuration: the candidate seed config on `gummi`,
+  the candidate learner config on `twocom`, the unchanged live config on
+  `navlisten2026`. All three passed; `twocom` reported only its three
+  standing public-server warnings.
+- Configuration changes, kept as `carillon.toml.prev`: `gummi` dropped
+  `leapfile`, gained `[leap] acquire = "iers"`, `require_table = true` and
+  `[serve] leap_keys = [1]`; `twocom` dropped `leapfile`, gained
+  `[leap] acquire = "peers"`, `require_table = true` and `leap_trust = true`
+  on its `gummi` association, which already used key 1. `navlisten2026` is
+  unchanged: a client with no table requirement, still on
+  `/usr/share/zoneinfo/leap-seconds.list`, where the expiry is only a health
+  warning and the next tzdata delivers the renewal.
+- No reset of any leap cache was needed. The IERS file's dates both advance
+  past the accepted tzdata record and its leap records are identical, so
+  acceptance on every hop is an ordinary update.
+
+### Method and order
+
+On each host: `cp -p` the outgoing binaries to `.prev`, `install` the new
+ones beside the target and `mv` over it, `restorecon` on `gummi`, install
+the config, `-check` with the installed binary, restart, `waitsync 300`.
+`.prev` now holds `a8f56b5` everywhere. Upstream first, with the slew rule
+applied literally:
+
+- `gummi` restarted 02:28:57. It came up with −1.53 ms of phase and took 17.5
+  minutes to bring its pending slew under 300 µs (−298 µs at 02:46:34).
+- `twocom` restarted 02:47:06, once `gummi` was settled.
+- `navlisten2026` restarted 02:47:27, with `twocom` at −100 µs.
+
+### Results
+
+| host | `waitsync` | offset at restart | frequency before → after | drift file | system source |
+|---|---|---|---|---|---|
+| `gummi` | 3 s | −1.53 ms | −4.334 → −3.957 ppm | −5.547275 → −3.957480 (written by the new binary after 15 min) | `fedora-0` |
+| `twocom` | 3 s | −100 µs | +21.173 → +21.131 ppm | 21.185757, untouched | `gummi` |
+| `navlisten2026` | 3 s | +177 µs | +9.401 → +9.401 ppm | 9.401391, untouched | `junia` |
+
+- Zero clock steps on all three. Zero `level=WARN` or `level=ERROR` lines in
+  any service log since its restart, apart from `twocom`'s three standing
+  configuration warnings at startup. `/healthz` is 200 `healthy` on all three.
+- **Seed.** `gummi` fetched the IERS file 1.5 s after starting and activated
+  it 2.5 s after starting, before `waitsync` returned: `leap table activated
+  provider=https://hpiers.obspm.fr/… kind=iers old_sha256=506e737d…
+  sha256=db5a895f… expires=2027-06-28`. `tracking` reports `Leap source iers`,
+  data updated 2026-07-06T07:44:57Z, expires 2027-06-28. `seed.json` beside
+  the cache holds the publisher's `ETag "13c9-655ec9478b1c2"` and
+  `Last-Modified Mon, 06 Jul 2026 07:54:11 GMT`, so tomorrow's check is
+  conditional. The fetch went out from inside the hardened unit
+  (`ProtectSystem=strict`, SELinux enforcing) with no denial.
+- **Transfer.** `twocom` probed `gummi` at startup and activated the same
+  bytes at 02:48:28, 82 s after its restart: one probe, twenty 256-byte GETs
+  at the 4 s spacing, 5065 bytes, `provider=gummi kind=peer key_id=1`.
+  `tracking` reports `Leap source peer`, `Leap provider peer gummi (key 1)`,
+  digest `db5a895f…`, expires 2027-06-28. Counters: `twocom` probes 1, bytes
+  5065, accepted 1, failures 0; `gummi` served 21, rate-limited 0. `twocom`
+  has no `seed.json`, as a learner should not.
+- **No side effects on time.** `twocom` kept `gummi` as system source
+  throughout the transfer (−38 µs at 230 µs delay, reach 177 two minutes in,
+  jitter 22 µs); its root dispersion fell from 264 ms at restart to 33 ms.
+- Server paths, from the new builds: `twocom`'s authenticated query to `gummi`
+  (key 1) measured −29 µs offset at 185 µs delay; `gummi`'s unauthenticated,
+  ACL-authorized query to `twocom` measured +39 µs at 273 µs. Both carried
+  kernel receive timestamps. `gummi` served 122 requests with zero drops in
+  every category; `twocom` served 20 with zero drops.
+- `navlisten2026` keeps `Leap source file`, digest `506e737d…`, expiring
+  2026-12-28, `table required: false`; `manual: unchanged`.
+
+### Observed, not acted on
+
+- `twocom` answered one request while unsynchronized, in the second between
+  its start and `synced`; earlier entries recorded zero. It is the documented
+  LI=3 / stratum 16 reply, not a synchronized claim.
+- `navlisten2026` chose `junia` (70 ms path) as system source on its first
+  samples, with `gummi` and `twocom` as survivors reading +1.7 ms and
+  `debian-2` an outlier at −4.1 ms. The same early-sample selection was noted
+  on 2026-09-09 and is expected to settle.
+- The 30-day expiry warning that would have fired on 2026-11-28 no longer
+  applies to `gummi` or `twocom`. It will still fire on `navlisten2026` if
+  Debian has not shipped tzdata 2026c by then; harmless for a client.
+
+Rollback: `.prev` copies of both binaries (`a8f56b5`) on each host,
+`carillon.toml.prev` on `gummi` and `twocom`. Rolling `gummi`'s binary back
+requires its `.prev` config too, since `a8f56b5` does not know `iers`; the
+cache stays usable either way, because `state.json` kept its format and
+`seed.json` is a separate file an older binary never opens.
+
 ## Repeatable checklist
 
 Deploy a chain upstream-first, and between hosts wait for the upstream's
