@@ -1164,9 +1164,9 @@ func deviceIdentity(path string) (string, error) {
 }
 
 // checkDeviceOwnership rejects two refclocks claiming one device. Sharing
-// within a single refclock is legitimate — on FreeBSD one callout tty
-// carries both the NMEA stream and the PPS edge — so only claims from
-// *different* refclock blocks conflict. Aliases are preserved: the operator
+// within a single refclock is legitimate on both platforms — one tty carries
+// a receiver's NMEA stream and its PPS edge, natively on FreeBSD and through
+// N_PPS on Linux — so only claims from *different* refclock blocks conflict. Aliases are preserved: the operator
 // keeps writing whichever name they prefer, and identity is compared behind
 // it.
 func checkDeviceOwnership(refclocks []Refclock) []error {

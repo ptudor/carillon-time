@@ -306,8 +306,8 @@ func TestAstra6RejectsSharedDevices(t *testing.T) {
 	})
 
 	t.Run("one refclock using a device for both roles", func(t *testing.T) {
-		// The supported FreeBSD arrangement: one callout tty carries both
-		// the NMEA stream and the PPS edge.
+		// The normal single-receiver arrangement on both platforms: one
+		// tty carries the NMEA stream and the PPS edge.
 		errs := checkDeviceOwnership([]Refclock{
 			{Name: "gps0", Type: "gps", Device: os.DevNull, PPS: alias},
 		})
