@@ -23,6 +23,11 @@ FreeBSD kernel or change a runner’s clock.
   loss, antenna loss, reacquisition, and long holdover. Autonomous leap handling
   still needs hardware evidence beyond the fake-clock positive/negative leap
   simulations in [the M5 acceptance matrix](leap-distribution.md#observability-and-acceptance).
+- A Linux run with NMEA and DCD PPS sharing one tty (`pps = "dcd"`). The
+  daemon attaches `N_PPS` itself and relies on `pps_ldisc` inheriting the
+  `N_TTY` operations so the sentence stream survives; that is what the kernel
+  source and `ldattach(8)` practice say, but no carillon host has yet run it
+  against a live pulse.
 - A sustained accuracy comparison against a measured reference. UART, USB,
   receiver, kernel, and host scheduling behavior all matter.
 - Native FreeBSD ABI/race checks and device acceptance on each deployed

@@ -344,6 +344,21 @@ going inactive. Configuration is either
 - `device = "/dev/pps0"` — a PPS device somebody else created (`ldattach PPS
   /dev/ttyS0`, `pps-gpio` on a Raspberry Pi/OpenWrt, `pps-ktimer` for tests).
 
+**N_PPS does not take the serial stream away.** `pps_ldisc` is registered
+through `n_tty_inherit_ops()` and its `open` handler chains to `n_tty_open()`,
+so N_PPS is N_TTY *plus* a `dcd_change` hook, not a replacement for it: reads
+keep delivering bytes while carrier transitions are timestamped in the
+interrupt handler. That is exactly what `ldattach(8) PPS` has always relied on
+— it holds the tty open with the discipline attached while another process
+reads NMEA from the same port — and carillon attaching the discipline itself
+is the same operation without the extra daemon. One receiver on one port
+therefore needs no `ldattach`, no `pps-gpio`, and no second tty (§5.3).
+
+Attaching a discipline frees the previous one's read buffer, so whatever the
+tty had buffered is discarded. carillon opens the NMEA reader before it
+attaches N_PPS; the cost is at most a partial sentence, which the framer
+resynchronises past on the next `$`.
+
 `PPS_FETCH` (`<linux/pps.h>`) blocks until the next event; a timeout with
 `flags = PPS_TIME_INVALID` waits forever, zero returns immediately.
 
@@ -450,7 +465,7 @@ name        = "gps"
 type        = "gps"
 device      = "/dev/cuau0"
 baud        = 9600
-pps         = "dcd"         # "dcd", "cts", "none", or a Linux "/dev/ppsN" path
+pps         = "dcd"         # "dcd", "cts" (FreeBSD), "none", or a device path
 pps_edge    = "assert"
 pps_offset  = 0.0
 nmea_offset = 0.150         # seconds: measured lag of the sentence behind its PPS edge
@@ -458,11 +473,24 @@ sentences   = ["RMC", "ZDA"]  # accepted talkers: GP, GN, GL, GA, BD
 prefer      = true
 ```
 
-On FreeBSD, native UART PPS and NMEA use independent opens of the same callout
-tty. On Linux, `N_PPS` replaces normal tty input, so a combined receiver must
-provide PPS through a separate `/dev/ppsN`, GPIO PPS device, or PPS-only tty;
-`carillon -check` rejects an attempt to share the NMEA tty. `pps = "none"`
-creates only `<name>/nmea` on either platform.
+**One receiver, one port, on both platforms.** `pps = "dcd"` names the pulse
+pin on the receiver's own tty and is the normal configuration everywhere. On
+FreeBSD, native UART PPS and NMEA use independent opens of the same callout
+tty. On Linux the daemon attaches `N_PPS` to that tty and reads the resulting
+`/dev/ppsN`, and the sentence stream keeps flowing because `pps_ldisc`
+inherits the N_TTY operations (§5.2): the two roles are again independent
+opens of one tty, one held only to keep the discipline attached.
+
+`pps = "cts"` is FreeBSD-only — `pps_ldisc` hooks `dcd_change` and has no
+equivalent for CTS — and `carillon -check` says so on Linux. An absolute path
+in `pps` selects a *different* device for the pulse: a `/dev/ppsN` created by
+`pps-gpio` or `ldattach`, or a second tty. `pps = "none"` creates only
+`<name>/nmea` on either platform.
+
+Until 2026-09-09 the Linux check refused `pps = "dcd"` outright, on the belief
+that attaching `N_PPS` replaced normal tty input. It does not, and the
+restriction cost every Linux GPS host either an `ldattach(8)` service or a
+second serial port.
 
 **Serial setup:** raw mode, 8N1, `CLOCAL`, `CREAD`, no flow control, no echo,
 `VMIN=1, VTIME=0`; opened `O_RDWR|O_NOCTTY|O_NONBLOCK`. Reads use `poll(2)`

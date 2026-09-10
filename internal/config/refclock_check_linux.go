@@ -4,36 +4,26 @@ package config
 
 import "fmt"
 
-// checkRefclockPlatform enforces the Linux rule that GPS serial data and the
-// N_PPS line discipline cannot share one tty: attaching N_PPS replaces the
-// discipline that delivers the NMEA bytes.
+// checkRefclockPlatform enforces the one restriction Linux serial PPS really
+// has: `pps_ldisc` timestamps DCD transitions and nothing else, so CTS is a
+// FreeBSD-only pin.
 //
-// The comparison is by device identity, not path spelling. `pps ==
-// r.Device` let an alias — /dev/serial/by-id/... against /dev/ttyUSB0, or
-// any other name for the same node — walk straight past the check and take
-// the NMEA stream away from itself (RA6X-039). Aliases stay usable; only the
-// underlying device has to differ.
+// NMEA and PPS may share one tty. `pps_ldisc` is built with
+// `n_tty_inherit_ops()` and its open handler chains to `n_tty_open()`, so
+// N_PPS is N_TTY plus a `dcd_change` hook: reads keep delivering the sentence
+// stream while carrier transitions are timestamped in the interrupt handler.
+// That is what `ldattach(8) PPS` has always relied on, and carillon attaching
+// the discipline itself is the same operation without the extra daemon.
+//
+// carillon used to refuse `pps = "dcd"` on the belief that N_PPS replaced
+// normal tty input, which forced every Linux GPS host to run ldattach or wire
+// a second port for no reason.
 func checkRefclockPlatform(r *Refclock) error {
 	if r.Type != "gps" || !r.HasPPS() {
 		return nil
 	}
-	if r.PPS == "dcd" || r.PPS == "cts" {
-		return fmt.Errorf("GPS serial data and Linux N_PPS cannot share one tty; set pps to a separate /dev/ppsN, PPS GPIO, or PPS-only tty")
-	}
-	if sameDevice(r.PPS, r.Device) {
-		return fmt.Errorf("pps %s and device %s are the same device; GPS serial data and Linux N_PPS cannot share one tty", r.PPS, r.Device)
+	if r.PPS == "cts" {
+		return fmt.Errorf("Linux serial PPS captures DCD only; set pps to \"dcd\", to a /dev/ppsN, or wire the pulse to DCD")
 	}
 	return nil
-}
-
-// sameDevice reports whether two paths name one device. A path that cannot
-// be identified is compared literally, which is what the check did before and
-// is still enough to catch the obvious mistake.
-func sameDevice(a, b string) bool {
-	if a == b {
-		return true
-	}
-	ida, erra := deviceIdentity(a)
-	idb, errb := deviceIdentity(b)
-	return erra == nil && errb == nil && ida == idb
 }
