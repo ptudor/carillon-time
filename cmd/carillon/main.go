@@ -466,7 +466,7 @@ func runDaemon(args []string) int {
 	auxErr := make(chan error, 3)
 	aux := newAuxiliaries()
 	if leapStore != nil {
-		updater := leap.NewUpdater(leap.UpdaterConfig{Mode: cfg.LeapMode(), ManualPath: cfg.Daemon.LeapFile, Peers: leapPeers, Store: leapStore, Initial: leapState, Controller: eng, Report: leapReport, Log: log})
+		updater := leap.NewUpdater(leap.UpdaterConfig{Mode: cfg.LeapMode(), ManualPath: cfg.Daemon.LeapFile, Peers: leapPeers, Store: leapStore, Initial: leapState, Controller: eng, Report: leapReport, Log: log, UserAgent: buildinfo.UserAgent()})
 		aux.start("leap acquisition", func() { updater.Run(ctx) })
 	}
 	if statsRecorder != nil {

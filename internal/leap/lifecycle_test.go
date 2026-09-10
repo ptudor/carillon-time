@@ -24,7 +24,10 @@ func TestNISTRestartRetainsSuccessfulCheckSchedule(t *testing.T) {
 	c.active.Store(r)
 	restarted := NewUpdater(UpdaterConfig{Mode: "nist", Store: u.cfg.Store, Initial: disk, Controller: c})
 	var calls atomic.Int32
-	restarted.fetchNIST = func(context.Context) (*Object, error) { calls.Add(1); return nil, errors.New("egress denied") }
+	restarted.fetchSeed = func(context.Context, Validators) (SeedResult, error) {
+		calls.Add(1)
+		return SeedResult{}, errors.New("egress denied")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	restarted.Run(ctx)
@@ -41,7 +44,10 @@ func TestUnknownUTCDoesNotFetchOrActivate(t *testing.T) {
 	u, c := testUpdater(t, "nist", now)
 	c.view.Store(&View{Now: now})
 	var calls atomic.Int32
-	u.fetchNIST = func(context.Context) (*Object, error) { calls.Add(1); return nil, errors.New("must not fetch") }
+	u.fetchSeed = func(context.Context, Validators) (SeedResult, error) {
+		calls.Add(1)
+		return SeedResult{}, errors.New("must not fetch")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	u.Run(ctx)

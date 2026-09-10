@@ -10,14 +10,14 @@ automated and native checks; those checks do not establish live GPS/PPS accuracy
 
 A GPS/NMEA/PPS host needs advance leap information even when its network
 sources disappear. Carillon servers and refclock hosts require a valid local
-table before advertising synchronization. One installation fetches the NIST
-file; other Carillon hosts learn and persist the same file from explicitly
-trusted upstreams. All continue to use their ordinary time sources. A cached
+table before advertising synchronization. One installation fetches the
+publisher's file; other Carillon hosts learn and persist the same file from
+explicitly trusted upstreams. All continue to use their ordinary time sources. A cached
 leap table supplies neither a clock measurement nor PPS second numbering.
 
 ```mermaid
 flowchart LR
-    N[NIST HTTPS] --> S[Configured seed]
+    N[IERS or NIST HTTPS] --> S[Configured seed]
     S -->|Authenticated NTP extension| H[GPS/PPS host with local cache]
     H -->|Authenticated NTP extension| C[Downstream Carillon with local cache]
     C -->|Standard NTP leap indicator| O[Ordinary NTP clients]
@@ -100,26 +100,65 @@ and the age of `#$` does not determine freshness. Acceptance compares both
 dates and the digest under the rules below.
 [Source: NIST leap file](https://tf.nist.gov/leap-seconds.list).
 
-The `nist` acquisition mode uses
+**Two publishers, one choice.** The `iers` and `nist` acquisition modes fetch
+from a fixed URL each:
+[`https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list`](https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list),
+published by the IERS Earth Orientation Centre that issues Bulletin C, and
 [`https://tf.nist.gov/leap-seconds.list`](https://tf.nist.gov/leap-seconds.list),
-the HTTPS location published by
+the location documented by
 [NIST's Internet Time Service](https://www.nist.gov/pml/time-and-frequency-division/time-distribution/internet-time-service-its).
-It validates the system CA chain, hostname and certificate dates, requests
-identity content encoding, rejects redirects, and caps the response at 64 KiB
-with a 30-second overall deadline. HTTP downgrade and TLS verification bypass
-are prohibited. Process proxy environment variables are ignored; the fetch
-connects directly to the fixed HTTPS endpoint. The embedded file hash, if
-present, is not an origin signature.
+IERS publishes first: on 2026-09-09 its file carried `#$ 3992312697`
+(2026-07-06) and `#@ 4023129600` (2027-06-28), while NIST still served the
+December-2026 expiry. The two also date `#$` differently: IERS by the last
+edit of the file, NIST by the last change to the leap records. A host whose
+accepted record is IERS-dated therefore sees NIST's copy as a rollback, and
+only an [offline reset](#operator-recovery) can move it; the other direction
+is an ordinary advance. Distribution copies (Linux tzdata, FreeBSD's ntpd
+fetch) are the IERS file. Choose one publisher per deployment and stay with
+it. There is no IANA mode: IANA's copy is the IERS file, and the tz database
+already delivers it to hosts running `manual` mode on a distribution file.
+No fallback between publishers exists, so one seed has one externally
+observable download policy.
 
-The seed checks on startup when no usable table exists, then every 24 hours
-with ±10% jitter. Errors back off from 15 minutes to six hours with jitter;
-an existing valid table stays active. Conditional requests may use HTTP ETag
-or Last-Modified, but `304 Not Modified` never renews the table's expiry.
+Either mode validates the system CA chain, hostname and certificate dates,
+requests identity content encoding, rejects redirects, and caps the response
+at 64 KiB with a 30-second overall deadline. HTTP downgrade and TLS
+verification bypass are prohibited. Process proxy environment variables are
+ignored; the fetch connects directly to the fixed HTTPS endpoint. The
+embedded file hash, if present, is not an origin signature.
+
+**Polite client.** A publisher's file server is a shared public resource that
+answers a once-daily need. The seed therefore behaves as a good citizen:
+
+- Every request carries `User-Agent: carillon/<version>
+  (+https://github.com/ptudor/carillon-time; NTP daemon leap-seconds seed)`,
+  so an operator can recognise an installation and reach its maintainer
+  rather than block a generic client. A request without a `User-Agent` is
+  refused locally. Cookies the publisher sets are never returned.
+- Requests are conditional. The `ETag` and `Last-Modified` of the last body
+  evaluated are persisted in `seed.json` beside the cache and sent back as
+  `If-None-Match` and `If-Modified-Since`, so an unchanged file costs the
+  publisher a `304 Not Modified` and no body. A `304` confirms that the copy
+  we hold is current; it never renews the table's expiry, never creates a
+  table, and is an error when the request was not conditional. Validators
+  from a body that was rejected are not kept, so the next request is still
+  conditional on what the host actually holds.
+- The connection is closed after each request; a daily client does not hold
+  a server connection open.
+- Checks run on startup only when no usable table exists, then every 24
+  hours with ±10% jitter. Errors back off from 15 minutes to six hours,
+  with jitter that only ever delays. A `Retry-After` on any error response
+  is obeyed, seconds or HTTP-date, bounded at seven days. A client error
+  other than `408`, `425` or `429` says the request is wrong or the resource
+  is gone, and is not repeated more than daily.
+- The time of the last attempt is persisted before the request starts, and a
+  restart honors the 15-minute floor from it, so a crash or deploy loop
+  cannot become a request loop. The last successful check is persisted
+  separately from acceptance/expiry, so restarting a seed with a valid cache
+  does not force another download.
+
 Refreshing because an unchanged table approaches expiry does not justify a
-tighter retry loop. Peer mode never automatically switches to NIST: this
-keeps one designated fetcher and one externally observable download policy.
-Persist the last successful seed check separately from acceptance/expiry, so
-restarting a seed with a valid cache does not force another NIST download.
+tighter retry loop. Peer mode never automatically switches to a publisher.
 The normal listener rate limits also apply to transfers. A learner retains
 an authenticated RATE minimum across failed retries. A successful authenticated
 probe resumes the normal four-second request spacing; a new RATE aborts the
@@ -366,7 +405,7 @@ time source. No network response can authorize or perform this reset.
 
 `daemon.leapfile` remains the read-only manual source. With it configured, acquisition defaults
 to `manual`; otherwise it defaults to `peers` when a leap-trusted association
-exists, or `off` when none exists. Selecting any mode other than `manual`
+exists, or `off` when none exists. `iers` and `nist` are the seed modes. Selecting any mode other than `manual`
 together with `daemon.leapfile` is an error, so authority is never ambiguous.
 Automatic modes use a cache directory `leap` beneath the platform's normal
 state directory (`/var/db/carillon` or `/var/lib/carillon`). A customized
@@ -400,7 +439,7 @@ Seed additions to an otherwise complete server configuration:
 
 ```toml
 [leap]
-acquire = "nist"             # off | manual | nist | peers
+acquire = "iers"             # off | manual | nist | iers | peers
 require_table = true
 
 [serve]
@@ -440,9 +479,10 @@ configuration, trust changes and key changes still require a restart.
 ## Observability and acceptance
 
 Tracking/JSON report effective readiness, whether a table is required,
-authority (`file`, `nist`, `peer`, `sources`, `unknown`), digest, data-update date,
+authority (`file`, `iers`, `nist`, `peer`, `sources`, `unknown`), digest, data-update date,
 expiry, immediate provider/key ID, last fetch result and last rejection reason.
-Do not label a relayed object "NIST verified" merely because a peer said so.
+Do not label a relayed object "IERS verified" or "NIST verified" merely
+because a peer said so.
 Report accepted, pending and rejected candidates separately. `waitsync` uses
 effective readiness. Missing required data, expiry and conflicts have explicit
 health reasons; an expiring table is degraded 30 days out. A fetch failure

@@ -7,55 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"time"
 
 	"github.com/ptudor/carillon-time/internal/ntp"
 	"github.com/ptudor/carillon-time/internal/ntp/auth"
 )
-
-const NISTURL = "https://tf.nist.gov/leap-seconds.list"
-
-// FetchNIST uses the system trust store and certificate date validation.
-// Neither a peer nor configuration can replace the URL or TLS policy.
-func FetchNIST(ctx context.Context) (*Object, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil // acquisition policy never comes from the environment
-	transport.DisableCompression = true
-	defer transport.CloseIdleConnections()
-	return fetchHTTPS(ctx, &http.Client{Transport: transport, Timeout: 30 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("leap: redirects are forbidden") }}, NISTURL)
-}
-
-// The injected client/URL are private test seams. Production only calls the
-// fixed-URL entry point above, after establishing UTC.
-func fetchHTTPS(ctx context.Context, client *http.Client, url string) (*Object, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if req.URL.Scheme != "https" {
-		return nil, Reject("transport", "HTTPS is required")
-	}
-	req.Header.Set("Accept-Encoding", "identity")
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("leap: NIST fetch: %w", err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, Reject("http", fmt.Sprintf("HTTP status %d", res.StatusCode))
-	}
-	if res.Header.Get("Content-Encoding") != "" && res.Header.Get("Content-Encoding") != "identity" {
-		return nil, Reject("transport", "encoded body refused")
-	}
-	if res.ContentLength > MaxFileSize {
-		return nil, Reject("size", "HTTP body exceeds 64 KiB")
-	}
-	return ReadObject(res.Body)
-}
 
 // Peer is an explicitly trusted configured association. It has its own UDP
 // socket and never emits a time measurement or updates a source's reach.

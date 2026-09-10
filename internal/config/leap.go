@@ -3,15 +3,15 @@ package config
 func validateLeap(cfg *Config, needKeys *bool, fail func(string, ...any)) {
 	mode := cfg.LeapMode()
 	switch mode {
-	case "off", "manual", "nist", "peers":
+	case "off", "manual", "nist", "iers", "peers":
 	default:
-		fail("leap: acquire %q must be off, manual, nist or peers", mode)
+		fail("leap: acquire %q must be off, manual, nist, iers or peers", mode)
 	}
 	if (cfg.Serve.Enabled() || len(cfg.Refclocks) > 0) && !cfg.LeapRequired() {
 		fail("leap: require_table cannot be false with NTP service or a refclock")
 	}
 	if cfg.LeapRequired() && mode == "off" {
-		fail("leap: required table needs manual, nist or peers acquisition")
+		fail("leap: required table needs manual, nist, iers or peers acquisition")
 	}
 	if mode == "manual" && cfg.Daemon.LeapFile == "" {
 		fail("leap: manual acquisition requires daemon.leapfile")

@@ -33,6 +33,9 @@ type UpdaterConfig struct {
 	Controller Controller
 	Report     *Report
 	Log        *slog.Logger
+	// UserAgent identifies this installation to the HTTPS publisher in
+	// seed modes; the fetch refuses to run anonymously.
+	UserAgent string
 }
 
 // Updater owns all cache state. A single acquisition job does bounded I/O
@@ -47,9 +50,13 @@ type Updater struct {
 	dirty       bool
 	committed   bool
 	nextPersist time.Time
-	fetchNIST   func(context.Context) (*Object, error)
-	fetchPeer   func(Peer, context.Context, *Object, time.Time, *Counters, time.Duration) (*Object, error)
-	spacing     time.Duration
+	// seed is set in the "nist" and "iers" modes; seedState is its
+	// bookkeeping from seed.json, owned here like the rest of the cache.
+	seed      *Seed
+	seedState SeedState
+	fetchSeed func(context.Context, Validators) (SeedResult, error)
+	fetchPeer func(Peer, context.Context, *Object, time.Time, *Counters, time.Duration) (*Object, error)
+	spacing   time.Duration
 }
 
 func NewUpdater(cfg UpdaterConfig) *Updater {
@@ -59,7 +66,21 @@ func NewUpdater(cfg UpdaterConfig) *Updater {
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.DiscardHandler)
 	}
-	u := &Updater{cfg: cfg, state: cfg.Initial, committed: true, fetchNIST: FetchNIST, fetchPeer: Peer.fetch, spacing: 4 * time.Second}
+	u := &Updater{cfg: cfg, state: cfg.Initial, committed: true, fetchPeer: Peer.fetch, spacing: 4 * time.Second}
+	if seed, ok := SeedFor(cfg.Mode); ok {
+		u.seed = &seed
+		u.fetchSeed = func(ctx context.Context, v Validators) (SeedResult, error) { return seed.Fetch(ctx, cfg.UserAgent, v) }
+		if cfg.Store != nil {
+			state, err := cfg.Store.LoadSeed()
+			if err != nil {
+				// Validators are hints; the price of losing them is one
+				// unconditional download, so start clean rather than refuse.
+				cfg.Log.Warn("leap seed bookkeeping unreadable; next publisher check is unconditional", "error", err)
+				state = SeedState{}
+			}
+			u.seedState = state
+		}
+	}
 	u.status.Mode = cfg.Mode
 	u.status.LastFetch = cfg.Initial.LastCheck
 	u.status.LastResult = "awaiting UTC"
@@ -93,6 +114,19 @@ func (u *Updater) reject(err error, o *Object) {
 	}
 	u.cfg.Log.Warn("leap update rejected", "reason", reason, "error", err)
 	u.publish()
+}
+
+// saveSeed persists the publisher bookkeeping. It is not part of the
+// authority record, so a failure is counted and logged but never blocks
+// activation or withdraws a table.
+func (u *Updater) saveSeed() {
+	if u.cfg.Store == nil {
+		return
+	}
+	if err := u.cfg.Store.SaveSeed(u.seedState); err != nil {
+		u.cfg.Report.Counters.CacheFailures.Add(1)
+		u.cfg.Log.Warn("leap seed bookkeeping not saved", "error", err)
+	}
 }
 
 func (u *Updater) save() error {
@@ -172,10 +206,12 @@ func (u *Updater) activate(ctx context.Context) error {
 }
 
 type fetchResult struct {
-	object   *Object
-	provider Provider
-	peer     int
-	err      error
+	object      *Object
+	provider    Provider
+	peer        int
+	err         error
+	validators  Validators
+	notModified bool
 }
 type peerSchedule struct {
 	next    time.Time
@@ -239,12 +275,22 @@ func (u *Updater) Run(ctx context.Context) {
 		now := time.Now() // scheduling only, never leap validity
 		if v.Known && initialSchedule {
 			initialSchedule = false
-			if u.cfg.Mode == "nist" && u.state.Active != nil && leapCurrent(u.state.Active.Object, v) {
-				checked := u.state.LastCheck
-				if checked.IsZero() {
-					checked = u.state.Active.Accepted
+			if u.seed != nil {
+				if u.state.Active != nil && leapCurrent(u.state.Active.Object, v) {
+					checked := u.state.LastCheck
+					if checked.IsZero() {
+						checked = u.state.Active.Accepted
+					}
+					nextJob = now.Add(max(0, 24*time.Hour+jitter(24*time.Hour)-v.Now.Sub(checked)))
 				}
-				nextJob = now.Add(max(0, 24*time.Hour+jitter(24*time.Hour)-v.Now.Sub(checked)))
+				// A restart is not a reason to ask the publisher again: keep
+				// the error floor across process lifetimes so a crash or
+				// deploy loop cannot turn into a request loop.
+				if wait := seedRetryFloor - v.Now.Sub(u.seedState.LastAttempt); !u.seedState.LastAttempt.IsZero() && wait > 0 {
+					if floor := now.Add(wait); floor.After(nextJob) {
+						nextJob = floor
+					}
+				}
 			}
 		}
 		u.checkpoint(v, false)
@@ -269,7 +315,7 @@ func (u *Updater) Run(ctx context.Context) {
 					}
 				}
 			}
-			if u.cfg.Mode == "manual" || u.cfg.Mode == "nist" || peer >= 0 {
+			if u.cfg.Mode == "manual" || u.seed != nil || peer >= 0 {
 				inflight = true
 				anchor := u.state.Anchor()
 				utc := v.Now
@@ -280,16 +326,25 @@ func (u *Updater) Run(ctx context.Context) {
 				if peer >= 0 {
 					spacing = max(spacing, schedules[peer].spacing)
 				}
+				validators := u.seedState.Validators
+				if u.seed != nil {
+					// Record the attempt before it starts so an interrupted
+					// process still honors the floor on restart.
+					u.seedState.LastAttempt = v.Now
+					u.saveSeed()
+				}
 				go func(peer int) {
 					r := fetchResult{peer: peer}
-					switch u.cfg.Mode {
-					case "manual":
+					switch {
+					case u.cfg.Mode == "manual":
 						r.provider = Provider{Kind: "file", Name: u.cfg.ManualPath}
 						r.object, r.err = LoadObject(u.cfg.ManualPath)
-					case "nist":
-						r.provider = Provider{Kind: "nist", Name: NISTURL}
-						r.object, r.err = u.fetchNIST(ctx)
-					case "peers":
+					case u.seed != nil:
+						r.provider = Provider{Kind: u.seed.Kind, Name: u.seed.URL}
+						var res SeedResult
+						res, r.err = u.fetchSeed(ctx, validators)
+						r.object, r.validators, r.notModified = res.Object, res.Validators, res.NotModified
+					default:
 						p := u.cfg.Peers[peer]
 						r.provider = Provider{Kind: "peer", Name: p.Name, KeyID: p.Key.ID}
 						r.object, r.err = u.fetchPeer(p, ctx, anchor, utc, &u.cfg.Report.Counters, spacing)
@@ -311,8 +366,11 @@ func (u *Updater) Run(ctx context.Context) {
 			}
 			if err == nil && r.object == nil {
 				u.status.LastResult = "unchanged"
+				if r.notModified {
+					u.status.LastResult = "not modified"
+				}
 			}
-			if err == nil && u.cfg.Mode == "nist" {
+			if err == nil && u.seed != nil {
 				v := u.cfg.Controller.LeapView()
 				if v.Known {
 					u.state.LastCheck = v.Now
@@ -323,6 +381,13 @@ func (u *Updater) Run(ctx context.Context) {
 						u.state.UTCbound = v.Now
 					}
 					u.dirty = true
+				}
+				// Validators describe the body just evaluated. A rejected
+				// body keeps the old ones, so the next request is still
+				// conditional on what we actually hold.
+				if r.validators != u.seedState.Validators {
+					u.seedState.Validators = r.validators
+					u.saveSeed()
 				}
 			}
 			if err != nil {
@@ -352,13 +417,23 @@ func (u *Updater) Run(ctx context.Context) {
 				// and the peer's exact RATE minimum.
 				s.next = time.Now().Add(interval + jitter(interval)/2 + interval/20)
 				nextJob = time.Now().Add(u.spacing)
-			} else {
-				if err != nil {
-					backoff = errorBackoff(backoff)
-					interval = backoff
-				} else {
-					backoff = 0
+			} else if err != nil {
+				backoff = errorBackoff(backoff)
+				interval = backoff
+				var se *SeedError
+				if errors.As(err, &se) {
+					// The publisher's own instructions outrank our backoff:
+					// a Retry-After is obeyed, and a request the server says
+					// is wrong or gone is not repeated more than daily.
+					if se.clientError() {
+						interval = max(interval, 24*time.Hour)
+					}
+					interval = max(interval, se.RetryAfter)
 				}
+				// Positive-only jitter: never retry earlier than the floor.
+				nextJob = time.Now().Add(interval + jitter(interval)/2 + interval/20)
+			} else {
+				backoff = 0
 				nextJob = time.Now().Add(interval + jitter(interval))
 			}
 			u.publish()
@@ -374,9 +449,13 @@ func leapCurrent(o *Object, v View) bool {
 	return CheckUpdate(nil, o, now) == nil
 }
 
+// seedRetryFloor is the shortest interval between two requests to a
+// publisher, whatever happened in between, restarts included.
+const seedRetryFloor = 15 * time.Minute
+
 func errorBackoff(previous time.Duration) time.Duration {
 	if previous == 0 {
-		return 15 * time.Minute
+		return seedRetryFloor
 	}
 	return min(2*previous, 6*time.Hour)
 }

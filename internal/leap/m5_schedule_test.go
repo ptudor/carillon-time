@@ -162,7 +162,7 @@ func TestUpdaterCacheFailureRetriesAfterFifteenMinutes(t *testing.T) {
 		}
 		// Make the seed's startup check due despite the current active table.
 		u.state.LastCheck = now.Add(-48 * time.Hour)
-		u.fetchNIST = func(context.Context) (*Object, error) { return renew, nil }
+		u.fetchSeed = func(context.Context, Validators) (SeedResult, error) { return SeedResult{Object: renew}, nil }
 		var failed atomic.Bool
 		failed.Store(true)
 		var attempts atomic.Int32

@@ -1017,8 +1017,9 @@ leap information during an outage. Every refclock host and every NTP-serving
 host must have a valid, durably stored leap table before advertising
 synchronization. A network-only client may instead use fresh survivor LI.
 
-The table can be an operator-installed `daemon.leapfile`, a NIST HTTPS download,
-or a cache learned from an explicitly trusted Carillon upstream. These are
+The table can be an operator-installed `daemon.leapfile`, an HTTPS download
+from IERS or NIST, or a cache learned from an explicitly trusted Carillon
+upstream. These are
 acquisition methods for the same authority, with the same content, expiry and
 rollback checks. A valid local copy continues to work through network loss
 and restart. Autonomy ends at the table's expiry; no file predicts future IERS
@@ -1026,17 +1027,28 @@ decisions indefinitely. Bare PPS still needs a live or qualified holdover
 source to number seconds (§6.5).
 
 **Acquisition and redistribution.** One designated seed fetches
-[`leap-seconds.list` from NIST](https://tf.nist.gov/leap-seconds.list) over
-certificate-validated HTTPS, checks it at most daily in normal operation, and
-retains the original bytes. Downstreams use an opt-in NTPv4 extension (§8.5)
+`leap-seconds.list` from one fixed publisher, either
+[IERS](https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list) or
+[NIST](https://tf.nist.gov/leap-seconds.list), over certificate-validated
+HTTPS, checks it at most daily in normal operation, and retains the original
+bytes. IERS issues Bulletin C and publishes the file first; NIST republishes
+it later and dates its `#$` record by the last change to the leap records
+rather than the last edit of the file. The two copies are therefore not
+interchangeable under the rollback rule: a deployment chooses one publisher
+and stays with it, and the IANA copy is not offered as a third because it is
+the IERS file. The seed is a polite client. It identifies itself with a
+version and contact `User-Agent`, sends conditional requests and accepts
+`304 Not Modified`, obeys `Retry-After`, retries a rejected request no more
+than daily, and backs off exponentially on failure, never faster than 15
+minutes even across restarts. Downstreams use an opt-in NTPv4 extension (§8.5)
 to compare SHA-256, a 64-bit leap-record update date, and a 64-bit expiry
 date. A changed, acceptable version is pulled in bounded chunks, validated,
 persisted, and activated without restarting the clock loop. A downstream can
-redistribute those unchanged bytes, so it needs no routine NIST download.
+redistribute those unchanged bytes, so it needs no routine publisher download.
 Network-only clients can also opt into caching. The protocol and
 configuration are specified in [Leap-table distribution](docs/leap-distribution.md).
-NIST can advance expiry without changing the record-update date; that is a
-valid renewal. Both dates participate in rollback checks, so neither a fresh
+A publisher can advance expiry without changing the record-update date; that
+is a valid renewal. Both dates participate in rollback checks, so neither a fresh
 receipt time nor the old record-update date determines the table's validity.
 
 A digest establishes content identity; it does not establish authenticity.
@@ -1877,8 +1889,9 @@ classic "why does my clock wobble" and it must fail loudly, not coexist.
   durable cache writes. It offers immutable generations to the engine for
   approval and activation; neither the engine nor responder waits for I/O.
   Leap transfers use separate requests and never refresh time-source reach
-  or feed the filter. Only the configured NIST seed needs outbound HTTPS and
-  access to the system CA trust store; peers reuse authorized UDP associations.
+  or feed the filter. Only the configured IERS or NIST seed needs outbound
+  HTTPS and access to the system CA trust store; peers reuse authorized UDP
+  associations.
 - **Control/monitoring:** a small unix-socket accept loop and standard
   `net/http`; both only read immutable snapshots. Only `waitsync` sends a
   request into the engine and waits on a reply channel.
@@ -2008,8 +2021,8 @@ Security posture summary: no modes 6/7, reply never larger than request
 (bounded MAC case aside), ACL default-deny, rate limiting with KoD, random
 client ports and transmit nonces, origin timestamp check, CMAC-authenticated
 NTP, keys file permission check, no dynamic memory growth driven by attackers
-(rate-limit table is bounded and LRU). M5 adds certificate-validated NIST HTTPS,
-explicit leap-distributor permissions and bounded authenticated transfers;
+(rate-limit table is bounded and LRU). M5 adds certificate-validated IERS or
+NIST HTTPS, explicit leap-distributor permissions and bounded authenticated transfers;
 SHA-256 alone is never an authority.
 
 ---

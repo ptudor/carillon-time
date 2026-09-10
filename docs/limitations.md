@@ -42,13 +42,13 @@ not closed by packaging or by a successful CI build.
 
 ## Leap-data trust and offline coverage
 
-M5 implements manual refresh, NIST HTTPS acquisition, authenticated CLPS
-transfers, durable caches and synchronized-service gating. This closes
+M5 implements manual refresh, IERS or NIST HTTPS acquisition, authenticated
+CLPS transfers, durable caches and synchronized-service gating. This closes
 RA6X-023: expired data loses authority and cannot be revived by a clock setback.
 NMEA and PPS do not vote on leap state. See [verification](../review/2026/09/M5_IMPLEMENTATION.md).
 
 A SHA-256 identifies bytes, and CMAC authenticates the immediate configured
-distributor. There is no independent NIST origin signature. A compromised
+distributor. There is no independent publisher origin signature. A compromised
 authorized distributor can still invent a plausible future event; public
 unauthenticated relay trust is outside this implementation. Offline coverage
 ends at the file's expiry. Keep that deadline beyond the intended disconnected

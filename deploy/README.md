@@ -169,19 +169,30 @@ UTC — `YYYY/MM/DD/loop.tsv`, `YYYY/MM/DD/sources.tsv`, `YYYY/MM/DD/pps.tsv`,
 out is a per-day removal. Set `[stats] keep_days` to have carillon do that
 itself; the default of 0 keeps everything.
 
-For a GPS-led stratum-1 host, install a current NIST/IERS
+For a GPS-led stratum-1 host, install a current IERS or NIST
 `leap-seconds.list` and set `daemon.leapfile`, even when backup NTP servers are
 configured. PPS and the supported NMEA sentences do not supply an advance
 leap warning; those backup servers cannot supply it while disconnected. Check
 that the file stays valid through the intended offline period. Provision a
 current table on NTP-serving hosts as well.
 
-NIST publishes the file at
+IERS, which issues Bulletin C, publishes the file at
+[`https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list`](https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list).
+NIST republishes it, usually later, at
 [`https://tf.nist.gov/leap-seconds.list`](https://tf.nist.gov/leap-seconds.list),
 as documented by its
 [Internet Time Service](https://www.nist.gov/pml/time-and-frequency-division/time-distribution/internet-time-service-its).
-The same validated file can be copied to multiple hosts; a separate NIST
-download on every host is unnecessary.
+Linux tzdata and FreeBSD's ntpd fetch ship the IERS copy. The same validated
+file can be copied to multiple hosts; a separate download on every host is
+unnecessary.
+
+The two publishers date the `#$` record differently: IERS by the last edit
+of the file, NIST by the last change to the leap records, which has been
+2016 for years. Carillon's rollback rule refuses any decrease in that date,
+so a host that accepted an IERS-dated file, including every distribution
+copy, cannot later accept NIST's without the
+[offline reset](#leap-cache-recovery). The other direction is an ordinary
+advance. Choose one publisher per deployment and stay with it.
 
 `carillon -check` stays offline and validates the manual file, acquisition
 policy, private keys and existing cache. Manual mode checks for replacements
@@ -189,9 +200,14 @@ hourly. Missing or expired required data withholds synchronization from the
 kernel, NTP server and `waitsync`; time acquisition continues. Monitoring reports
 missing data, expiry, conflicts and the 30-day expiry warning.
 
-For automatic updates, configure `[leap] acquire = "nist"` on one seed.
-On learners, set `leap_trust = true` on the chosen authenticated `[[server]]`
-association; acquisition then defaults to `peers`. Enable redistribution with
+For automatic updates, configure `[leap] acquire = "iers"` (or `"nist"`) on
+one seed. The seed is a deliberately polite client: it sends a `User-Agent`
+naming the version and this repository, makes conditional requests so an
+unchanged file costs the publisher a `304` and no body, obeys `Retry-After`,
+retries a rejected request no more than daily, and never asks more often
+than every 15 minutes even across restarts. On learners, set
+`leap_trust = true` on the chosen authenticated `[[server]]` association;
+acquisition then defaults to `peers`. Enable redistribution with
 `[serve] leap_keys = [<key IDs>]` in addition to the ordinary listener ACL and
 keys. Every hop requires explicit trust. Changes to trust and configuration
 require a restart; data updates do not. See the
