@@ -78,17 +78,19 @@ log_level = "info"
 # <name>/pps; prefer applies to the precise PPS source, while NMEA remains the
 # normal source that identifies each second. NMEA-only defaults to pps="none".
 #
-# FreeBSD can take NMEA and native UART PPS from the same callout tty; set pps
-# to the pin selected by dev.uart.N.pps_mode. Linux N_PPS replaces the tty's
-# serial line discipline, so NMEA must stay on device while pps names a
-# separate /dev/ppsN, GPIO PPS device, or PPS-only tty.
+# One receiver on one port works on both platforms: set pps = "dcd" and leave
+# device on the receiver tty. FreeBSD captures natively on the pin selected by
+# dev.uart.N.pps_mode; Linux attaches N_PPS to the tty and keeps reading NMEA
+# from it, so no ldattach and no second port are needed. pps = "cts" is
+# FreeBSD-only. Give pps an absolute path only when the pulse is on another
+# device: a pps-gpio /dev/ppsN, or a second PPS-only tty.
 
 #[[refclock]]
 #name        = "gps"
 #type        = "gps"
 #device      = "/dev/cuau0" # Linux example: /dev/ttyS0
 #baud        = 9600          # 4800, 9600, 19200, 38400, 57600, or 115200
-#pps         = "dcd"        # FreeBSD: dcd/cts; Linux: separate /dev/ppsN; or none
+#pps         = "dcd"         # dcd (both), cts (FreeBSD), a /dev/ppsN, or none
 #pps_edge    = "assert"
 #pps_offset  = 0.0
 #nmea_offset = 0.150         # fixed sentence-arrival correction, seconds

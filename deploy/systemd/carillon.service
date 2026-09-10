@@ -65,9 +65,11 @@ MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # Serial port and PPS devices for the refclock. Adjust the tty to match the
-# configured device. A client-only or server-only host has no refclock: delete
-# these two lines and SupplementaryGroups=dialout above, which are the only
-# reason this unit needs any device access at all.
+# configured device. The tty needs rw even for a receiver that is only read:
+# pps = "dcd" attaches the N_PPS line discipline to it with TIOCSETD, which is
+# a write. A client-only or server-only host has no refclock: delete these two
+# lines and SupplementaryGroups=dialout above, which are the only reason this
+# unit needs any device access at all.
 DeviceAllow=/dev/ttyS0 rw
 DeviceAllow=char-pps rw
 

@@ -275,6 +275,12 @@ func runDaemon(args []string) int {
 			log.Error("refclock", "name", r.Name, "error", err)
 			return exitUsage
 		}
+		// A modem-control pin names the receiver's own tty: FreeBSD captures
+		// on it natively, Linux attaches N_PPS to it. The NMEA source above
+		// is opened first on purpose — attaching a line discipline discards
+		// whatever the tty has buffered, and doing that before any reading
+		// starts costs at most a partial sentence the framer would resync
+		// past anyway.
 		ppsDevice := r.PPS
 		if r.PPS == "dcd" || r.PPS == "cts" {
 			ppsDevice = r.Device

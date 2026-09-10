@@ -58,8 +58,9 @@ old daemon:
 
 For Linux PPS, install the line discipline and a udev rule before adding a
 `[[refclock]]`. A configured tty makes carillon attach `N_PPS`; an existing
-`/dev/ppsN` is opened directly. The rule gives the unprivileged daemon access
-to either kind:
+`/dev/ppsN` is opened directly. The daemon needs write access to the tty for
+`TIOCSETD`, and the rule below gives it access to the PPS device of either
+kind:
 
 ```sh
 printf 'pps_ldisc\n' > /etc/modules-load.d/carillon.conf
@@ -72,10 +73,11 @@ udevadm trigger --subsystem-match=pps
 Before enabling it, confirm that the sequence after `#` increases once per
 second in `/sys/class/pps/pps0/assert` (or `clear` for the selected edge).
 
-A Linux GPS receiver that carries NMEA on a tty cannot use serial `N_PPS` on
-that same tty: the PPS line discipline replaces normal serial input. Keep
-NMEA on the receiver tty and configure a separate kernel PPS device (commonly
-`pps-gpio`) or a second PPS-only tty:
+A Linux GPS receiver that carries NMEA and its pulse on one port needs no
+second device and no `ldattach`. Set `pps = "dcd"`: carillon attaches `N_PPS`
+to the receiver tty and reads the `/dev/ppsN` that appears, and the sentence
+stream keeps flowing, because `pps_ldisc` is the normal `N_TTY` discipline
+plus a carrier-detect hook rather than a replacement for it.
 
 ```toml
 [[refclock]]
@@ -83,12 +85,20 @@ name = "gps"
 type = "gps"
 device = "/dev/ttyS0"
 baud = 9600
-pps = "/dev/pps0"
+pps = "dcd"
 pps_edge = "assert"
 nmea_offset = 0.150
 sentences = ["RMC", "ZDA"]
 prefer = true
 ```
+
+The pulse must reach **DCD**; `pps = "cts"` is FreeBSD-only and `-check`
+refuses it here. Give `pps` an absolute path instead when the pulse arrives on
+a different device — a `pps-gpio` `/dev/pps0` on a Raspberry Pi, a second
+PPS-only tty, or a `/dev/ppsN` that `ldattach(8)` already maintains — and keep
+`device` on the receiver tty. Earlier versions rejected `pps = "dcd"` on
+Linux and required one of those arrangements; that restriction was wrong and
+is gone.
 
 Set `pps = "none"` for an NMEA-only receiver. This still provides an
 independent stratum-1 source, but with serial sentence-arrival accuracy rather

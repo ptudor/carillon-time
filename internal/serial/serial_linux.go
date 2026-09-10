@@ -108,6 +108,17 @@ func linuxBaud(baud int) (uint32, bool) {
 // AttachPPS installs the N_PPS line discipline, waits for its /dev/ppsN
 // device to appear, and returns both that device and the tty which must stay
 // open to keep the discipline attached.
+//
+// The tty keeps delivering serial data afterwards. pps_ldisc is registered
+// through n_tty_inherit_ops() and its open handler chains to n_tty_open(), so
+// N_PPS is N_TTY plus a dcd_change hook rather than a replacement for it;
+// a GPS receiver may carry NMEA and its pulse on one port. The open here is
+// deliberately independent of any NMEA open of the same tty: this fd exists
+// only to hold the discipline, and nothing reads from it.
+//
+// Attaching the discipline drops whatever the tty has buffered (the kernel
+// frees the old discipline's read buffer), so attach before an NMEA reader
+// starts rather than under a running one.
 func AttachPPS(path string) (*Port, string, error) {
 	p, err := OpenCLOCAL(path)
 	if err != nil {

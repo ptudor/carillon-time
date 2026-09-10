@@ -104,10 +104,12 @@ often uses `dialout` for serial ports; inspect your distribution’s device owne
 For NMEA on a serial port, add that exact device, for example
 `DeviceAllow=/dev/ttyS0 rw`, and configure its permissions too.
 
-Linux serial PPS needs the appropriate kernel PPS support; the `pps_ldisc` line
-discipline applies to a PPS-only tty. NMEA on Linux needs a separate readable
-serial stream from a tty used for `N_PPS`. Loading modules and hardware/udev setup
-are administrator tasks, not package-install actions. Restart after changing the
+Linux serial PPS needs the appropriate kernel PPS support. The `pps_ldisc` line
+discipline inherits the normal `N_TTY` operations, so one tty can carry both a
+receiver's NMEA stream and its DCD pulse: `pps = "dcd"` needs no second device.
+`DeviceAllow=` for that tty must be `rw`, because attaching the discipline is an
+ioctl on it. Loading modules and hardware/udev setup are administrator tasks,
+not package-install actions. Restart after changing the
 drop-in, and inspect `carillonctl refclock` plus service logs.
 
 ## Upgrade, rollback, and removal
