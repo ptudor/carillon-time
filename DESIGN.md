@@ -345,8 +345,9 @@ going inactive. Configuration is either
   /dev/ttyS0`, `pps-gpio` on a Raspberry Pi/OpenWrt, `pps-ktimer` for tests).
 
 **N_PPS does not take the serial stream away.** `pps_ldisc` is registered
-through `n_tty_inherit_ops()` and its `open` handler chains to `n_tty_open()`,
-so N_PPS is N_TTY *plus* a `dcd_change` hook, not a replacement for it: reads
+through `n_tty_inherit_ops()`, keeps the inherited `open` as
+`alias_n_tty_open` and calls it from `pps_tty_open()`, so N_PPS is N_TTY
+*plus* a `dcd_change` hook, not a replacement for it (§14): reads
 keep delivering bytes while carrier transitions are timestamped in the
 interrupt handler. That is exactly what `ldattach(8) PPS` has always relied on
 — it holds the tty open with the discipline attached while another process
@@ -358,6 +359,12 @@ Attaching a discipline frees the previous one's read buffer, so whatever the
 tty had buffered is discarded. carillon opens the NMEA reader before it
 attaches N_PPS; the cost is at most a partial sentence, which the framer
 resynchronises past on the next `$`.
+
+The daemon does not take this on trust: `TestNPPSKeepsDeliveringSerialData`
+in `internal/serial` attaches N_PPS to a pseudo-terminal on the running kernel
+and asserts that bytes written afterwards still arrive. It needs no hardware
+and no privilege, and skips where the kernel will not attach the discipline at
+all, so it can never report a problem it did not observe.
 
 `PPS_FETCH` (`<linux/pps.h>`) blocks until the next event; a timeout with
 `flags = PPS_TIME_INVALID` waits forever, zero returns immediately.
@@ -2204,6 +2211,11 @@ the M5 specification and implementation verification record.
 - Linux: `Documentation/driver-api/pps.rst`, `<linux/pps.h>`,
   `<linux/timex.h>` (`adjtimex`, `ADJ_SETOFFSET`), `ldattach(8)`,
   `socket(7)` (`SO_TIMESTAMPNS`, `SO_TIMESTAMPING`)
+- Linux `drivers/pps/clients/pps-ldisc.c` — `pps_tty_init()` calls
+  `n_tty_inherit_ops()` and keeps the inherited `open` as `alias_n_tty_open`,
+  which `pps_tty_open()` then calls; `pps_tty_dcd_change()` is the only
+  capture hook, and it is on DCD. This is the authority for §5.2's claim that
+  N_PPS keeps delivering serial data and for CTS being FreeBSD-only
 - Mills, *Computer Network Time Synchronization*, 2nd ed. — the PLL/FLL
   derivation behind §6.4
 - chrony `sys_generic.c` and `sources.c` — reference for frequency-offset
