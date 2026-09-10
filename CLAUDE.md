@@ -210,8 +210,10 @@ dependency.
   through `n_tty_inherit_ops()` and chains to `n_tty_open()`, so it is `N_TTY`
   plus a `dcd_change` hook. One GPS on one tty is therefore the normal Linux
   configuration (`pps = "dcd"`), exactly as on FreeBSD — do not reintroduce
-  the old "N_PPS replaces tty input" restriction. `pps = "cts"` stays
-  FreeBSD-only, because `pps_ldisc` hooks carrier detect and nothing else.
+  the old "N_PPS replaces tty input" restriction —
+  `TestNPPSKeepsDeliveringSerialData` in `internal/serial` holds the kernel to
+  it. `pps = "cts"` stays FreeBSD-only, because `pps_ldisc` hooks carrier
+  detect and nothing else.
 - **Both:** set `CLOCAL` immediately after opening a tty that carries PPS on
   DCD, otherwise the carrier toggling at 1 Hz hangs up the port.
 - **Privileges:** FreeBSD runs `carillon` as its own user with the `mac_ntpd(4)`
