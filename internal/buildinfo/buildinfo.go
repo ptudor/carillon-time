@@ -36,3 +36,14 @@ func Time() time.Time {
 	}
 	return time.Time{}
 }
+
+// Homepage is where an operator on the receiving end of our HTTP requests
+// can find out what carillon is and who to contact about it.
+const Homepage = "https://github.com/ptudor/carillon-time"
+
+// UserAgent identifies carillon to the leap-seconds publishers it polls.
+// Version and homepage let a server operator recognise a misbehaving
+// installation and reach its maintainer rather than block a generic client.
+func UserAgent() string {
+	return "carillon/" + Version + " (+" + Homepage + "; NTP daemon leap-seconds seed)"
+}

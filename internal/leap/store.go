@@ -19,7 +19,7 @@ import (
 const maxStateSize = 256 << 10
 
 // Provider identifies the immediate authority. Peer origin claims are never
-// promoted to an independently verified NIST provenance.
+// promoted to an independently verified publisher provenance.
 type Provider struct {
 	Kind  string `json:"kind"`
 	Name  string `json:"name"`
@@ -200,7 +200,7 @@ func loadState(root *os.Root) (State, error) {
 			return nil, err
 		}
 		if o.manifest != d.Manifest || d.Accepted.IsZero() || len(d.Provider.Name) > 1024 ||
-			(d.Provider.Kind != "file" && d.Provider.Kind != "nist" && d.Provider.Kind != "peer") ||
+			(d.Provider.Kind != "file" && d.Provider.Kind != "nist" && d.Provider.Kind != "iers" && d.Provider.Kind != "peer") ||
 			(d.Provider.Kind == "peer" && (d.Provider.KeyID == 0 || d.Provider.KeyID > 65535)) {
 			return nil, errors.New("leap: cache metadata does not match its object")
 		}
@@ -273,8 +273,91 @@ func (s *Store) Save(state State) error {
 	if len(b) > maxStateSize {
 		return errors.New("leap: encoded cache exceeds bound")
 	}
+	return s.write("state.json", b, true)
+}
+
+// SeedState is the HTTPS seed's own bookkeeping: the publisher's cache
+// validators for the body last evaluated and when we last asked. It lives
+// in seed.json, apart from state.json, so the authority record's format and
+// its rollback coupling are untouched and an older binary can still read
+// the cache after a rollback. Losing it costs one unconditional download.
+type SeedState struct {
+	Validators  Validators
+	LastAttempt time.Time
+}
+
+type diskSeed struct {
+	Version      int       `json:"version"`
+	ETag         string    `json:"etag,omitempty"`
+	LastModified string    `json:"last_modified,omitempty"`
+	LastAttempt  time.Time `json:"last_attempt,omitzero"`
+}
+
+const maxSeedSize = 4 << 10
+
+func (s *Store) LoadSeed() (SeedState, error) {
+	f, err := openNoFollow(s.root, "seed.json", os.O_RDONLY, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return SeedState{}, nil
+	}
+	if err != nil {
+		return SeedState{}, fmt.Errorf("leap: open seed bookkeeping: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return SeedState{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > maxSeedSize {
+		return SeedState{}, errors.New("leap: seed bookkeeping must be a private, bounded regular file")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxSeedSize+1))
+	if err != nil {
+		return SeedState{}, err
+	}
+	if len(b) > maxSeedSize {
+		return SeedState{}, errors.New("leap: seed bookkeeping exceeds size bound")
+	}
+	var d diskSeed
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&d); err != nil {
+		return SeedState{}, fmt.Errorf("leap: decode seed bookkeeping: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return SeedState{}, errors.New("leap: trailing seed bookkeeping data")
+	}
+	if d.Version != 1 {
+		return SeedState{}, errors.New("leap: unsupported seed bookkeeping version")
+	}
+	v := Validators{ETag: d.ETag, LastModified: d.LastModified}
+	if !v.valid() {
+		return SeedState{}, errors.New("leap: invalid seed validators")
+	}
+	if !d.LastAttempt.IsZero() && (d.LastAttempt.Year() < 1900 || d.LastAttempt.Year() > 9999) {
+		return SeedState{}, errors.New("leap: invalid seed attempt date")
+	}
+	return SeedState{Validators: v, LastAttempt: d.LastAttempt}, nil
+}
+
+func (s *Store) SaveSeed(state SeedState) error {
+	if !state.Validators.valid() {
+		return errors.New("leap: refusing to persist invalid seed validators")
+	}
+	b, err := json.Marshal(diskSeed{Version: 1, ETag: state.Validators.ETag, LastModified: state.Validators.LastModified, LastAttempt: state.LastAttempt})
+	if err != nil {
+		return fmt.Errorf("leap: encode seed bookkeeping: %w", err)
+	}
+	return s.write("seed.json", b, false)
+}
+
+// write replaces one cache entry atomically: private temporary file, fsync,
+// rename, directory fsync. Only state.json participates in the persistence
+// fault injection used by the crash tests.
+func (s *Store) write(target string, b []byte, faults bool) error {
 	stage := func(name string) error {
-		if s.fault != nil {
+		if faults && s.fault != nil {
 			return s.fault(name)
 		}
 		return nil
@@ -311,8 +394,8 @@ func (s *Store) Save(state State) error {
 	if err := stage("rename"); err != nil {
 		return err
 	}
-	if err := s.root.Rename(name, "state.json"); err != nil {
-		return fmt.Errorf("leap: replace cache: %w", err)
+	if err := s.root.Rename(name, target); err != nil {
+		return fmt.Errorf("leap: replace %s: %w", target, err)
 	}
 	if err := stage("directory_sync"); err != nil {
 		return err

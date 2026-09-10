@@ -41,12 +41,15 @@
 # debug | info | warn | error
 log_level = "info"
 
-# Required when enabling a refclock or [serve]. Choose one seed for "nist";
-# downstreams use "peers" plus leap_trust=true and a CMAC key on [[server]].
-# With daemon.leapfile configured the default is "manual"; otherwise the
-# default is "peers" if a leap-trusted server exists, or "off" for clients.
+# Required when enabling a refclock or [serve]. Choose one seed host and one
+# publisher for it: "iers" (issues Bulletin C, publishes first) or "nist"
+# (republishes later, dates #$ differently). Pick one and stay with it; the
+# two copies are not interchangeable under the rollback rule, see
+# docs/leap-distribution.md. Downstreams use "peers" plus leap_trust=true and
+# a CMAC key on [[server]]. With daemon.leapfile configured the default is
+# "manual"; otherwise "peers" if a leap-trusted server exists, or "off".
 #[leap]
-#acquire = "nist"             # off | manual | nist | peers
+#acquire = "iers"             # off | manual | nist | iers | peers
 #require_table = true         # mandatory for refclock and serving hosts
 
 # --- PPS reference clock ---------------------------------------------------

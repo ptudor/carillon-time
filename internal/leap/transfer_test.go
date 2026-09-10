@@ -222,11 +222,11 @@ func TestHTTPSSeedRelayChainAndRenewal(t *testing.T) {
 	relay, rc := testUpdater(t, "peers", now)
 	leaf, lc := testUpdater(t, "peers", now)
 	// Downstreams cannot fetch HTTPS, even through an accidental fallback.
-	relay.fetchNIST = func(context.Context) (*Object, error) {
+	relay.fetchSeed = func(context.Context, Validators) (SeedResult, error) {
 		t.Error("relay fetched HTTPS")
-		return nil, errors.New("egress denied")
+		return SeedResult{}, errors.New("egress denied")
 	}
-	leaf.fetchNIST = relay.fetchNIST
+	leaf.fetchSeed = relay.fetchSeed
 	fromSeed := wirePeer(t, func() *Object {
 		if r := sc.active.Load(); r != nil {
 			return r.Object
@@ -243,10 +243,11 @@ func TestHTTPSSeedRelayChainAndRenewal(t *testing.T) {
 	defer cancel()
 	for i, want := range []*Object{old, renew} {
 		published.Store(want)
-		o, err := fetchHTTPS(ctx, client, https.URL)
+		res, err := fetchSeed(ctx, client, https.URL, "carillon/test", Validators{})
 		if err != nil {
 			t.Fatal(err)
 		}
+		o := res.Object
 		if err := seed.install(ctx, o, Provider{Kind: "nist", Name: NISTURL}); err != nil {
 			t.Fatal(err)
 		}
@@ -343,12 +344,12 @@ func TestHTTPSPolicy(t *testing.T) {
 			if kind == "untrusted_tls" {
 				client = &http.Client{Timeout: time.Second}
 			}
-			if o, err := fetchHTTPS(context.Background(), client, srv.URL); err == nil || o != nil {
+			if res, err := fetchSeed(context.Background(), client, srv.URL, "carillon/test", Validators{}); err == nil || res.Object != nil || res.NotModified {
 				t.Fatal("unsafe HTTPS result accepted")
 			}
 		})
 	}
-	if _, err := fetchHTTPS(context.Background(), http.DefaultClient, "http://127.0.0.1"); err == nil {
+	if _, err := fetchSeed(context.Background(), http.DefaultClient, "http://127.0.0.1", "carillon/test", Validators{}); err == nil {
 		t.Fatal("HTTP downgrade accepted")
 	}
 }

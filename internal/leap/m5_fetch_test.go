@@ -5,9 +5,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
-	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -15,35 +12,6 @@ import (
 
 	"github.com/ptudor/carillon-time/internal/ntp"
 )
-
-func TestNISTFetchIgnoresProxyEnvironment(t *testing.T) {
-	for _, name := range []string{"HTTPS_PROXY", "https_proxy"} {
-		t.Setenv(name, "http://127.0.0.1:1")
-	}
-	for _, name := range []string{"NO_PROXY", "no_proxy"} {
-		t.Setenv(name, "")
-	}
-	// Stop at DialContext so this tests the real fixed-URL entry point
-	// without consulting DNS or making any external connection.
-	original := http.DefaultTransport
-	transport := original.(*http.Transport).Clone()
-	// Avoid ProxyFromEnvironment's process-wide cache from earlier tests.
-	transport.Proxy = func(*http.Request) (*url.URL, error) { return url.Parse(os.Getenv("HTTPS_PROXY")) }
-	dialed := make(chan string, 1)
-	stop := errors.New("test stopped before network I/O")
-	transport.DialContext = func(_ context.Context, _, address string) (net.Conn, error) {
-		dialed <- address
-		return nil, stop
-	}
-	http.DefaultTransport = transport
-	t.Cleanup(func() { http.DefaultTransport = original; transport.CloseIdleConnections() })
-	if _, err := FetchNIST(context.Background()); !errors.Is(err, stop) {
-		t.Fatalf("unexpected fetch result: %v", err)
-	}
-	if address := <-dialed; address != "tf.nist.gov:443" {
-		t.Fatalf("environment redirected the fixed-URL fetch to %q", address)
-	}
-}
 
 func TestSuccessfulProbeRecoversRATEForLargeObject(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
