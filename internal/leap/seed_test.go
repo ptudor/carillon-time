@@ -237,11 +237,14 @@ func TestSeedScheduleHonorsRetryAfterAndClientErrorFloor(t *testing.T) {
 		if err != nil || seed.Validators.ETag != `"x"` || !seed.LastAttempt.Equal(now) {
 			t.Fatalf("seed bookkeeping after success: %+v %v", seed, err)
 		}
-		// Success returns to the daily cadence, ±10%.
-		time.Sleep(21*time.Hour + 30*time.Minute)
+		// Success returns to the daily cadence, ±10%, counted from the
+		// successful check itself: the delayed retry ran up to 2.4 h before
+		// this point, so a window measured from here would overlap the next
+		// check's earliest time (21.6 h after that retry).
+		time.Sleep(21*time.Hour + 30*time.Minute - time.Since(calls[2]))
 		synctest.Wait()
 		if len(recorded.snapshot()) != 3 {
-			t.Fatal("successful check re-polled inside a day")
+			t.Fatal("successful check re-polled before the daily cadence's -10% floor")
 		}
 		time.Sleep(5 * time.Hour)
 		synctest.Wait()
