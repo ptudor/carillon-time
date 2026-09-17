@@ -61,7 +61,7 @@ source independence/quorum, and negative root-delay interoperability.
 Read [known limitations](docs/limitations.md) before choosing a deployment.
 
 Carillon implements [durable leap data and authenticated distribution](docs/leap-distribution.md):
-one configured seed downloads from NIST, and downstreams learn and cache the
+one configured seed downloads from IERS or NIST, and downstreams learn and cache the
 original file over authenticated NTP. Manual files are supported and updates
 activate without restarting the loop. Refclock and serving hosts require a
 current table before reporting synchronization. Configure an acquisition mode
@@ -82,7 +82,7 @@ timestamping, and OpenWrt deployment are outside the current release scope.
 ## Install
 
 Download binaries and packages from the
-[1.0.0 release](https://github.com/ptudor/carillon-time/releases/tag/v1.0.0).
+[1.1.0 release](https://github.com/ptudor/carillon-time/releases/tag/v1.1.0).
 Choose the file matching your OS and architecture, then follow the
 [verification instructions](docs/releases.md#verify-a-download).
 Development snapshots are also available from successful

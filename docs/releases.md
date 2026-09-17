@@ -30,9 +30,12 @@ use a new version for corrected public artifacts.
 
 ## Public releases
 
-[Carillon v1.0.0](https://github.com/ptudor/carillon-time/releases/tag/v1.0.0)
-is the first public release. See the [release notes](release-notes/v1.0.0.md)
-for features, downloads, and platform coverage. Development snapshots are also
+[Carillon v1.1.0](https://github.com/ptudor/carillon-time/releases/tag/v1.1.0)
+adds durable leap-second data with authenticated distribution, one serial port
+for a Linux GPS's sentences and pulse, and signed packages. See the
+[release notes](release-notes/v1.1.0.md) for features, upgrade guidance,
+downloads, and platform coverage. The [1.0.0 notes](release-notes/v1.0.0.md)
+describe the first public release. Development snapshots are also
 available from successful [CI runs](https://github.com/ptudor/carillon-time/actions/workflows/ci.yml).
 
 The project uses the [MIT license](../LICENSE). Archives and packages also carry
