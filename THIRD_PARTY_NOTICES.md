@@ -1111,7 +1111,7 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-## golang.org/x/sys v0.47.0
+## golang.org/x/sys v0.48.0
 
 ### LICENSE
 
