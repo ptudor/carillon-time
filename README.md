@@ -100,15 +100,16 @@ From a directory containing the appropriate downloaded package:
 # Debian / Ubuntu
 sudo apt install ./carillon_*_amd64.deb
 
-# Fedora / RHEL family (local packages are unsigned)
-sudo dnf --setopt=localpkg_gpgcheck=0 install ./carillon-*.x86_64.rpm
+# Fedora / RHEL family, after importing the release key (see the verification instructions)
+sudo dnf --setopt=localpkg_gpgcheck=1 install ./carillon-*.x86_64.rpm
 ```
 
 Packages **do not start or enable the daemon** and do not stop your current time
 service. Configuration starts as an NTP client, with downstream serving and device
 access disabled. Follow [Linux setup](docs/linux-packages.md) to configure and activate
-it. Packages are unsigned; release checksums and GitHub build attestations are
-provided. There is no hosted APT/YUM repository.
+it. Packages and `checksums.txt` are signed with the
+[release key](docs/releases.md#release-signing-key), and GitHub build attestations
+are provided. There is no hosted APT/YUM repository.
 
 For a manual installation or FreeBSD rc.d setup, use the
 [deployment guide](deploy/README.md). Packaged binaries live in `/usr/bin`; manual
@@ -198,7 +199,7 @@ make abicheck        # Native Linux/FreeBSD header-layout comparisons; needs C c
 make linux           # Static Linux amd64 and arm64 binaries
 make freebsd         # Static FreeBSD amd64 and arm64 binaries
 make release-check   # Validate GoReleaser configuration
-make snapshot        # Release archives, RPMs, and DEBs in dist/
+make snapshot        # Release archives, RPMs, and DEBs in dist/, throwaway-signed
 ```
 
 GitHub CI runs native race tests on Linux amd64, Linux arm64, and macOS arm64;
@@ -212,7 +213,7 @@ clock privileges. Hardware acceptance remains a separate operator task.
 | [Configuration](deploy/carillon.toml.example) | Annotated settings and topologies |
 | [Linux packages](docs/linux-packages.md) / [Manual deployment](deploy/README.md) | Install, activate, inspect, upgrade |
 | [Known limitations](docs/limitations.md) | Open review items and hardware acceptance gaps |
-| [Release guide](docs/releases.md) | GitHub builds, packages, checksums, provenance |
+| [Release guide](docs/releases.md) | GitHub builds, packages, signatures, checksums, provenance |
 | [Contributing](CONTRIBUTING.md) / [Security](SECURITY.md) | Development and private vulnerability reporting |
 
 **License:** [MIT](LICENSE). Commercial use, modification, and redistribution

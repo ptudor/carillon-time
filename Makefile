@@ -78,8 +78,9 @@ GORELEASER ?= goreleaser
 release-check:
 	$(GORELEASER) check
 
+# Signs with a throwaway key and verifies the result; see scripts/snapshot.sh.
 snapshot:
-	$(GORELEASER) release --snapshot --clean
+	sh scripts/snapshot.sh $(GORELEASER)
 
 .PHONY: check-examples
 check-examples: build

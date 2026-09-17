@@ -35,12 +35,15 @@ includes example serial-device access; it is a separate installation recipe.
 ```sh
 sudo apt install ./carillon_*_amd64.deb
 # Or on an RPM system:
-sudo dnf --setopt=localpkg_gpgcheck=0 install ./carillon-*.x86_64.rpm
+sudo rpm --import release-signing-key.asc
+sudo dnf --setopt=localpkg_gpgcheck=1 install ./carillon-*.x86_64.rpm
 ```
 
-Choose `arm64` DEBs or `aarch64` RPMs for ARM. The local packages are unsigned.
-Do not disable signature checks globally; the DNF option above applies only to
-local-package checks for that invocation.
+Choose `arm64` DEBs or `aarch64` RPMs for ARM. The packages are signed with the
+[release key](releases.md#release-signing-key). DNF checks an RPM's signature once
+that key is imported, and the option above makes it mandatory for this local
+file. APT does not check a local DEB's signature, so verify the signed
+`checksums.txt` before installing one.
 
 Edit `/etc/carillon/carillon.toml` to choose your upstreams and topology. The
 [full example](../deploy/carillon.toml.example) covers serving, authentication,
