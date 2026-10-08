@@ -82,7 +82,7 @@ timestamping, and OpenWrt deployment are outside the current release scope.
 ## Install
 
 Download binaries and packages from the
-[1.1.0 release](https://github.com/ptudor/carillon-time/releases/tag/v1.1.0).
+[1.2.0 release](https://github.com/ptudor/carillon-time/releases/tag/v1.2.0).
 Choose the file matching your OS and architecture, then follow the
 [verification instructions](docs/releases.md#verify-a-download).
 Development snapshots are also available from successful

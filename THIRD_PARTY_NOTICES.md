@@ -673,7 +673,7 @@ This product includes software developed at
 SoundCloud Ltd. (http://soundcloud.com/).
 ```
 
-## github.com/prometheus/common v0.71.0
+## github.com/prometheus/common v0.72.0
 
 ### LICENSE
 

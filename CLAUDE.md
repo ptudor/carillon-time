@@ -82,10 +82,11 @@ future rename stays a mechanical search-and-replace.
   kernel (ioctls, `ntp_adjtime`, socket timestamps) is done with
   `golang.org/x/sys/unix` and hand-declared structs — no C toolchain, so
   cross-compiling for FreeBSD/Linux from this Mac is one command.
-- Local toolchain: `/opt/local/bin/go` (MacPorts). `go.mod` sets `go 1.25.0`
-  as the floor — `golang.org/x/sys` v0.47 requires it; bump deliberately, not
-  as a side effect of a `go mod tidy`. Run `go` with `GOMODCACHE`/`GOCACHE`
-  pointed at the session scratchpad so nothing is written outside `~/Git`.
+- Local toolchain: `/opt/local/bin/go` (MacPorts). `go.mod` sets `go 1.26.0`
+  as the compatibility floor, with the release toolchain in `.go-version`.
+  Bump the floor deliberately, not as a side effect of a `go mod tidy`. Run `go`
+  with `GOMODCACHE`/`GOCACHE` pointed at the session scratchpad so nothing is
+  written outside `~/Git`.
 - Allowed third-party modules — do not add others without saying why:
   - `golang.org/x/sys` — syscalls, ioctls, socket options
   - `github.com/pelletier/go-toml/v2` — config (house standard; strict decode

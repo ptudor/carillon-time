@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2026-10-07
+
+- Update `github.com/prometheus/common` to v0.72.0 and refresh compiled
+  dependency notices.
+- Update GoReleaser to v2.18.2, `govulncheck` to v1.8.0, and the pinned
+  artifact-upload Action to v7.0.2. The release toolchain remains Go 1.27.1.
+- Keep dependency alerts and scheduled security checks while disabling
+  automatic dependency-update pull requests.
+
 ## 1.1.0 — 2026-09-16
 
 - Add durable leap-second data. `[leap] acquire` selects `manual` (the existing
