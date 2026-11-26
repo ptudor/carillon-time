@@ -11,8 +11,7 @@ import (
 
 // receiveBufferSize returns the socket's effective SO_RCVBUF. Linux reports
 // twice what was requested because it accounts for bookkeeping overhead, and
-// both kernels silently clamp to a system maximum, so the value a caller
-// asked for and the value it got are rarely the same number.
+// FreeBSD reports the granted request directly.
 func receiveBufferSize(raw syscall.RawConn) (int, error) {
 	var size int
 	var sockErr error

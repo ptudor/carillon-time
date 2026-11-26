@@ -22,7 +22,8 @@ func TestTrackingPrintsLeapReadinessAndCandidates(t *testing.T) {
 	defer func() { os.Stdout = original }()
 	updated := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	expiry := time.Date(2026, 12, 28, 0, 0, 0, 0, time.UTC)
-	printTracking(&control.Tracking{State: "unsynced", Leap: "unsynchronized", LeapSource: "peer", LeapRequired: true, LeapReason: "UTC not established", LeapHash: "accepted-hash", LeapProvider: leap.Provider{Kind: "peer", Name: "home", KeyID: 7}, LeapUpdated: &updated, LeapExpiry: &expiry, LeapUpdate: leap.UpdateStatus{Mode: "peers", LastResult: "candidate refused", Pending: "pending-hash", LastRejection: "conflict"}})
+	age := 27.0
+	printTracking(&control.Tracking{SystemSource: "alternate", UpdateSource: "home", UpdateAge: &age, UpdateReason: "offset spike rejected", State: "unsynced", Leap: "unsynchronized", LeapSource: "peer", LeapRequired: true, LeapReason: "UTC not established", LeapHash: "accepted-hash", LeapProvider: leap.Provider{Kind: "peer", Name: "home", KeyID: 7}, LeapUpdated: &updated, LeapExpiry: &expiry, LeapUpdate: leap.UpdateStatus{Mode: "peers", LastResult: "candidate refused", Pending: "pending-hash", LastRejection: "conflict"}})
 	os.Stdout = original
 	b, err := os.ReadFile(file.Name())
 	if err != nil {
@@ -34,6 +35,7 @@ func TestTrackingPrintsLeapReadinessAndCandidates(t *testing.T) {
 	}
 	text := strings.Join(lines, "\n")
 	for _, want := range []string{
+		"System source alternate", "Last update source home (27.0 s ago)", "Discipline decision offset spike rejected",
 		"Leap unsynchronized", "Leap source peer", "Leap ready false (table required: true)", "Leap readiness reason UTC not established",
 		"Leap SHA-256 accepted-hash", "Leap provider peer home (key 7)", "Leap data updated 2026-09-01T00:00:00Z",
 		"Leap acquisition peers: candidate refused", "Leap pending SHA-256 pending-hash", "Leap last rejection conflict", "Leap file expires 2026-12-28T00:00:00Z",

@@ -191,13 +191,13 @@ type Engine struct {
 	reqs   chan func() error
 	status atomic.Pointer[Status]
 
-	tick           time.Duration // ticker period; one second outside tests
-	started        time.Time
-	startedMono    float64
-	refWall        time.Time
-	lastLoopUpdate float64
-	lastKernel     clock.Status
-	haveKernel     bool
+	tick            time.Duration // ticker period; one second outside tests
+	started         time.Time
+	startedMono     float64
+	refWall         time.Time
+	lastLoopUpdates int
+	lastKernel      clock.Status
+	haveKernel      bool
 
 	// appliedFreq is the last frequency word the actuator actually
 	// accepted, and haveAppliedFreq whether one ever has been. The engine
@@ -1041,8 +1041,8 @@ func (e *Engine) handle(res discipline.Result, now float64) error {
 	}
 	st := e.sys.Status(now)
 	e.applyLeap(&st, e.clk.Now())
-	if st.LastUpdate != e.lastLoopUpdate {
-		e.lastLoopUpdate = st.LastUpdate
+	if st.Updates != e.lastLoopUpdates {
+		e.lastLoopUpdates = st.Updates
 		e.refWall = e.clk.Now()
 	}
 	e.noteFrequency(now, &st)
@@ -1069,7 +1069,7 @@ func (e *Engine) logEvent(ev discipline.Event) {
 		e.log.Error("offset exceeds the panic threshold; refusing to correct the clock",
 			"offset", ev.Value, "hint", "set [step] panic_at_startup = true for a first boot without an RTC, or set the clock by hand")
 	case discipline.EventPopcorn:
-		e.log.Warn("ignored offset spike", "offset", ev.Value)
+		e.log.Warn("ignored offset spike", "source", ev.Source, "offset", ev.Value)
 	case discipline.EventStateChange:
 		switch ev.To {
 		case discipline.StateSynced:
@@ -1088,7 +1088,8 @@ func (e *Engine) logEvent(ev discipline.Event) {
 	case discipline.EventPreferRegained:
 		e.log.Info("preferred source is back in charge")
 	case discipline.EventSystemSource:
-		e.log.Info("system source", "source", ev.Source)
+		st := e.sys.Status(e.clk.Monotonic())
+		e.log.Info("system source", "source", ev.Source, "update_source", st.UpdateSource, "update_reason", st.UpdateReason)
 	case discipline.EventUnknownSource:
 		e.log.Error("measurement from an unregistered source", "source", ev.Source)
 	case discipline.EventPPSUnqualified:

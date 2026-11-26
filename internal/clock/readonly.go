@@ -2,10 +2,25 @@ package clock
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/ptudor/carillon-time/internal/ntp"
 )
+
+// SynchronizedUTC reads the kernel NTP state with a modes-zero query. During
+// first-install preparation the incumbent daemon must report TIME_OK. An
+// unsynchronized clock or an in-progress leap cannot authorize a cold cache.
+func SynchronizedUTC() (time.Time, error) {
+	state, err := kernelTimeState()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("clock: read kernel synchronization state: %w", err)
+	}
+	if state != 0 {
+		return time.Time{}, fmt.Errorf("clock: existing time service must report TIME_OK (kernel state %d)", state)
+	}
+	return time.Now().UTC(), nil
+}
 
 // ErrReadOnly is returned by the mutating methods of a read-only clock.
 var ErrReadOnly = errors.New("clock: read-only clock cannot be adjusted")

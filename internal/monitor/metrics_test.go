@@ -56,6 +56,20 @@ func gatherMetrics(t *testing.T, snapshot func() Snapshot) string {
 	return body.String()
 }
 
+func TestMetricsDistinguishSelectedFromAcceptedSource(t *testing.T) {
+	st := testEngineStatus(time.Now(), discipline.StateSynced)
+	st.UpdateSource, st.UpdateAge = "previous", 1620
+	st.Sources = []discipline.SourceStatus{{Name: "previous"}, {Name: "home", Status: discipline.StatusSystem}}
+	body := gatherMetrics(t, func() Snapshot {
+		return SnapshotOf(st, ntpserver.StatsSnapshot{}, false, Metadata{}, st.Now, st.PublishedMono, st.Now)
+	})
+	for _, want := range []string{"carillon_update_age_seconds{} 1620", "carillon_source_last_update{source=previous} 1", "carillon_source_last_update{source=home} 0", "carillon_source_selected{source=home} 1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %s", want)
+		}
+	}
+}
+
 func TestServerMetricsAreLabelledByFamily(t *testing.T) {
 	now := time.Date(2026, 8, 24, 23, 37, 21, 0, time.UTC)
 	stats := ntpserver.StatsSnapshot{

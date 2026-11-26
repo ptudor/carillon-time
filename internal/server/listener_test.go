@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +120,26 @@ func TestListenAcceptsAnOversizedReceiveBuffer(t *testing.T) {
 	defer s.Close()
 	if got := s.ReceiveBuffers(); len(got) != 1 || got[0] <= 0 {
 		t.Fatalf("effective receive buffers %v", got)
+	}
+}
+
+func TestReceiveBufferCapacity(t *testing.T) {
+	const request = 4 << 20
+	for _, tc := range []struct {
+		os             string
+		readback, want int
+	}{
+		{"freebsd", request, request}, {"freebsd", request / 2, request / 2},
+		{"linux", 2 * request, request}, {"linux", request, request / 2},
+	} {
+		var out bytes.Buffer
+		reportReceiveBuffer(slog.New(slog.NewTextHandler(&out, nil)), netip.MustParseAddrPort("[::1]:123"), request, tc.readback, tc.os)
+		if tc.want == request && out.Len() != 0 {
+			t.Errorf("full grant warned: %s", out.String())
+		}
+		if tc.want < request && !strings.Contains(out.String(), "requested=4194304 granted=2097152") {
+			t.Errorf("missing shortfall: %s", out.String())
+		}
 	}
 }
 

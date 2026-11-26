@@ -82,7 +82,7 @@ timestamping, and OpenWrt deployment are outside the current release scope.
 ## Install
 
 Download binaries and packages from the
-[1.2.0 release](https://github.com/ptudor/carillon-time/releases/tag/v1.2.0).
+[1.2.1 release](https://github.com/ptudor/carillon-time/releases/tag/v1.2.1).
 Choose the file matching your OS and architecture, then follow the
 [verification instructions](docs/releases.md#verify-a-download).
 Development snapshots are also available from successful
@@ -113,7 +113,9 @@ are provided. There is no hosted APT/YUM repository.
 
 For a manual installation or FreeBSD rc.d setup, use the
 [deployment guide](deploy/README.md). Packaged binaries live in `/usr/bin`; manual
-installation examples use `/usr/local`.
+installation examples use `/usr/local`. On a first installation using IERS or NIST,
+prepare the leap cache while the existing daemon still serves synchronized time.
+See [first-install leap preparation](docs/leap-distribution.md#prepare-a-first-installation).
 
 ## Try it safely
 

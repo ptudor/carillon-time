@@ -1,7 +1,6 @@
 package main
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -58,21 +57,13 @@ func TestPublicServeWarnings(t *testing.T) {
 		t.Fatalf("the warning must quote the prefixes: %q", warnings[0].message)
 	}
 
-	// Tuned for a public server: still announced. FreeBSD also explains
-	// the kernel buffer limit even when a buffer has been configured.
+	// Socket capacity is measured when the listener actually binds.
 	warnings = public(func(c *config.Config) {
 		c.Serve.RateLimitPPS = 0.25
 		c.Serve.RecvBuffer = 4 << 20
 	})
-	wantWarnings := 1
-	if runtime.GOOS == "freebsd" {
-		wantWarnings = 2
-	}
-	if len(warnings) != wantWarnings || !strings.Contains(warnings[0].message, "public internet") {
+	if len(warnings) != 1 || !strings.Contains(warnings[0].message, "public internet") {
 		t.Fatalf("tuned public server: %+v", warnings)
-	}
-	if runtime.GOOS == "freebsd" && (!strings.Contains(warnings[1].message, "kern.ipc.maxsockbuf") || warnings[1].error) {
-		t.Fatalf("FreeBSD buffer warning: %+v", warnings[1])
 	}
 
 	// A LAN ACL says nothing at all, and neither does a disabled server.

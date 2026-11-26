@@ -108,6 +108,9 @@ type Status struct {
 	Pending   float64
 
 	SystemSource string
+	UpdateSource string  // selected source at the last accepted update, including a step
+	UpdateAge    float64 // monotonic seconds, meaningful when UpdateSource is present
+	UpdateReason string  // last outcome for the selected source
 	PreferLost   bool
 	PPSQualified bool
 	LastUpdate   float64 // monotonic; zero if never
@@ -181,6 +184,8 @@ type System struct {
 
 	sel           Selection
 	sysName       string
+	updateSource  string
+	updateReason  string
 	lastUpdate    float64
 	haveUpdate    bool
 	offset        float64
@@ -210,6 +215,7 @@ func New(cfg Config, freq float64, freqKnown bool) *System {
 		refID:          ntp.KissINIT,
 		leap:           ntp.LeapUnsync,
 		unsyncedReason: ntp.KissINIT,
+		updateReason:   "no selectable source",
 	}
 }
 
@@ -294,6 +300,7 @@ func (s *System) Update(m Measurement) Result {
 	if !ok {
 		return Result{Events: []Event{{Kind: EventUnknownSource, Source: m.Source}}}
 	}
+	priorUpdates := s.loop.Updates
 	src.apply(m)
 	// Settling counts *acquisitions* from the system source, not every
 	// event that names it. A timeout, a bad MAC, a rejected packet or an
@@ -303,7 +310,13 @@ func (s *System) Update(m Measurement) Result {
 	if m.Source == s.sysName && m.IsAcquisition() {
 		s.sinceStep++
 	}
-	return s.reselect(m.Now)
+	res := s.reselect(m.Now)
+	// A fresh reply may leave the filter's winner unchanged. Timer ticks
+	// and other associations must not erase a specific rejection.
+	if m.IsAcquisition() && m.Source == s.sysName && s.loop.Updates == priorUpdates && s.updateReason == "accepted" {
+		s.updateReason = "filter sample already used"
+	}
+	return res
 }
 
 func (s *System) setState(to State, res *Result) {
@@ -364,6 +377,7 @@ func (s *System) reselect(now float64) Result {
 
 	if sel.System == nil {
 		s.sysName = ""
+		s.updateReason = "no selectable source"
 		switch {
 		case s.state == StateSynced:
 			s.holdoverSince = now
@@ -388,7 +402,9 @@ func (s *System) reselect(now float64) Result {
 	}
 
 	if sel.System.Name != s.sysName {
+		s.loop.handoff = s.haveUpdate
 		s.sysName = sel.System.Name
+		s.updateReason = "filter sample already used"
 		res.Events = append(res.Events, Event{Kind: EventSystemSource, Source: s.sysName})
 	}
 	// Run the loop only when the system source has a sample it has not
@@ -418,18 +434,21 @@ func (s *System) reselect(now float64) Result {
 	res.Actions = append(res.Actions, u.Actions...)
 	switch {
 	case u.Deferred:
+		s.updateReason = "step awaiting corroboration"
 		// The offset warrants a step but there is not enough post-step
 		// evidence yet. Leave the loop untouched and wait for the next
 		// sample; the source's usedAt has already advanced, so it will run
 		// again.
 		return res
 	case u.PanicRefused:
+		s.updateReason = "panic threshold exceeded"
 		res.Events = append(res.Events, Event{Kind: EventPanicRefused, Value: sel.Offset})
 		s.unsyncedReason = ntp.KissPANC
 		s.setState(StateUnsynced, &res)
 		return res
 	case u.Ignored:
-		res.Events = append(res.Events, Event{Kind: EventPopcorn, Value: sel.Offset})
+		s.updateReason = "offset spike rejected"
+		res.Events = append(res.Events, Event{Kind: EventPopcorn, Source: s.sysName, Value: sel.Offset})
 		return res
 	case u.Stepped:
 		res.Events = append(res.Events, Event{Kind: EventStep, Value: sel.Offset})
@@ -477,6 +496,7 @@ func (s *System) reselect(now float64) Result {
 	// selection distance had already accounted for, so switching to an
 	// older survivor advertised less uncertainty than it had (RA6X-025).
 	s.rootDispAt = sys.Updated
+	s.updateSource, s.updateReason = sys.Name, "accepted"
 	s.lastUpdate = now
 	s.haveUpdate = true
 	return res
@@ -560,6 +580,8 @@ func (s *System) Status(now float64) Status {
 		Jitter:       s.loop.Jitter,
 		Pending:      s.loop.Pending,
 		SystemSource: s.sysName,
+		UpdateSource: s.updateSource,
+		UpdateReason: s.updateReason,
 		PreferLost:   s.preferLost,
 		PPSQualified: s.sel.PPSQualified,
 		Updates:      s.loop.Updates,
@@ -567,6 +589,7 @@ func (s *System) Status(now float64) Status {
 	}
 	if s.haveUpdate {
 		st.LastUpdate = s.lastUpdate
+		st.UpdateAge = math.Max(0, now-s.lastUpdate)
 		st.RootDisp = s.rootDisp + Phi*math.Max(0, now-s.rootDispAt) + math.Abs(s.loop.Pending)
 	}
 	switch s.state {

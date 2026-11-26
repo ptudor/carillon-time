@@ -171,6 +171,30 @@ departing the network they must check coverage through the intended deployment
 period. Beyond expiry, a new announcement or refreshed no-event assurance is
 needed; retaining the old file cannot extend that assurance.
 
+## Prepare a first installation
+
+For a host configured with `[leap] acquire = "iers"` or `"nist"`, create the
+service account and its drift-file directory, then run the command below
+while the incumbent time daemon still reports kernel state `TIME_OK`.
+
+```sh
+# Linux package
+sudo -u carillon /usr/bin/carillon prepare-leap -config /etc/carillon/carillon.toml
+
+# FreeBSD manual installation
+sudo -u carillon /usr/local/sbin/carillon prepare-leap -config /usr/local/etc/carillon/carillon.toml
+```
+
+The command reads the kernel synchronization state before and after fetching
+from the configured publisher. It binds no listener and makes no clock
+adjustments. It validates the table and atomically commits the original bytes,
+digest, provider, expiry and UTC bound in the private cache beside the drift
+file. Output includes the digest and expiry. Repeating the command verifies
+the current cache without contacting the publisher. An active Carillon daemon
+holds the cache lock. Leave renewals and recovery of pending updates to the
+daemon. At startup Carillon still qualifies its sources and UTC before serving
+synchronized replies.
+
 ## NTP exchange
 
 Only NTPv4 client/server modes 3/4 are used, on the existing UDP/123 listener.

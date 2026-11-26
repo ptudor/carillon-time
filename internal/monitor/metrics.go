@@ -13,22 +13,24 @@ import (
 type collector struct {
 	snapshot func() Snapshot
 
-	state          *prometheus.Desc
-	offset         *prometheus.Desc
-	frequency      *prometheus.Desc
-	jitter         *prometheus.Desc
-	rootDispersion *prometheus.Desc
-	stratum        *prometheus.Desc
-	steps          *prometheus.Desc
-	updates        *prometheus.Desc
-	leapPending    *prometheus.Desc
-	leapfileExpiry *prometheus.Desc
-	leapfileValid  *prometheus.Desc
-	leapReady      *prometheus.Desc
-	leapRequired   *prometheus.Desc
-	leapUpdated    *prometheus.Desc
-	leapEvents     *prometheus.Desc
-	buildInfo      *prometheus.Desc
+	state            *prometheus.Desc
+	offset           *prometheus.Desc
+	frequency        *prometheus.Desc
+	jitter           *prometheus.Desc
+	rootDispersion   *prometheus.Desc
+	stratum          *prometheus.Desc
+	steps            *prometheus.Desc
+	updates          *prometheus.Desc
+	updateAge        *prometheus.Desc
+	sourceLastUpdate *prometheus.Desc
+	leapPending      *prometheus.Desc
+	leapfileExpiry   *prometheus.Desc
+	leapfileValid    *prometheus.Desc
+	leapReady        *prometheus.Desc
+	leapRequired     *prometheus.Desc
+	leapUpdated      *prometheus.Desc
+	leapEvents       *prometheus.Desc
+	buildInfo        *prometheus.Desc
 
 	sourceOffset     *prometheus.Desc
 	sourceDelay      *prometheus.Desc
@@ -73,29 +75,31 @@ func newCollector(snapshot func() Snapshot) *collector {
 	return &collector{
 		snapshot: snapshot,
 
-		state:          desc("carillon_state", "Current discipline state as a one-hot labeled gauge.", "state"),
-		offset:         desc("carillon_offset_seconds", "Current system offset estimate in seconds."),
-		frequency:      desc("carillon_frequency_ppm", "Current kernel frequency correction in parts per million."),
-		jitter:         desc("carillon_jitter_seconds", "Current system jitter estimate in seconds."),
-		rootDispersion: desc("carillon_root_dispersion_seconds", "Current NTP root dispersion in seconds."),
-		stratum:        desc("carillon_stratum", "Current NTP stratum."),
-		steps:          desc("carillon_steps_total", "Clock steps since this daemon process started."),
-		updates:        desc("carillon_updates_total", "Discipline updates since this daemon process started."),
-		leapPending:    desc("carillon_leap_pending", "Whether an insertion or deletion leap second is pending."),
-		leapfileExpiry: desc("carillon_leapfile_expiry_timestamp_seconds", "Unix timestamp at which the configured leap file expires; zero when absent."),
-		leapfileValid:  desc("carillon_leapfile_valid", "Whether the configured leap file is unexpired; zero when absent or expired."),
-		leapReady:      desc("carillon_leap_ready", "Whether current leap authority permits synchronization."),
-		leapRequired:   desc("carillon_leap_table_required", "Whether this topology requires a durable leap table."),
-		leapUpdated:    desc("carillon_leap_data_updated_timestamp_seconds", "Unix date of the accepted file's last change to leap records; zero when absent."),
-		leapEvents:     desc("carillon_leap_events_total", "Bounded leap acquisition and distribution counters.", "result"),
-		buildInfo:      desc("carillon_build_info", "Build information for this carillon process.", "version"),
+		state:            desc("carillon_state", "Current discipline state as a one-hot labeled gauge.", "state"),
+		offset:           desc("carillon_offset_seconds", "Current system offset estimate in seconds."),
+		frequency:        desc("carillon_frequency_ppm", "Current kernel frequency correction in parts per million."),
+		jitter:           desc("carillon_jitter_seconds", "Current system jitter estimate in seconds."),
+		rootDispersion:   desc("carillon_root_dispersion_seconds", "Current NTP root dispersion in seconds."),
+		stratum:          desc("carillon_stratum", "Current NTP stratum."),
+		steps:            desc("carillon_steps_total", "Clock steps since this daemon process started."),
+		updateAge:        desc("carillon_update_age_seconds", "Monotonic seconds since the last accepted discipline update."),
+		sourceLastUpdate: desc("carillon_source_last_update", "Whether this source supplied the last accepted discipline update.", "source"),
+		updates:          desc("carillon_updates_total", "Discipline updates since this daemon process started."),
+		leapPending:      desc("carillon_leap_pending", "Whether an insertion or deletion leap second is pending."),
+		leapfileExpiry:   desc("carillon_leapfile_expiry_timestamp_seconds", "Unix timestamp at which the configured leap file expires; zero when absent."),
+		leapfileValid:    desc("carillon_leapfile_valid", "Whether the configured leap file is unexpired; zero when absent or expired."),
+		leapReady:        desc("carillon_leap_ready", "Whether current leap authority permits synchronization."),
+		leapRequired:     desc("carillon_leap_table_required", "Whether this topology requires a durable leap table."),
+		leapUpdated:      desc("carillon_leap_data_updated_timestamp_seconds", "Unix date of the accepted file's last change to leap records; zero when absent."),
+		leapEvents:       desc("carillon_leap_events_total", "Bounded leap acquisition and distribution counters.", "result"),
+		buildInfo:        desc("carillon_build_info", "Build information for this carillon process.", "version"),
 
 		sourceOffset:     desc("carillon_source_offset_seconds", "Filtered source offset estimate in seconds.", "source"),
 		sourceDelay:      desc("carillon_source_delay_seconds", "Filtered source round-trip delay in seconds.", "source"),
 		sourceJitter:     desc("carillon_source_jitter_seconds", "Filtered source jitter in seconds.", "source"),
 		sourceDistance:   desc("carillon_source_root_distance_seconds", "Source correctness interval radius in seconds.", "source"),
 		sourceReach:      desc("carillon_source_reach", "Eight-bit source reach register as an integer.", "source"),
-		sourceSelected:   desc("carillon_source_selected", "Whether this source currently drives the system clock.", "source"),
+		sourceSelected:   desc("carillon_source_selected", "Whether this source currently wins system selection.", "source"),
 		sourceLastRx:     desc("carillon_source_receive_timestamp_seconds", "Unix timestamp of the last accepted source reply or pulse.", "source"),
 		sourceNoKernelTS: desc("carillon_source_kernel_timestamp_missing_total", "Source replies received without a kernel timestamp.", "source"),
 		sourceEvents:     desc("carillon_source_events_total", "Source protocol event counters.", "source", "result"),
@@ -124,7 +128,7 @@ func newCollector(snapshot func() Snapshot) *collector {
 func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, d := range []*prometheus.Desc{
 		c.state, c.offset, c.frequency, c.jitter, c.rootDispersion, c.stratum,
-		c.steps, c.updates, c.leapPending, c.leapfileExpiry, c.leapfileValid, c.buildInfo,
+		c.steps, c.updates, c.updateAge, c.sourceLastUpdate, c.leapPending, c.leapfileExpiry, c.leapfileValid, c.buildInfo,
 		c.leapReady, c.leapRequired, c.leapUpdated, c.leapEvents,
 		c.sourceOffset, c.sourceDelay, c.sourceJitter, c.sourceDistance,
 		c.sourceReach, c.sourceSelected, c.sourceLastRx, c.sourceNoKernelTS, c.sourceEvents,
@@ -161,6 +165,9 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	gauge(c.stratum, float64(t.Stratum))
 	counter(c.steps, uint64(t.Steps))
 	counter(c.updates, uint64(t.Updates))
+	if t.UpdateAge != nil {
+		gauge(c.updateAge, *t.UpdateAge)
+	}
 	gauge(c.leapPending, boolValue(t.Leap == "insert" || t.Leap == "delete"))
 	gauge(c.leapfileExpiry, optionalTimestampSeconds(t.LeapExpiry))
 	gauge(c.leapfileValid, boolValue(t.LeapValid))
@@ -185,6 +192,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		gauge(c.sourceJitter, src.Jitter, src.Name)
 		gauge(c.sourceDistance, src.Distance, src.Name)
 		gauge(c.sourceReach, float64(src.Reach), src.Name)
+		gauge(c.sourceLastUpdate, boolValue(src.Name == t.UpdateSource), src.Name)
 		gauge(c.sourceSelected, boolValue(src.Status == "system"), src.Name)
 		gauge(c.sourceLastRx, optionalTimestampSeconds(src.LastRx), src.Name)
 		counter(c.sourceNoKernelTS, src.NoKernelTS, src.Name)

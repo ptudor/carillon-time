@@ -24,7 +24,7 @@ const serverOOBSize = 256
 const minRecvBuffer = 64 << 10
 
 // RecvBufferSysctl names the kernel knob that caps SO_RCVBUF on this OS, for
-// error messages and for -check to point at.
+// diagnostics when the actual socket falls short.
 func RecvBufferSysctl() string {
 	switch runtime.GOOS {
 	case "linux":
@@ -131,7 +131,7 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 			"listen", addr, "error", err)
 	}
 	if recvBuffer > 0 {
-		if err := setReadBuffer(conn, recvBuffer, addr, log); err != nil {
+		if err := setReadBuffer(conn, recvBuffer, addr); err != nil {
 			return fail("%w", err)
 		}
 	}
@@ -139,6 +139,7 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 	if err != nil {
 		return fail("server: listen %s: %w", addr, err)
 	}
+	reportReceiveBuffer(log, addr, recvBuffer, effective, runtime.GOOS)
 	h, err := NewHandler(hcfg)
 	if err != nil {
 		return fail("server: listen %s: %w", addr, err)
@@ -150,6 +151,17 @@ func listenOne(addr netip.AddrPort, hcfg Config, recvBuffer int, log *slog.Logge
 	}
 	l.recvBuffer = effective
 	return l, nil
+}
+
+func reportReceiveBuffer(log *slog.Logger, addr netip.AddrPort, requested, effective int, goos string) {
+	granted := effective
+	if goos == "linux" {
+		granted /= 2 // SO_RCVBUF includes kernel bookkeeping on Linux.
+	}
+	if granted > 0 && granted < requested {
+		log.Warn("receive buffer below configured size", "listen", addr, "requested", requested,
+			"granted", granted, "so_rcvbuf", effective, "sysctl", RecvBufferSysctl())
+	}
 }
 
 // setReadBuffer asks for want bytes of SO_RCVBUF, halving the request until
@@ -169,7 +181,7 @@ type bufferSetter interface {
 	SetReadBuffer(bytes int) error
 }
 
-func setReadBuffer(conn bufferSetter, want int, addr netip.AddrPort, log *slog.Logger) error {
+func setReadBuffer(conn bufferSetter, want int, addr netip.AddrPort) error {
 	var lastErr error
 	var tried []int
 	// Halving an arbitrary request can step straight past the documented
@@ -184,13 +196,6 @@ func setReadBuffer(conn bufferSetter, want int, addr netip.AddrPort, log *slog.L
 		tried = append(tried, size)
 		err := conn.SetReadBuffer(size)
 		if err == nil {
-			if size != want {
-				log.Warn("receive buffer request was refused; using a smaller one",
-					"listen", addr, "requested", want, "granted_request", size,
-					"attempted", tried,
-					"hint", RecvBufferSysctl()+" must be raised before a larger buffer can be granted",
-					"error", lastErr)
-			}
 			return nil
 		}
 		lastErr = err

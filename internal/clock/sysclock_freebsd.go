@@ -59,6 +59,11 @@ func New() (Clock, error) {
 	return c, nil
 }
 
+func kernelTimeState() (int, error) {
+	var tx timex
+	return ntpAdjtime(&tx)
+}
+
 // Now implements Clock.
 func (c *sysClock) Now() time.Time {
 	var ts unix.Timespec

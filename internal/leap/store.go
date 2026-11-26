@@ -284,6 +284,15 @@ func (s *Store) Save(state State) error {
 type SeedState struct {
 	Validators  Validators
 	LastAttempt time.Time
+	RetryAt     time.Time
+}
+
+func (s SeedState) nextAttempt() time.Time {
+	floor := s.LastAttempt.Add(seedRetryFloor)
+	if s.RetryAt.After(floor) {
+		return s.RetryAt
+	}
+	return floor
 }
 
 type diskSeed struct {
@@ -291,6 +300,7 @@ type diskSeed struct {
 	ETag         string    `json:"etag,omitempty"`
 	LastModified string    `json:"last_modified,omitempty"`
 	LastAttempt  time.Time `json:"last_attempt,omitzero"`
+	RetryAt      time.Time `json:"retry_at,omitzero"`
 }
 
 const maxSeedSize = 4 << 10
@@ -338,14 +348,17 @@ func (s *Store) LoadSeed() (SeedState, error) {
 	if !d.LastAttempt.IsZero() && (d.LastAttempt.Year() < 1900 || d.LastAttempt.Year() > 9999) {
 		return SeedState{}, errors.New("leap: invalid seed attempt date")
 	}
-	return SeedState{Validators: v, LastAttempt: d.LastAttempt}, nil
+	if !d.RetryAt.IsZero() && (d.LastAttempt.IsZero() || d.RetryAt.Before(d.LastAttempt) || d.RetryAt.Sub(d.LastAttempt) > maxRetryAfter+time.Hour) {
+		return SeedState{}, errors.New("leap: invalid publisher retry date")
+	}
+	return SeedState{Validators: v, LastAttempt: d.LastAttempt, RetryAt: d.RetryAt}, nil
 }
 
 func (s *Store) SaveSeed(state SeedState) error {
 	if !state.Validators.valid() {
 		return errors.New("leap: refusing to persist invalid seed validators")
 	}
-	b, err := json.Marshal(diskSeed{Version: 1, ETag: state.Validators.ETag, LastModified: state.Validators.LastModified, LastAttempt: state.LastAttempt})
+	b, err := json.Marshal(diskSeed{Version: 1, ETag: state.Validators.ETag, LastModified: state.Validators.LastModified, LastAttempt: state.LastAttempt, RetryAt: state.RetryAt})
 	if err != nil {
 		return fmt.Errorf("leap: encode seed bookkeeping: %w", err)
 	}

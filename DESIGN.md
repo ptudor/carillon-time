@@ -579,7 +579,7 @@ noselect = false
   after the reply or timeout. Connected matters: ICMP port-unreachable is
   delivered only to a connected socket, so a host that is up but is not
   running NTP fails at once instead of costing the full 2 s timeout on every
-  poll and 8 s on an `iburst`. It is reported as a miss with the reason
+  poll. It is reported as a miss with the reason
   "connection refused". The reply's source address is still checked, because
   a server that answers from a different address is one whose reply we drop.
 - A hostname is resolved once, when the source starts, and re-resolved only
@@ -648,8 +648,9 @@ noselect = false
   after, so a demanded interval is never undercut.
   `DENY`/`RSTR` → stop polling that server and log ERROR. Any KoD packet that carries a valid MAC is honoured;
   unauthenticated KoDs are honoured only for `RATE`.
-- `iburst`: a burst of 4 requests 2 s apart on start-up and whenever the
-  server transitions from unreachable to reachable.
+- `iburst` sends one probe on the regular schedule while reach is zero. A
+  usable reply opens three more requests spaced 2 s apart. An outstanding
+  RATE minimum suppresses the burst for that endpoint.
 - **Authentication:** if `key` is set, append a MAC (§8.4) to requests and
   require a valid MAC on replies — unauthenticated replies are dropped and
   counted.
@@ -835,9 +836,16 @@ if synced and |θ − θ_prev| > 3·ψ_clk and μ < 2P: ignore it (popcorn spike
           then and the difference describes nothing.
 pending = θ                                       # replace, don't accumulate
 if |θ| ≤ max_slew·τ:                              # linear region only — see anti-windup
-    freq += θ · min(μ, 2048) / (4τ²) · 1e6        # 2048 s = Allan intercept
+    weight = min(μ, 2048)                         # 2048 s = Allan intercept
+    if selection changed since last acceptance or P decreased: weight = min(weight, P)
+    freq += θ · weight / (4τ²) · 1e6
 freq    = clamp(freq, ±500)
 ```
+
+Selection changes count even when the intervening source never supplies an
+accepted update. A rejected or reused sample leaves the handoff pending. The
+first accepted sample receives full phase weight, and the next independent
+sample resumes ordinary frequency integration.
 
 An update issues no frequency word of its own. Writing the base alone would
 remove the phase transient the previous tick applied and pause the slew until
@@ -1061,6 +1069,10 @@ and restart. Autonomy ends at the table's expiry; no file predicts future IERS
 decisions indefinitely. Bare PPS still needs a live or qualified holdover
 source to number seconds (§6.5).
 
+A first-install seed can use `carillon prepare-leap` while its incumbent daemon
+reports kernel `TIME_OK`. Preparation commits a validated initial table under
+the normal store lock. Startup still requires Carillon's own UTC evidence.
+
 **Acquisition and redistribution.** One designated seed fetches
 `leap-seconds.list` from one fixed publisher, either
 [IERS](https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list) or
@@ -1211,8 +1223,9 @@ the 4 MB the example configuration recommends for a public host would stop
 the daemon starting. The listener therefore halves the request until the
 kernel accepts it, down to a 64 KB floor, warning once with the name of the
 sysctl to raise; only a refusal at the floor is fatal. Either way the size
-actually granted is read back and logged, and `-check` warns on FreeBSD
-whenever `recv_buffer` is set. Linux is additionally asked for `SO_RXQ_OVFL`, whose
+actually granted is read back and logged. A shortfall produces a warning that
+names the sysctl and reports requested and granted capacity. Linux readback
+includes twice the requested capacity for kernel bookkeeping. Linux is additionally asked for `SO_RXQ_OVFL`, whose
 per-datagram cumulative counter of receive-queue overflows is folded into
 `kernel_drops` (§10.4) — without it a server that cannot keep up is
 indistinguishable from a quiet one. FreeBSD has no per-socket equivalent;
@@ -1581,7 +1594,11 @@ packet above DEBUG.
 Unix socket, newline-delimited JSON request/response, `0660`. Commands:
 
 - `tracking` — state, system source, θ, freq, ψ, root delay/dispersion,
-  stratum, refid, leap, last update, pending slew, steps.
+  stratum, refid, leap, last update, pending slew, steps. `system_source` names
+  the selection winner. `update_source` and `update_age_seconds` identify the
+  last accepted discipline update and its monotonic age. Both fields are absent
+  until the first update. `update_reason` records the decision for the selected
+  source and retains a spike rejection across background ticks.
 - `sources` — per source: reach (octal), poll, θ, δ, ψ, λ, selection status
   (`falseticker`/`survivor`/`system`/`noselect`/`unreachable`), prefer.
 - `refclock` — PPS window σ, locked, qualified, sequence gaps, pulse
@@ -1695,7 +1712,8 @@ The `/metrics` endpoint exports:
 `carillon_steps_total`, `carillon_source_offset_seconds{source}`,
 `carillon_source_delay_seconds{source}`, `carillon_source_jitter_seconds{source}`,
 `carillon_source_root_distance_seconds{source}`, `carillon_source_reach{source}`,
-`carillon_source_selected{source}`, `carillon_source_events_total{source,result}`,
+`carillon_source_selected{source}`, `carillon_source_last_update{source}`,
+`carillon_update_age_seconds`, `carillon_source_events_total{source,result}`,
 `carillon_pps_samples_total{source,result=ok|timeout|spike|gap|glitch}`,
 `carillon_pps_jitter_seconds{source}`, `carillon_pps_locked{source}`,
 `carillon_server_enabled`, `carillon_source_receive_timestamp_seconds{source}`,

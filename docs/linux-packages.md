@@ -58,7 +58,9 @@ The tmpfiles command ensures the control-socket directory exists even after a
 service stop has removed it. The preflight check exits before opening the system
 clock. It does not prove that upstreams,
 devices, or clock permissions work. Keep your existing time daemon running while
-preparing configuration.
+preparing configuration. For a first-install IERS or NIST seed, run
+`sudo -u carillon /usr/bin/carillon prepare-leap -config /etc/carillon/carillon.toml`
+while the existing service is synchronized.
 
 ## Activate on the intended host
 

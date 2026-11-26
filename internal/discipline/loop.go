@@ -127,7 +127,9 @@ type Loop struct {
 	haveApply   bool
 	chargeFrom  float64 // monotonic time from which `applied` is unaccounted
 	haveTick    bool
-	skipJitter  bool // the next update follows a step; lastOffset means nothing
+	// Set on selection changes, even if the new winner never supplies an accepted sample.
+	handoff    bool
+	skipJitter bool // the next update follows a step; lastOffset means nothing
 
 	// Bootstrap frequency measurement state.
 	firstTime   float64
@@ -234,11 +236,12 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 	if l.Updates > 0 {
 		u.Mu = now - l.lastUpdate
 	}
-	tau := l.cfg.TimeConstant * math.Ldexp(1, int(poll))
+	interval := math.Ldexp(1, int(poll))
+	tau := l.cfg.TimeConstant * interval
 
 	// Popcorn spike suppressor.
 	if synced && l.Updates > 0 {
-		if math.Abs(offset-l.lastOffset) > spikeGate*l.Jitter && u.Mu < 2*math.Ldexp(1, int(poll)) {
+		if math.Abs(offset-l.lastOffset) > spikeGate*l.Jitter && u.Mu < 2*interval {
 			u.Ignored = true
 			return u
 		}
@@ -284,6 +287,11 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 			// linear region.
 		default:
 			mu := math.Min(u.Mu, AllanIntercept)
+			// Time before a handoff is not evidence of rate error at the new
+			// cadence. One fresh observation gets at most one poll of weight.
+			if l.handoff || tau < l.tau {
+				mu = math.Min(mu, interval)
+			}
 			l.Freq = clampFreq(l.Freq + offset*mu/(4*tau*tau)*1e6)
 			l.FreqKnown = true
 		}
@@ -297,6 +305,7 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 	l.Pending = offset
 	l.lastOffset = offset
 	l.lastUpdate = now
+	l.handoff = false
 	l.tau = tau
 	l.Updates++
 	// No frequency action here. Issuing the base alone would remove the
@@ -310,6 +319,7 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 // step performs a step and resets the phase state; the frequency estimate
 // is kept, since a step says nothing about rate.
 func (l *Loop) step(offset float64, now float64) UpdateResult {
+	l.handoff = false
 	l.Steps++
 	l.Updates++
 	// The step supersedes the residual phase entirely. Start a fresh

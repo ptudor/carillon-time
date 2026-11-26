@@ -82,6 +82,19 @@ func (e *SeedError) clientError() bool {
 		e.Status != http.StatusRequestTimeout && e.Status != http.StatusTooEarly
 }
 
+// publisherDelay is the minimum wait a publisher error adds to our own
+// backoff, including when the next caller is a freshly started daemon.
+func publisherDelay(err error) time.Duration {
+	var se *SeedError
+	if !errors.As(err, &se) {
+		return 0
+	}
+	if se.clientError() {
+		return max(24*time.Hour, se.RetryAfter)
+	}
+	return se.RetryAfter
+}
+
 // maxRetryAfter bounds an honored Retry-After. A week is far shorter than
 // the six-month expiry cycle, so obeying it costs nothing.
 const maxRetryAfter = 7 * 24 * time.Hour

@@ -2,7 +2,6 @@ package server
 
 import (
 	"errors"
-	"log/slog"
 	"math"
 	"net"
 	"net/netip"
@@ -371,12 +370,11 @@ func (f *fakeBuffers) SetReadBuffer(n int) error {
 // ever asking for it — 100000 halves to 50000, below the 65536 floor — so
 // startup failed with an error claiming the minimum had been tried.
 func TestAstra6ReceiveBufferFallbackReachesTheMinimum(t *testing.T) {
-	log := slog.New(slog.DiscardHandler)
 	addr := netip.MustParseAddrPort("127.0.0.1:123")
 
 	t.Run("a non-power-of-two request reaches the floor", func(t *testing.T) {
 		f := &fakeBuffers{accept: map[int]bool{minRecvBuffer: true}}
-		if err := setReadBuffer(f, 100000, addr, log); err != nil {
+		if err := setReadBuffer(f, 100000, addr); err != nil {
 			t.Fatalf("a system that can grant the minimum must not fail: %v", err)
 		}
 		if f.granted != minRecvBuffer {
@@ -389,7 +387,7 @@ func TestAstra6ReceiveBufferFallbackReachesTheMinimum(t *testing.T) {
 
 	t.Run("the floor is asked for exactly once", func(t *testing.T) {
 		f := &fakeBuffers{accept: map[int]bool{}}
-		if err := setReadBuffer(f, 100000, addr, log); err == nil {
+		if err := setReadBuffer(f, 100000, addr); err == nil {
 			t.Fatal("all attempts failing must be an error")
 		}
 		n := 0
@@ -405,7 +403,7 @@ func TestAstra6ReceiveBufferFallbackReachesTheMinimum(t *testing.T) {
 
 	t.Run("a power-of-two request still works", func(t *testing.T) {
 		f := &fakeBuffers{accept: map[int]bool{1 << 20: true}}
-		if err := setReadBuffer(f, 4<<20, addr, log); err != nil {
+		if err := setReadBuffer(f, 4<<20, addr); err != nil {
 			t.Fatal(err)
 		}
 		if f.granted != 1<<20 {
@@ -415,7 +413,7 @@ func TestAstra6ReceiveBufferFallbackReachesTheMinimum(t *testing.T) {
 
 	t.Run("a request equal to the floor is one attempt", func(t *testing.T) {
 		f := &fakeBuffers{accept: map[int]bool{minRecvBuffer: true}}
-		if err := setReadBuffer(f, minRecvBuffer, addr, log); err != nil {
+		if err := setReadBuffer(f, minRecvBuffer, addr); err != nil {
 			t.Fatal(err)
 		}
 		if len(f.tried) != 1 {
@@ -425,7 +423,7 @@ func TestAstra6ReceiveBufferFallbackReachesTheMinimum(t *testing.T) {
 
 	t.Run("a non-capacity error stops immediately", func(t *testing.T) {
 		f := &fakeBuffers{err: syscall.EPERM}
-		if err := setReadBuffer(f, 4<<20, addr, log); err == nil {
+		if err := setReadBuffer(f, 4<<20, addr); err == nil {
 			t.Fatal("a non-capacity error must fail")
 		}
 		if len(f.tried) != 1 {

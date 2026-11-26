@@ -31,8 +31,7 @@ const (
 	// unrelated measurements (DESIGN.md §5.4).
 	resolveAfterTimeouts = 8
 
-	// burstCount and burstSpacing describe an iburst: packets sent while the
-	// server is unreachable so the first fix arrives quickly.
+	// A usable acquisition probe opens the rest of a four-packet iburst.
 	burstCount   = 4
 	burstSpacing = 2 * time.Second
 
@@ -78,7 +77,7 @@ type NTPConfig struct {
 	// replies (RFC 8573 AES-128-CMAC).
 	Key *auth.Key
 
-	// IBurst sends a burst of four packets while the server is unreachable.
+	// IBurst sends three additional requests after a usable first reply on acquisition.
 	IBurst bool
 
 	// PollMin and PollMax bound the poll exponent (log2 seconds). Zero
@@ -151,10 +150,6 @@ type NTP struct {
 	// cfg.PollMax is the operator's configured bound and never changes; a
 	// RATE demand raises only this, and only for the peer that made it.
 	effPollMax int8
-
-	// kissedRate records that the peer asked us to slow down during the
-	// current burst, so the rest of the burst is abandoned.
-	kissedRate bool
 
 	// meta pairs each filter stage with the association metadata of the
 	// exchange that produced it. See stageMeta.
@@ -256,19 +251,21 @@ func (n *NTP) Run(ctx context.Context, out chan<- discipline.Measurement) error 
 			if !n.emit(ctx, out, nil, n.generation(), false) {
 				return nil
 			}
-		case n.cfg.IBurst && n.reach == 0:
-			n.kissedRate = false
-			for i := 0; i < burstCount && !n.denied && !n.kissedRate; i++ {
-				if i > 0 && !n.sleep(ctx, burstSpacing) {
-					return nil
-				}
-				if !n.pollOnce(ctx, out) {
-					return nil
-				}
-			}
 		default:
-			if !n.pollOnce(ctx, out) {
+			burst := n.cfg.IBurst && n.reach == 0 && n.kodMinPoll == 0
+			acquired, running := n.pollOnce(ctx, out)
+			if !running {
 				return nil
+			}
+			if burst && acquired {
+				for i := 1; i < burstCount && !n.denied && n.kodMinPoll == 0; i++ {
+					if !n.sleep(ctx, burstSpacing) {
+						return nil
+					}
+					if _, running := n.pollOnce(ctx, out); !running {
+						return nil
+					}
+				}
 			}
 		}
 		if n.denied {
@@ -384,7 +381,6 @@ func (n *NTP) resetEndpointState() {
 	n.kodMinPoll = 0
 	n.effPollMax = n.cfg.PollMax
 	n.poll = n.cfg.PollMin
-	n.kissedRate = false
 	n.meta, n.metaNext = n.meta[:0], 0
 	n.haveStratum = false
 	n.filter.Reset()
@@ -470,8 +466,8 @@ func (n *NTP) metaAt(t float64) (stageMeta, bool) {
 }
 
 // pollOnce performs one exchange, updates state, and emits a measurement.
-// It returns false when ctx is done.
-func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) bool {
+// acquired requires a usable reply in the current epoch. running is false on cancellation.
+func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) (acquired, running bool) {
 	n.exchangeBusy.Store(true)
 	defer n.exchangeBusy.Store(false)
 	gen := n.generation()
@@ -493,7 +489,6 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 	// entered the clock filter. It is separate from s != nil: a good reply
 	// whose filter winner is unchanged produces no new estimate but is
 	// still a successful acquisition (RA6X-010).
-	var acquired bool
 	var kiss *kissError
 	var bogus *bogusError
 	switch {
@@ -517,7 +512,7 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 			acquired = true
 		}
 	case ctx.Err() != nil:
-		return false
+		return false, false
 	case errors.Is(err, errTimeout):
 		n.consecutiveTimeouts++
 		n.updateInfo(func(i *Info) { i.Timeouts++; i.LastError = "timeout" })
@@ -562,7 +557,7 @@ func (n *NTP) pollOnce(ctx context.Context, out chan<- discipline.Measurement) b
 		// generation is current now.
 		gen = n.generation()
 	}
-	return n.emit(ctx, out, s, gen, acquired)
+	return acquired, n.emit(ctx, out, s, gen, acquired)
 }
 
 // discardStale records a reply whose exchange spanned a clock step or leap
@@ -625,7 +620,6 @@ func (n *NTP) handleKiss(k *kissError) {
 		n.poll = want
 		// End an iburst here: the remaining two-second burst requests are
 		// exactly what the server has just asked us to stop sending.
-		n.kissedRate = true
 		n.miss("kiss RATE")
 	case "DENY", "RSTR":
 		if k.authenticated {
@@ -727,9 +721,8 @@ func (n *NTP) pollFloor() int8 {
 
 // shouldLogErr counts one failed exchange and reports whether it deserves a
 // log line: the first, then every logEvery-th, the same throttle badAuthSeen
-// and bogusSeen use. A server that stays down fails every poll, and an iburst
-// makes that four failures a cycle, so logging each one buries every other
-// line in the file. miss() logs the transition to unreachable separately, and
+// and bogusSeen use. A server that stays down fails every poll. Logging every
+// failure would bury other events. miss() records the transition separately and
 // hit() clears the count on recovery.
 //
 // Failures are counted, never compared: every exchange opens a fresh socket,
@@ -899,7 +892,7 @@ func exchange(ctx context.Context, p exchangeParams) (exchangeResult, error) {
 	// A *connected* socket, per DESIGN.md §5.4. ICMP port-unreachable is
 	// only delivered to one, so a host that is up but is not running NTP
 	// otherwise costs the full timeout on every poll — 2 s of a source
-	// goroutine per poll, 8 s for an iburst — instead of failing at once.
+	// goroutine per poll instead of failing at once.
 	conn, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(addr))
 	if err != nil {
 		return res, fmt.Errorf("socket: %w", err)

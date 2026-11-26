@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.1 — 2026-11-26
+
+- Limit the weight of the first frequency correction after a source change or
+  a shorter poll interval. Apply the accepted phase correction immediately.
+- Start the three additional `iburst` requests only after a usable probe reply.
+  Honor an association's outstanding RATE minimum during reacquisition.
+- Report which source supplied the last accepted update, its monotonic age,
+  and the discipline decision in tracking and HTTP status. Export the update
+  age and source in Prometheus.
+- Add `carillon prepare-leap` for first installations using IERS or NIST.
+- Report a receive-buffer shortfall when the bound socket measures below its
+  requested capacity on FreeBSD or Linux.
+
 ## 1.2.0 — 2026-10-07
 
 - Update `github.com/prometheus/common` to v0.72.0 and refresh compiled

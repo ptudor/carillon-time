@@ -240,6 +240,9 @@ type Tracking struct {
 	RootDelay        float64           `json:"root_delay"`
 	RootDisp         float64           `json:"root_dispersion"`
 	SystemSource     string            `json:"system_source,omitempty"`
+	UpdateSource     string            `json:"update_source,omitempty"`
+	UpdateAge        *float64          `json:"update_age_seconds,omitempty"`
+	UpdateReason     string            `json:"update_reason,omitempty"`
 	PreferLost       bool              `json:"prefer_lost"`
 	Updates          int               `json:"updates"`
 	Steps            int               `json:"steps"`
@@ -285,6 +288,10 @@ func TrackingOf(st *engine.Status) *Tracking {
 	if st.UTCbound.After(utc) {
 		utc = st.UTCbound
 	}
+	var age *float64
+	if st.UpdateSource != "" {
+		age = &st.UpdateAge
+	}
 	return &Tracking{
 		State:            st.State.String(),
 		Stratum:          st.Stratum,
@@ -314,6 +321,9 @@ func TrackingOf(st *engine.Status) *Tracking {
 		RootDelay:        st.RootDelay,
 		RootDisp:         st.RootDisp,
 		SystemSource:     st.SystemSource,
+		UpdateSource:     st.UpdateSource,
+		UpdateAge:        age,
+		UpdateReason:     st.UpdateReason,
 		PreferLost:       st.PreferLost,
 		Updates:          st.Updates,
 		Steps:            st.Steps,

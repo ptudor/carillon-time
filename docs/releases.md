@@ -30,6 +30,11 @@ use a new version for corrected public artifacts.
 
 ## Public releases
 
+[Carillon v1.2.1](https://github.com/ptudor/carillon-time/releases/tag/v1.2.1)
+improves clock discipline during source changes, acquisition traffic, tracking,
+first-install leap preparation, and socket diagnostics. See the
+[1.2.1 release notes](release-notes/v1.2.1.md).
+
 [Carillon v1.2.0](https://github.com/ptudor/carillon-time/releases/tag/v1.2.0)
 refreshes the metrics dependency and release tooling; see its
 [release notes](release-notes/v1.2.0.md). The [1.1.0 notes](release-notes/v1.1.0.md)

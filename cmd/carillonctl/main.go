@@ -221,6 +221,12 @@ func printTracking(t *control.Tracking) {
 	if t.SystemSource != "" {
 		fmt.Fprintf(w, "System source\t%s\n", t.SystemSource)
 	}
+	if t.UpdateAge != nil {
+		fmt.Fprintf(w, "Last update source\t%s (%.1f s ago)\n", t.UpdateSource, *t.UpdateAge)
+	}
+	if t.UpdateReason != "" {
+		fmt.Fprintf(w, "Discipline decision\t%s\n", t.UpdateReason)
+	}
 	if t.PreferLost {
 		fmt.Fprintf(w, "Prefer\tLOST\n")
 	}

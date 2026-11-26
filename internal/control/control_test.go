@@ -256,7 +256,7 @@ func TestFreshEngineOmitsNeverHappenedTimestamps(t *testing.T) {
 	if !ok {
 		t.Fatalf("tracking missing from %s", raw)
 	}
-	for _, key := range []string{"reftime", "leapfile_expires"} {
+	for _, key := range []string{"reftime", "leapfile_expires", "update_age_seconds", "update_source"} {
 		if v, present := tracking[key]; present {
 			t.Errorf("%q present on a fresh engine as %v; it has not happened yet", key, v)
 		}

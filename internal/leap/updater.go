@@ -286,7 +286,7 @@ func (u *Updater) Run(ctx context.Context) {
 				// A restart is not a reason to ask the publisher again: keep
 				// the error floor across process lifetimes so a crash or
 				// deploy loop cannot turn into a request loop.
-				if wait := seedRetryFloor - v.Now.Sub(u.seedState.LastAttempt); !u.seedState.LastAttempt.IsZero() && wait > 0 {
+				if wait := u.seedState.nextAttempt().Sub(v.Now); wait > 0 {
 					if floor := now.Add(wait); floor.After(nextJob) {
 						nextJob = floor
 					}
@@ -331,6 +331,7 @@ func (u *Updater) Run(ctx context.Context) {
 					// Record the attempt before it starts so an interrupted
 					// process still honors the floor on restart.
 					u.seedState.LastAttempt = v.Now
+					u.seedState.RetryAt = time.Time{}
 					u.saveSeed()
 				}
 				go func(peer int) {
@@ -420,15 +421,10 @@ func (u *Updater) Run(ctx context.Context) {
 			} else if err != nil {
 				backoff = errorBackoff(backoff)
 				interval = backoff
-				var se *SeedError
-				if errors.As(err, &se) {
-					// The publisher's own instructions outrank our backoff:
-					// a Retry-After is obeyed, and a request the server says
-					// is wrong or gone is not repeated more than daily.
-					if se.clientError() {
-						interval = max(interval, 24*time.Hour)
-					}
-					interval = max(interval, se.RetryAfter)
+				if wait := publisherDelay(err); wait > 0 {
+					interval = max(interval, wait)
+					u.seedState.RetryAt = u.status.LastFetch.Add(wait)
+					u.saveSeed()
 				}
 				// Positive-only jitter: never retry earlier than the floor.
 				nextJob = time.Now().Add(interval + jitter(interval)/2 + interval/20)

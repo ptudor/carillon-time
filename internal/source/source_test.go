@@ -459,6 +459,31 @@ func TestIBurst(t *testing.T) {
 	}
 }
 
+func TestIBurstRequiresUsableFirstReply(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		respond func(ntp.Packet, []byte) []byte
+	}{
+		{"silent", func(ntp.Packet, []byte) []byte { return nil }},
+		{"unsynchronized", func(req ntp.Packet, _ []byte) []byte {
+			return reply(req, func(p *ntp.Packet) { p.Leap = ntp.LeapUnsync })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFakeServer(t, tc.respond)
+			n := newPoller(t, srv, NTPConfig{IBurst: true, Timeout: 50 * time.Millisecond}, 0)
+			n.sleep = func(_ context.Context, d time.Duration) bool { return d == burstSpacing }
+			out := make(chan discipline.Measurement, burstCount)
+			if err := n.Run(t.Context(), out); err != nil {
+				t.Fatal(err)
+			}
+			if got := srv.requests.Load(); got != 1 {
+				t.Fatalf("sent %d probes before regular poll, want 1", got)
+			}
+		})
+	}
+}
+
 func TestResetEmptiesFilter(t *testing.T) {
 	srv := newFakeServer(t, plain)
 	n := newPoller(t, srv, NTPConfig{}, 1)

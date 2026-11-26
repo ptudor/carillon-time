@@ -200,11 +200,9 @@ iburst  = true
 #                  as clients that never got an answer. Linux clamps the
 #                  request to net.core.rmem_max silently. FreeBSD REFUSES a
 #                  request above kern.ipc.maxsockbuf (default about 1.86 MB)
-#                  with ENOBUFS rather than clamping it, so raise that sysctl
-#                  first: carillon halves the request until the kernel takes
-#                  it and warns, but you get the buffer you asked for only
-#                  after the sysctl is raised. The size actually granted is
-#                  logged at startup.
+#                  with ENOBUFS. Carillon retries with a smaller request and
+#                  logs the actual size at startup. A shortfall warning names
+#                  the sysctl to raise for the requested buffer.
 #                  On Linux carillon_server_kernel_drops_total counts what was
 #                  lost anyway; FreeBSD has no per-socket count, so watch
 #                  netstat -sp udp there instead.

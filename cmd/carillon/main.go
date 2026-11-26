@@ -4,6 +4,7 @@
 //
 //	carillon [-config path] [-check] [-version]
 //	carillon query [-timeout d] [-keys file -key id] host[:port]
+//	carillon prepare-leap [-config path]
 package main
 
 import (
@@ -17,7 +18,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,8 +50,13 @@ const (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "query" {
-		os.Exit(runQuery(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "query":
+			os.Exit(runQuery(os.Args[2:]))
+		case "prepare-leap":
+			os.Exit(runPrepareLeap(os.Args[2:]))
+		}
 	}
 	os.Exit(runDaemon(os.Args[1:]))
 }
@@ -62,7 +67,7 @@ func runDaemon(args []string) int {
 	check := fs.Bool("check", false, "validate the configuration and exit")
 	version := fs.Bool("version", false, "print the version and exit")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "usage: carillon [-config path] [-check] [-version]\n       carillon query [-timeout d] [-keys file -key id] host[:port]\n")
+		fmt.Fprintf(fs.Output(), "usage: carillon [-config path] [-check] [-version]\n       carillon query [-timeout d] [-keys file -key id] host[:port]\n       carillon prepare-leap [-config path]\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -718,16 +723,6 @@ func serveWarnings(cfg *config.Config) []configurationWarning {
 	if cfg.Serve.RecvBuffer == 0 {
 		warnings = append(warnings, configurationWarning{
 			message: "recv_buffer is unset, so each listening socket keeps the kernel default; a public server that outruns it drops requests with no other evidence",
-		})
-	} else if runtime.GOOS == "freebsd" {
-		// FreeBSD refuses an oversized SO_RCVBUF with ENOBUFS rather than
-		// clamping it the way Linux does. The listener halves the request
-		// until the kernel accepts it, so the daemon still starts, but the
-		// operator gets the buffer they asked for only after raising the
-		// sysctl.
-		warnings = append(warnings, configurationWarning{
-			message: fmt.Sprintf("recv_buffer = %d: FreeBSD refuses a request above %s (default about 1.86 MB) instead of clamping it; raise the sysctl or the listener will settle for a smaller buffer",
-				cfg.Serve.RecvBuffer, ntpserver.RecvBufferSysctl()),
 		})
 	}
 	return warnings
