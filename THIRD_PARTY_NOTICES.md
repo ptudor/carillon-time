@@ -35,7 +35,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## Go runtime and standard library (go1.27.1)
+## Go runtime and standard library (go1.27.4)
 
 Source: https://go.dev/LICENSE
 

@@ -3,7 +3,7 @@ module github.com/ptudor/carillon-time
 go 1.26.0
 
 // Match the release toolchain in .go-version.
-toolchain go1.27.1
+toolchain go1.27.4
 
 require (
 	github.com/pelletier/go-toml/v2 v2.4.3

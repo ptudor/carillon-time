@@ -2,6 +2,8 @@
 
 ## 1.2.1 — 2026-11-26
 
+- Build release binaries with Go 1.27.4 to include the standard library security fixes.
+
 - Limit the weight of the first frequency correction after a source change or
   a shorter poll interval. Apply the accepted phase correction immediately.
 - Start the three additional `iburst` requests only after a usable probe reply.
