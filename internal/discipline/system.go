@@ -286,6 +286,10 @@ func (s *System) Applied() (float64, bool) { return s.loop.Applied() }
 // Pending returns the residual phase, in seconds, the loop has not slewed yet.
 func (s *System) Pending() float64 { return s.loop.Pending }
 
+// Poll returns the discipline loop's system-wide poll exponent. It is not an
+// association's poll: the loop moves it gradually across source changes.
+func (s *System) Poll() int8 { return s.loop.Poll() }
+
 func (s *System) all() []*SourceState {
 	out := make([]*SourceState, 0, len(s.order))
 	for _, n := range s.order {

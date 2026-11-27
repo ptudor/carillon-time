@@ -820,7 +820,10 @@ spike gate and a clock-jitter estimate. The *gains* are not ntpd's — see D8.
 
 - `freq` — base frequency correction (ppm), applied to the kernel
 - `pending` — residual phase still to be slewed (seconds)
-- `P = 2^poll` — the system source's poll/averaging interval
+- `poll_sys` — one system-wide loop poll exponent, initially 6; an accepted
+  update moves it at most one exponent toward the selected source's current
+  poll. A source handoff therefore cannot replace the loop cadence in one jump.
+- `P = 2^poll_sys` — the loop poll/averaging interval
 - `τ = 4·P` — loop time constant (`TimeConstant`, default 4)
 - `μ` — seconds since the previous loop update
 
@@ -829,6 +832,8 @@ Per update with `θ = θ_sys`:
 ```
 if the step policy fires (§6.6) and a step is permitted: Step(θ); pending = 0; Reset() every source; return
 if synced and |θ − θ_prev| > 3·ψ_clk and μ < 2P: ignore it (popcorn spike); return
+poll_sys += sign(poll_source − poll_sys)            # at most one exponent
+P = 2^poll_sys; τ = 4P
 ψ_clk   = exp. average (weight 1/8) of |θ − θ_prev|, floored at the clock precision
           first update: |θ|/√8, not |θ| — otherwise a 100 ms initial offset is
           reported as 100 ms of clock jitter and is still 26 ms out twenty
@@ -846,6 +851,14 @@ Selection changes count even when the intervening source never supplies an
 accepted update. A rejected or reused sample leaves the handoff pending. The
 first accepted sample receives full phase weight, and the next independent
 sample resumes ordinary frequency integration.
+
+The source poll is a target, not the loop state itself. Association poll
+adaptation is already one exponent at a time, but selection can move directly
+between associations at very different cadences. Replacing `poll_sys` with the
+new source's exponent made a poll-10 to poll-5 handoff shorten `τ` by 32 in one
+sample; even with the handoff weight cap, a 2 ms observation then moved the
+base frequency by about 1 ppm. Keeping one incremental system poll preserves
+the intended gain across a source change.
 
 An update issues no frequency word of its own. Writing the base alone would
 remove the phase transient the previous tick applied and pause the slew until
@@ -1764,10 +1777,16 @@ good-against-bad traffic chart.
   reported as an error, because returning success there would be exactly the
   false promise the guarantee is about.
   The write is **gated on the estimate having stopped moving *while it was
-  being measured***: the engine keeps the last `drift_stable_seconds`
-  (default 900) of base-frequency readings and writes only while that history
-  spans the window, its spread is within `drift_stable_spread_ppm`
-  (default 1), **and at least two accepted loop updates fall inside it**.
+  being measured***: the engine keeps an evidence window whose minimum is
+  `drift_stable_seconds` (default 900). When two current system-poll intervals
+  are longer, that cadence-derived span is used instead. The newest sample at
+  or before the boundary is retained, so scheduling jitter does not discard
+  the evidence needed to span the nominal window. The engine writes only
+  while that history spans the effective window, its spread is within
+  `drift_stable_spread_ppm` (default 1), **and at least two accepted loop
+  updates fall inside it**. Thus a steady poll-10 association can qualify in
+  2048 s and still receive the promised hourly rewrites; a fixed 900 s window
+  could contain at most one such update and never qualify.
   Readings are taken only in SYNCED, and the history is discarded when the
   system source changes or the clock is stepped, because neither is the same
   measurement chain. Without the update requirement the gate measured only

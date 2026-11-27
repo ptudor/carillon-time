@@ -5,8 +5,15 @@ import "math"
 // Loop constants. The structure follows RFC 5905 §11.3 / ntpd's loop
 // filter; the gains do not (see LoopConfig.TimeConstant).
 const (
+	// defaultSystemPoll is the initial system-wide loop poll exponent. Source
+	// associations have their own poll exponents, but changing the selected
+	// source must not replace the loop cadence in one jump: doing that can
+	// multiply the integral gain by orders of magnitude on a handoff. RFC 5905
+	// starts the system poll at the ordinary network minimum of 6 (64 s).
+	defaultSystemPoll int8 = 6
+
 	// DefaultTimeConstant is the default ratio of the loop time constant to
-	// the poll interval. ntpd uses 16 with an integral gain a quarter of
+	// the system poll interval. ntpd uses 16 with an integral gain a quarter of
 	// critical, which leaves a slow mode with a time constant of ~15τ
 	// (hours at poll 6); this loop is critically damped, so both modes
 	// settle in ~2τ, and 4 keeps τ well above the poll interval for
@@ -121,6 +128,7 @@ type Loop struct {
 
 	lastUpdate  float64
 	lastOffset  float64
+	poll        int8 // system-wide loop poll exponent
 	tau         float64
 	applied     float64 // frequency word most recently issued
 	appliedBase float64 // the base frequency that word was computed against
@@ -169,7 +177,8 @@ func NewLoop(cfg LoopConfig, freq float64, known bool) *Loop {
 		Freq:      clampFreq(freq),
 		FreqKnown: known,
 		Jitter:    cfg.Precision,
-		tau:       cfg.TimeConstant * math.Ldexp(1, 6),
+		poll:      defaultSystemPoll,
+		tau:       cfg.TimeConstant * math.Ldexp(1, int(defaultSystemPoll)),
 	}
 }
 
@@ -191,15 +200,17 @@ func (l *Loop) stepAllowed() bool {
 	}
 }
 
-// Update feeds the loop a new system offset measured with the given poll
-// exponent at monotonic time now. synced enables the popcorn spike gate.
+// Update feeds the loop a new system offset from a source at sourcePoll at
+// monotonic time now. The source poll is a target for the loop's single
+// system-wide poll exponent; an accepted update moves that exponent by at
+// most one. synced enables the popcorn spike gate.
 //
 // mayStep is the caller's veto on the step policy: the System withholds it
 // when a step would rest on a single post-step sample (see reselect). A
 // withheld step is reported as Deferred and changes no loop state at all —
 // it consumes neither the step budget nor an update — so the decision is
 // simply retaken when more evidence arrives.
-func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bool) UpdateResult {
+func (l *Loop) Update(offset float64, sourcePoll int8, now float64, synced, mayStep bool) UpdateResult {
 	var u UpdateResult
 	abs := math.Abs(offset)
 
@@ -236,8 +247,10 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 	if l.Updates > 0 {
 		u.Mu = now - l.lastUpdate
 	}
-	interval := math.Ldexp(1, int(poll))
-	tau := l.cfg.TimeConstant * interval
+	// Spike detection uses the cadence that is in force for this update. The
+	// accepted update below may move it one exponent toward the source's
+	// cadence, but an ignored spike cannot change loop state.
+	interval := math.Ldexp(1, int(l.poll))
 
 	// Popcorn spike suppressor.
 	if synced && l.Updates > 0 {
@@ -246,6 +259,25 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 			return u
 		}
 	}
+
+	// The discipline owns one system poll exponent. Association poll changes
+	// are already incremental in ordinary operation, but a source handoff can
+	// otherwise replace poll 10 with poll 5 in one update, reducing tau by 32
+	// and turning a 2 ms observation into an approximately 1 ppm frequency
+	// kick. Follow the selected source one exponent at a time instead.
+	nextPoll := l.poll
+	if sourcePoll < MinPoll {
+		sourcePoll = MinPoll
+	} else if sourcePoll > MaxPoll {
+		sourcePoll = MaxPoll
+	}
+	if sourcePoll < nextPoll {
+		nextPoll--
+	} else if sourcePoll > nextPoll {
+		nextPoll++
+	}
+	interval = math.Ldexp(1, int(nextPoll))
+	tau := l.cfg.TimeConstant * interval
 
 	// Clock jitter: exponential average of the offset change.
 	d := math.Max(math.Abs(offset-l.lastOffset), l.cfg.Precision)
@@ -306,6 +338,7 @@ func (l *Loop) Update(offset float64, poll int8, now float64, synced, mayStep bo
 	l.lastOffset = offset
 	l.lastUpdate = now
 	l.handoff = false
+	l.poll = nextPoll
 	l.tau = tau
 	l.Updates++
 	// No frequency action here. Issuing the base alone would remove the
@@ -498,6 +531,11 @@ func (l *Loop) elapsed(now float64) float64 {
 
 // TimeConstant returns the current loop time constant in seconds.
 func (l *Loop) TimeConstant() float64 { return l.tau }
+
+// Poll returns the system-wide loop poll exponent. Source associations have
+// independent poll exponents; accepted updates move this value toward the
+// selected source by at most one exponent at a time.
+func (l *Loop) Poll() int8 { return l.poll }
 
 // Applied returns the frequency word most recently issued to the actuator —
 // the base frequency plus whatever phase-slew transient the last Tick added —

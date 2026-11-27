@@ -9,8 +9,11 @@ func TestShorterPollOnSameSource(t *testing.T) {
 	l := NewLoop(loopCfg(), 0, true)
 	l.Update(0, 10, 100, true, false)
 	u := l.Update(-0.001, 4, 1720, true, false)
-	if u.Mu != 1620 || l.Pending != -0.001 || l.Freq != -0.9765625 {
-		t.Fatalf("shorter poll: elapsed %v, phase %v, frequency %v", u.Mu, l.Pending, l.Freq)
+	// The loop-wide poll moved 6 -> 7 on the first update and only 7 -> 6
+	// on the shorter-poll update. The 1620 s gap therefore receives at most
+	// one system-poll interval (64 s) of frequency weight.
+	if u.Mu != 1620 || l.Poll() != 6 || l.Pending != -0.001 || l.Freq != -0.244140625 {
+		t.Fatalf("shorter poll: elapsed %v, poll %d, phase %v, frequency %v", u.Mu, l.Poll(), l.Pending, l.Freq)
 	}
 }
 

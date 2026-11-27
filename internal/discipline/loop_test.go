@@ -261,6 +261,36 @@ func TestLoopFrequencyClamp(t *testing.T) {
 	}
 }
 
+// TestLoopPollChangesGraduallyAcrossHandoff covers the live failure in which
+// selecting a poll-5 source replaced a poll-10 loop cadence immediately. With
+// the handoff weight cap, a 2 ms sample still moved the frequency by almost
+// 1 ppm because tau had become 32 times shorter. The system poll is one loop
+// variable and may move only one exponent per accepted update.
+func TestLoopPollChangesGraduallyAcrossHandoff(t *testing.T) {
+	l := NewLoop(loopCfg(), 0, true)
+	now := 0.0
+	for range 4 {
+		l.Update(0, 10, now, false, true)
+		now += 1024
+	}
+	if got := l.Poll(); got != 10 {
+		t.Fatalf("system poll after climbing = %d, want 10", got)
+	}
+
+	l.handoff = true
+	before := l.Freq
+	l.Update(0.002, 5, now, false, true)
+	if got := l.Poll(); got != 9 {
+		t.Fatalf("poll-5 handoff changed system poll 10 -> %d, want one step to 9", got)
+	}
+	if got, want := l.TimeConstant(), 4*math.Ldexp(1, 9); got != want {
+		t.Fatalf("time constant after handoff = %v, want %v", got, want)
+	}
+	if moved := l.Freq - before; moved <= 0 || moved >= 0.1 {
+		t.Fatalf("2 ms handoff sample moved frequency by %.6f ppm, want a positive move below 0.1 ppm", moved)
+	}
+}
+
 func TestLoopAntiWindup(t *testing.T) {
 	cfg := loopCfg()
 	cfg.StepLimit = 0

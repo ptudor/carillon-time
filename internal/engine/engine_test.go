@@ -748,3 +748,57 @@ func TestEngineFrequencySettledGate(t *testing.T) {
 		t.Fatalf("steady at the new value must settle again: %q", why)
 	}
 }
+
+// TestEngineFrequencySettlesAtPoll10 covers the steady-state persistence
+// failure at a 1024 s poll. The default 900 s history could never contain the
+// required two accepted updates, so the drift file was writable only while
+// the association's poll was still climbing after startup.
+func TestEngineFrequencySettlesAtPoll10(t *testing.T) {
+	dir := t.TempDir()
+	drift := filepath.Join(dir, "drift")
+	clk := clock.NewFake(time.Now())
+	if err := clk.SetFrequency(7.25); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(drift)
+	cfg.DriftStableWindow = 15 * time.Minute
+	e, err := New(cfg, clk, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.sys.AddSource("a", discipline.Options{Numbering: true})
+
+	// Four poll-10 observations move the system poll from its initial 6 to
+	// 10 one exponent at a time. The last three synchronized observations span
+	// the two-poll cadence-aware evidence window.
+	for i := 0; i < 4; i++ {
+		at := 1 + float64(i)*1024
+		m := good(0)
+		m.Source, m.Now, m.At, m.Poll = "a", at, at, 10
+		e.sys.Update(m)
+		st := e.sys.Status(at)
+		e.noteFrequency(at, &st)
+	}
+	if got := e.sys.Poll(); got != 10 {
+		t.Fatalf("system poll = %d, want 10", got)
+	}
+	now := 1 + 3*1024.0
+	if ok, why := e.frequencySettled(now); !ok {
+		t.Fatalf("steady poll-10 frequency never settled: %q", why)
+	}
+
+	e.maybeWriteDrift(now, false)
+	if e.drift == nil {
+		t.Fatal("settled poll-10 frequency did not start a drift write")
+	}
+	if !e.drift.close(5 * time.Second) {
+		t.Fatal("drift writer did not finish")
+	}
+	got, err := readDrift(drift)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != e.sys.Frequency() {
+		t.Fatalf("drift file = %v ppm, want current base %v ppm", got, e.sys.Frequency())
+	}
+}

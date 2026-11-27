@@ -59,9 +59,15 @@ const (
 // minDriftUpdates is how many accepted loop updates must span the stability
 // window before the frequency estimate is worth persisting. Two is enough to
 // distinguish "the loop has been running and the estimate held still" from
-// "nothing has been measured for the whole window". At the default 900 s
-// window an ordinary poll-6 association delivers about fourteen.
+// "nothing has been measured for the whole window".
 const minDriftUpdates = 2
+
+// driftPollIntervals is the number of current system-poll intervals retained
+// when that is longer than the configured drift stability window. The sample
+// at or before the window boundary is retained, so this many update gaps can
+// be demonstrated even when scheduling jitter puts that sample just outside
+// the nominal span.
+const driftPollIntervals = minDriftUpdates
 
 // Bounds on the delay before a source whose Run returned is started again.
 const (
@@ -277,6 +283,7 @@ type freqSample struct {
 	at      float64 // monotonic seconds
 	ppm     float64
 	updates int
+	poll    int8 // system-wide loop poll exponent
 }
 
 // New builds an engine. It loads the initial frequency (drift file, then the
@@ -1200,8 +1207,27 @@ func (e *Engine) publishStatus(st *discipline.Status, now float64) {
 	}
 }
 
+// driftHistoryWindow is the evidence span retained for the drift-file gate.
+// DriftStableWindow is a minimum: at a long system poll it is extended far
+// enough for multiple accepted updates to occur. Without that extension poll
+// 10 can deliver at most one update in the default 900 s window, making the
+// steady-state drift file permanently unwritable.
+func (e *Engine) driftHistoryWindow(poll int8) time.Duration {
+	window := e.cfg.DriftStableWindow
+	if poll < discipline.MinPoll || poll > discipline.MaxPoll {
+		return window
+	}
+	pollInterval := time.Duration(math.Ldexp(1, int(poll)) * float64(time.Second))
+	if cadenceWindow := time.Duration(driftPollIntervals) * pollInterval; cadenceWindow > window {
+		window = cadenceWindow
+	}
+	return window
+}
+
 // noteFrequency records the base frequency for the drift-file stability gate,
-// keeping only the last DriftStableWindow of history.
+// keeping only the current evidence window. Frequency changes happen only on
+// loop updates, so identical per-second readings are coalesced rather than
+// retaining days of duplicates at the longest legal poll intervals.
 func (e *Engine) noteFrequency(now float64, st *discipline.Status) {
 	// Only a synchronized daemon's frequency is evidence about this host's
 	// oscillator. While settling, in holdover, or unsynchronized, the word
@@ -1217,10 +1243,14 @@ func (e *Engine) noteFrequency(now float64, st *discipline.Status) {
 		e.freqHistory = e.freqHistory[:0]
 		e.freqSource, e.freqSteps = st.SystemSource, st.Steps
 	}
-	e.freqHistory = append(e.freqHistory, freqSample{at: now, ppm: st.Frequency, updates: st.Updates})
+	sample := freqSample{at: now, ppm: st.Frequency, updates: st.Updates, poll: e.sys.Poll()}
+	if n := len(e.freqHistory); n == 0 || e.freqHistory[n-1].ppm != sample.ppm ||
+		e.freqHistory[n-1].updates != sample.updates || e.freqHistory[n-1].poll != sample.poll {
+		e.freqHistory = append(e.freqHistory, sample)
+	}
 	// Keep the newest sample at or before the cut, so the retained history
 	// spans the whole window rather than starting inside it.
-	cut := now - e.cfg.DriftStableWindow.Seconds()
+	cut := now - e.driftHistoryWindow(sample.poll).Seconds()
 	drop := 0
 	for drop+1 < len(e.freqHistory) && e.freqHistory[drop+1].at <= cut {
 		drop++
@@ -1241,11 +1271,14 @@ func (e *Engine) noteFrequency(now float64, st *discipline.Status) {
 // same excursion again. Requiring the estimate to have stopped moving costs a
 // stale file at worst, and the loop corrects a stale start by itself.
 func (e *Engine) frequencySettled(now float64) (bool, string) {
-	window := e.cfg.DriftStableWindow.Seconds()
-	if len(e.freqHistory) == 0 || now-e.freqHistory[0].at < window {
+	if len(e.freqHistory) == 0 {
 		return false, fmt.Sprintf("less than %s of frequency history", e.cfg.DriftStableWindow)
 	}
 	first, last := e.freqHistory[0], e.freqHistory[len(e.freqHistory)-1]
+	window := e.driftHistoryWindow(last.poll)
+	if now-first.at < window.Seconds() {
+		return false, fmt.Sprintf("less than %s of frequency history", window)
+	}
 	// Independent fresh evidence spanning the interval. Without this the
 	// gate measured only whether the *readings* were flat, which they are
 	// by construction when nothing is being measured: a bad transient left
@@ -1254,7 +1287,7 @@ func (e *Engine) frequencySettled(now float64) (bool, string) {
 	// (RA6X-013).
 	if got := last.updates - first.updates; got < minDriftUpdates {
 		return false, fmt.Sprintf("only %d loop updates in the last %s; a frequency nothing is measuring is not settled, it is frozen",
-			got, e.cfg.DriftStableWindow)
+			got, window)
 	}
 	lo, hi := first.ppm, first.ppm
 	for _, f := range e.freqHistory[1:] {
@@ -1263,7 +1296,7 @@ func (e *Engine) frequencySettled(now float64) (bool, string) {
 	}
 	if spread := hi - lo; spread > e.cfg.DriftStableSpread {
 		return false, fmt.Sprintf("frequency moved %.3f ppm in the last %s, more than the %.3f ppm the estimate must hold to",
-			spread, e.cfg.DriftStableWindow, e.cfg.DriftStableSpread)
+			spread, window, e.cfg.DriftStableSpread)
 	}
 	return true, ""
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Keep one discipline-loop poll exponent and change it by at most one per
+  accepted update, preventing a fast-source handoff from abruptly multiplying
+  the frequency gain.
+- Extend drift-file stability evidence to the current loop cadence so hourly
+  persistence continues at long poll intervals without accepting a frozen
+  frequency.
+
 ## 1.2.1 — 2026-11-26
 
 - Build release binaries with Go 1.27.4 to include the standard library security fixes.
